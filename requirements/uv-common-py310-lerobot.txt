@@ -1,9 +1,10 @@
 # Python 3.10 training stack for the official LeRobot v3 dataset path.
 # Keep this separate from uv-common.txt, which preserves the older py39/cu116 stack.
 #
-# LeRobot 0.4.0 is the newest checked version that still targets Python 3.10.
-# Current LeRobot main has moved its declared package target beyond py310.
-lerobot==0.4.0
+# LeRobot itself is installed with --no-deps in the Dockerfile. LeRobot 0.4.0
+# declares rerun-sdk>=0.24, but that range requires numpy>=2. Keep a numpy-1.26
+# compatible rerun for local visualization imports without letting it drive the
+# training stack dependency resolution.
 
 # Diffusion Policy core runtime.
 numpy==1.26.4
@@ -15,7 +16,7 @@ matplotlib==3.8.4
 zarr==2.18.3
 numcodecs==0.12.1
 h5py==3.11.0
-pyarrow==17.0.0
+pyarrow==18.1.0
 hydra-core==1.3.2
 einops==0.8.1
 tqdm==4.67.1
@@ -33,12 +34,18 @@ psutil==6.1.1
 click==8.1.8
 boto3==1.35.99
 imagecodecs==2024.12.30
+glog==0.3.1
+logging_mp==0.2.1
+rich==15.0.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
 
 # Match LeRobot 0.4.0 dependency ranges while keeping explicit versions for repeatable Docker builds.
 accelerate==1.10.1
 datasets==4.0.0
 diffusers==0.35.1
 huggingface-hub[hf-transfer,cli]==0.35.3
+transformers==4.57.1
 opencv-python-headless==4.11.0.86
 av==15.0.0
 cmake==3.31.6
@@ -50,7 +57,7 @@ pyserial==3.5
 wandb==0.21.4
 draccus==0.10.0
 gymnasium==1.1.1
-rerun-sdk==0.24.1
+rerun-sdk==0.22.1
 deepdiff==8.6.1
 
 # Legacy DP utilities still import gym.* rather than gymnasium.*.
@@ -60,5 +67,4 @@ gym==0.23.1
 pygame==2.5.2
 ray[default,tune]==2.9.3
 mujoco==2.3.7
-dm-control==1.0.16
 pytorchvideo==0.1.5

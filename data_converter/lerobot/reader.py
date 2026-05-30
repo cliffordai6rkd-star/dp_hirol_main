@@ -645,7 +645,13 @@ class LerobotEpisodeReader(RerunEpisodeReader):
             if self._camera_keys_transformation is not None and camera_key in self._camera_keys_transformation:
                 output_key = self._camera_keys_transformation[camera_key]
 
-            colors[output_key] = np.asarray(sample[feature_name], dtype=np.uint8)
+            image = np.asarray(sample[feature_name])
+            if image.ndim == 3 and image.shape[0] in {1, 3, 4} and image.shape[-1] not in {1, 3, 4}:
+                image = np.moveaxis(image, 0, -1)
+            if np.issubdtype(image.dtype, np.floating) and image.size > 0 and float(np.nanmax(image)) <= 1.0:
+                image = image * 255.0
+            image = np.clip(image, 0, 255).astype(np.uint8, copy=False)
+            colors[output_key] = image
             colors_time_stamp[output_key] = self._feature_scalar(
                 sample,
                 f"{feature_name}.timestamp",

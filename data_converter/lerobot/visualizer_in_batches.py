@@ -30,7 +30,8 @@ if "XDG_RUNTIME_DIR" not in os.environ:
 os.environ["RUST_LOG"] = "off"
 
 # Initialize logger for the module
-logger_mp = logging_mp.get_logger(__name__, level=logging_mp.INFO)
+logger_mp = logging_mp.getLogger(__name__)
+logger_mp.setLevel(logging_mp.INFO)
 
 def transform_pose(pose1, pose2):
         pose = np.zeros(7)
@@ -104,7 +105,7 @@ def _maybe_delete_episode(data_record_type, episode_data_number, data_dir):
 
 if __name__ == "__main__":
 
-    data_dir = "data/pnp_30_ep/pick_and_place_lerobotv3"
+    data_dir = "data/train_episode/moving_bread/moving_bread_hirol_lerobotv3"
     start_episode = 1
     end_episode = 30
     fps = 30

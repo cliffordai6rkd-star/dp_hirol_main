@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 ARG CUDA_TAG=12.4.1-cudnn-devel-ubuntu22.04
 ARG CUDA_RUNTIME_TAG=12.4.1-cudnn-runtime-ubuntu22.04
 ARG PYTHON_VERSION=3.10
@@ -38,6 +40,8 @@ RUN apt-get update \
     libsm6 \
     libswresample-dev \
     libswscale-dev \
+    libvulkan1 \
+    libxkbcommon-x11-0 \
     libxext6 \
     libxrender1 \
     patchelf \
@@ -49,22 +53,43 @@ RUN apt-get update \
     && mv /root/.local/bin/uv /usr/local/bin/uv \
     && rm -rf /var/lib/apt/lists/*
 
-RUN uv venv --python python${PYTHON_VERSION} ${VIRTUAL_ENV}
+RUN uv venv --seed --python python${PYTHON_VERSION} ${VIRTUAL_ENV}
 
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 WORKDIR /build
 
 COPY requirements ./requirements
-COPY setup.py ./
-COPY diffusion_policy ./diffusion_policy
+COPY docker_for_train/wheelhouse/torch/ /wheelhouse/torch/
 
-RUN uv pip install \
+# Keep heavyweight CUDA wheels in their own stable layer. As long as these
+# pinned versions do not change, ordinary source-code rebuilds reuse this layer.
+# If docker_for_train/wheelhouse/torch already contains local wheels, pip will
+# reuse them and only download missing dependencies.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p /wheelhouse/torch \
+    && PIP_NO_CACHE_DIR=0 python -m pip download \
+    --dest /wheelhouse/torch \
+    --find-links=/wheelhouse/torch \
     --index-url https://download.pytorch.org/whl/cu124 \
     --extra-index-url https://pypi.org/simple \
     torch==2.6.0+cu124 \
-    torchvision==0.21.0+cu124
-RUN uv pip install --index-strategy unsafe-best-match -r requirements/uv-common-py310-lerobot.txt
+    torchvision==0.21.0+cu124 \
+    numpy==1.26.4
+
+RUN uv pip install \
+    --no-index \
+    --find-links=/wheelhouse/torch \
+    torch==2.6.0+cu124 \
+    torchvision==0.21.0+cu124 \
+    numpy==1.26.4
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --index-strategy unsafe-best-match -r requirements/uv-common-py310-lerobot.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps lerobot==0.4.0
+
+COPY setup.py ./
+COPY diffusion_policy ./diffusion_policy
 RUN uv pip install .
 
 FROM ${CUDA_IMAGE}:${CUDA_RUNTIME_TAG} AS runtime
@@ -96,6 +121,8 @@ RUN apt-get update \
     libosmesa6 \
     libsm6 \
     libusb-1.0-0 \
+    libvulkan1 \
+    libxkbcommon-x11-0 \
     libxext6 \
     libxrender1 \
     patchelf \

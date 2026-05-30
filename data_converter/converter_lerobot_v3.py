@@ -11,6 +11,9 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) in sys.path:
+    sys.path.remove(str(SCRIPT_DIR))
 
 from data_converter.hirol_reader import HiROLEpisodeReader
 from diffusion_policy.common.lerobot_v3_io import LeRobotV3Writer
@@ -112,16 +115,6 @@ def _build_feature_spec(image_shape: Sequence[int], camera_keys: Sequence[str]) 
                 "video.is_depth_map": False,
                 "has_audio": False,
             },
-        }
-        features[f"observation.images.{camera_key}.timestamp"] = {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": None,
-        }
-        features[f"observation.images.{camera_key}.is_valid"] = {
-            "dtype": "bool",
-            "shape": (1,),
-            "names": None,
         }
     return features
 

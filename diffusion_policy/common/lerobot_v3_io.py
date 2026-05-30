@@ -1,4 +1,5 @@
 import os
+import inspect
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
@@ -50,6 +51,13 @@ def _feature_spec_for_lerobot(features: Mapping[str, Mapping], use_videos: bool)
     return converted
 
 
+def _scalar_value(value):
+    array = np.asarray(value)
+    if array.size != 1:
+        raise ValueError(f"Expected scalar-compatible value, got shape {array.shape}.")
+    return array.reshape(-1)[0].item()
+
+
 class LeRobotV3Writer:
     """Small project wrapper around official lerobot.datasets.LeRobotDataset.create."""
 
@@ -81,7 +89,7 @@ class LeRobotV3Writer:
         use_videos = bool(video_keys)
         self.features = _feature_spec_for_lerobot(features, use_videos=use_videos)
         vcodec = "h264" if codec in {"mp4v", "avc1"} else codec
-        self.dataset = LeRobotDataset.create(
+        create_kwargs = dict(
             repo_id=_repo_id_from_root(self.root, repo_id),
             root=self.root,
             fps=int(fps),
@@ -90,6 +98,13 @@ class LeRobotV3Writer:
             use_videos=use_videos,
             vcodec=vcodec,
         )
+        create_params = inspect.signature(LeRobotDataset.create).parameters
+        create_kwargs = {
+            key: value
+            for key, value in create_kwargs.items()
+            if key in create_params
+        }
+        self.dataset = LeRobotDataset.create(**create_kwargs)
 
     def add_frame(self, frame: Mapping[str, object]) -> None:
         lerobot_frame = {}
@@ -99,22 +114,28 @@ class LeRobotV3Writer:
             spec = self.features[key]
             if spec.get("dtype") in {"video", "image"} and self.image_color_space == "bgr":
                 value = cv2.cvtColor(np.asarray(value), cv2.COLOR_BGR2RGB)
+            elif tuple(spec.get("shape", ())) == (1,):
+                value = _scalar_value(value)
             lerobot_frame[key] = value
 
         if "next.done" in self.features and "next.done" not in lerobot_frame:
-            lerobot_frame["next.done"] = np.asarray([False], dtype=np.bool_)
+            lerobot_frame["next.done"] = False
         lerobot_frame.setdefault("task", "")
         self.dataset.add_frame(lerobot_frame)
 
     def save_episode(self, task: Optional[str] = None) -> None:
-        if getattr(self.dataset, "writer", None) is not None:
-            episode_buffer = self.dataset.writer.episode_buffer
-            if episode_buffer is not None and episode_buffer.get("size", 0) > 0:
-                if "next.done" in episode_buffer:
-                    episode_buffer["next.done"][-1] = np.asarray([True], dtype=np.bool_)
-                if task is not None:
-                    episode_buffer["task"] = [task for _ in episode_buffer["task"]]
-        self.dataset.save_episode()
+        episode_buffer = getattr(self.dataset, "episode_buffer", None)
+        if episode_buffer is not None and episode_buffer.get("size", 0) > 0:
+            if "next.done" in episode_buffer:
+                episode_buffer["next.done"][-1] = True
+            if task is not None and "task" in episode_buffer:
+                episode_buffer["task"] = [task for _ in episode_buffer["task"]]
+
+        save_params = inspect.signature(self.dataset.save_episode).parameters
+        if task is not None and "task" in save_params:
+            self.dataset.save_episode(task=task)
+        else:
+            self.dataset.save_episode()
 
     def finalize(self) -> None:
         self.dataset.finalize()

@@ -15,7 +15,8 @@ import logging_mp
 os.environ["RUST_LOG"] = "error"
 
 # Initialize logger for the module
-logger_mp = logging_mp.get_logger(__name__, level=logging_mp.INFO)
+logger_mp = logging_mp.getLogger(__name__)
+logger_mp.setLevel(logging_mp.INFO)
 
 def transform_pose(pose1, pose2):
         pose = np.zeros(7)
@@ -205,21 +206,21 @@ class RerunLogger:
                rr.Points3D(positions=positions, colors=[100, 255, 100], radii=[0.003]))  # Light green points
 
     def log_item_data(self, item_data: dict):
-        rr.set_time("idx", sequence=self.counter)
+        rr.set_time_sequence("idx", self.counter)
         self.counter += 1
 
         # Log states
         states = item_data.get('observations', {}) or {}
         for key, obs_state in states.items():
             logger_mp.info(f'{key} obs_state: {obs_state.shape}')
-            rr.log(f"{self.prefix}{key}/obs_states/state", rr.Scalars(obs_state))
+            rr.log(f"{self.prefix}{key}/obs_states/state", rr.Scalar(obs_state))
 
         # Log actions
         actions = item_data.get('actions', {}) or {}
         for action_key, action_val in actions.items():
             if action_val is not None:
                 logger_mp.info(f'Logging action {action_key} with shape: {action_val.shape if hasattr(action_val, "shape") else type(action_val)}')
-                rr.log(f"{self.prefix}{action_key}/actions/action", rr.Scalars(action_val[-1]))
+                rr.log(f"{self.prefix}{action_key}/actions/action", rr.Scalar(action_val[-1]))
             else:
                 logger_mp.warning(f'Could not find {action_key} for action_key')
                 

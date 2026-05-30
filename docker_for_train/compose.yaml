@@ -16,9 +16,6 @@ services:
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     working_dir: /workspace
     command: sleep infinity
-    stdin_open: true
-    tty: true
-    ipc: host
     deploy:
       resources:
         reservations:
