@@ -109,6 +109,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         image_feature_map: Optional[Mapping[str, str]] = None,
         lowdim_feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
         action_feature_fields: Optional[Sequence[str]] = None,
+        action_layout: str = "per_step",
         timestamp_key: str = "timestamp",
         timestamp_step_sec: Optional[float] = None,
         timestamp_tolerance_sec: Optional[float] = None,
@@ -125,19 +126,30 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 f"Unsupported window_sampling_strategy={window_sampling_strategy!r}. "
                 "Expected 'idx' or 'timestamp'."
             )
+        if action_layout not in {"per_step", "prechunked"}:
+            raise ValueError(
+                f"Unsupported action_layout={action_layout!r}. "
+                "Expected 'per_step' or 'prechunked'."
+            )
 
         self.shape_meta = shape_meta
         self.dataset_path = os.path.expanduser(dataset_path)
-        self.horizon = horizon
+        self.horizon = int(horizon)
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
-        self.n_latency_steps = n_latency_steps
+        self.n_latency_steps = int(n_latency_steps)
+        self.action_layout = action_layout
         self.window_sampling_strategy = window_sampling_strategy
         self.timestamp_key = timestamp_key
         self.timestamp_step_sec = timestamp_step_sec
         self.timestamp_tolerance_sec = timestamp_tolerance_sec
-        self.sequence_length = horizon + n_latency_steps
+        if self.action_layout == "prechunked":
+            self.sequence_length = int(n_obs_steps or 1)
+            self.sampler_pad_after = 0
+        else:
+            self.sequence_length = self.horizon + self.n_latency_steps
+            self.sampler_pad_after = self.pad_after
         self.anchor_position = max(0, min(self.sequence_length - 1, (n_obs_steps or 1) - 1))
         self.image_data: Dict[str, np.ndarray] = {}
         self.load_result_add = load_result_add
@@ -199,11 +211,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 )
 
         expected_action_shape = tuple(shape_meta["action"]["shape"])
-        if self.action_data.shape[1:] != expected_action_shape:
-            raise ValueError(
-                f"Action shape mismatch. Got {self.action_data.shape[1:]}, expected {expected_action_shape}. "
-                f"Source fields: {self.action_feature_fields}"
-            )
+        self._validate_action_shape(expected_action_shape)
 
         effective_budget_bytes = compute_effective_budget_bytes(
             memory_limit_gb=memory_limit_gb,
@@ -280,7 +288,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             self.episode_ends,
             sequence_length=self.sequence_length,
             pad_before=self.pad_before,
-            pad_after=self.pad_after,
+            pad_after=self.sampler_pad_after,
             episode_mask=self.train_mask,
         )
 
@@ -314,6 +322,52 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         if len(arrays) == 1:
             return arrays[0].astype(dtype, copy=False)
         return np.concatenate(arrays, axis=-1).astype(dtype, copy=False)
+
+    def _validate_action_shape(self, expected_action_shape: Sequence[int]) -> None:
+        expected_action_shape = tuple(expected_action_shape)
+        source_shape = self.action_data.shape[1:]
+
+        if self.action_layout == "per_step":
+            if source_shape != expected_action_shape:
+                raise ValueError(
+                    f"Per-step action shape mismatch. Got {source_shape}, "
+                    f"expected {expected_action_shape}. "
+                    f"Source fields: {self.action_feature_fields}"
+                )
+            return
+
+        required_chunk_steps = self.n_latency_steps + self.horizon
+        if len(source_shape) < 1 or source_shape[1:] != expected_action_shape:
+            raise ValueError(
+                f"Prechunked action shape mismatch. Got {source_shape}, expected "
+                f"(chunk_steps, {', '.join(map(str, expected_action_shape))}). "
+                f"Source fields: {self.action_feature_fields}"
+            )
+        if source_shape[0] < required_chunk_steps:
+            raise ValueError(
+                f"Prechunked action has {source_shape[0]} steps, but horizon={self.horizon} "
+                f"and n_latency_steps={self.n_latency_steps} require at least "
+                f"{required_chunk_steps}."
+            )
+
+    def _sample_action(self, sequence_indices: np.ndarray) -> np.ndarray:
+        if self.action_layout == "per_step":
+            action = self.action_data[sequence_indices, ...]
+            if self.n_latency_steps > 0:
+                action = action[self.n_latency_steps :]
+        else:
+            anchor_idx = int(sequence_indices[self.anchor_position])
+            chunk_start = self.n_latency_steps
+            chunk_end = chunk_start + self.horizon
+            action = self.action_data[anchor_idx, chunk_start:chunk_end, ...]
+
+        expected_shape = (self.horizon,) + tuple(self.shape_meta["action"]["shape"])
+        if action.shape != expected_shape:
+            raise RuntimeError(
+                f"Sampled action shape mismatch. Got {action.shape}, expected {expected_shape}. "
+                f"action_layout={self.action_layout!r}"
+            )
+        return np.array(action, dtype=np.float32, copy=True)
 
     def _estimate_image_preload_bytes(self) -> int:
         total = 0
@@ -463,7 +517,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             self.episode_ends,
             sequence_length=self.sequence_length,
             pad_before=self.pad_before,
-            pad_after=self.pad_after,
+            pad_after=self.sampler_pad_after,
             episode_mask=self.val_mask,
         )
         val_set.image_randomer = None
@@ -520,10 +574,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         for key in self.lowdim_keys:
             obs_dict[key] = self.lowdim_data[key][obs_indices, ...].astype(np.float32, copy=False)
 
-        action = self.action_data[sequence_indices, ...].astype(np.float32, copy=False)
-        if self.n_latency_steps > 0:
-            action = action[self.n_latency_steps :]
-        action = np.array(action, copy=True)
+        action = self._sample_action(sequence_indices)
 
         return {
             "obs": dict_apply(obs_dict, _safe_torch_from_numpy),
