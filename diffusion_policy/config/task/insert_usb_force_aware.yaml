@@ -46,3 +46,14 @@ dataset:
   local_files_only: true
   preload_images: false
   load_result_add: ram
+
+  image_randomer_config:
+    resize: false
+    random_crop: false
+    rotation: false
+    color_jitter: true
+    color_jitter_params:
+      brightness: 0.3
+      contrast: 0.3
+      saturation: 0.1
+      hue: 0.03
