@@ -6,6 +6,10 @@ import torch.nn.functional as F
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.common.pose_util import (
+    normalize_quaternion_xyzw,
+    relative_pose_to_absolute_pose,
+)
 from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
     ContextTransformerForDiffusion,
 )
@@ -50,15 +54,7 @@ def mean_pose_chunk(action: torch.Tensor, quaternion_eps: float = 1e-8) -> torch
 def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     if action.shape[-1] != 7:
         return action
-    quaternion = action[..., 3:7]
-    norm = torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True)
-    identity = torch.zeros_like(quaternion)
-    identity[..., 3] = 1.0
-    normalized = torch.where(
-        norm > eps,
-        quaternion / norm.clamp_min(eps),
-        identity,
-    )
+    normalized = normalize_quaternion_xyzw(action[..., 3:7], eps=eps)
     return torch.cat([action[..., :3], normalized], dim=-1)
 
 
@@ -72,8 +68,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         horizon: int,
         n_action_steps: int,
         n_obs_steps: int,
-        image_key: str = "wrist",
+        image_key: Optional[str] = None,
+        image_keys: Optional[Sequence[str]] = None,
         wrench_key: str = "wrench_ext",
+        relative_pose_actions: bool = False,
+        action_reference_key: str = "action_reference",
         num_inference_steps: Optional[int] = None,
         dino_model_name_or_path: str = "facebook/dinov3-vits16-pretrain-lvd1689m",
         dino_local_files_only: bool = True,
@@ -98,15 +97,52 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
-        if set(shape_meta.get("obs", {})) != {image_key, wrench_key}:
-            raise ValueError(
-                "Force-aware DP shape_meta must contain exactly the configured image "
-                f"and wrench keys ({image_key!r}, {wrench_key!r})."
+        obs_shape_meta = shape_meta.get("obs", {})
+        configured_image_keys = tuple(
+            sorted(
+                key
+                for key, attr in obs_shape_meta.items()
+                if attr.get("type", "low_dim") == "rgb"
             )
-        image_meta = shape_meta["obs"][image_key]
-        wrench_meta = shape_meta["obs"][wrench_key]
-        if image_meta.get("type") != "rgb":
-            raise ValueError(f"{image_key!r} must be an rgb observation")
+        )
+        if not configured_image_keys:
+            raise ValueError("Force-aware DP requires at least one rgb observation")
+        if image_key is not None and image_keys is not None:
+            raise ValueError(
+                "image_key is a legacy single-camera alias; do not combine it with image_keys"
+            )
+        if image_keys is not None:
+            selected_image_keys = tuple(sorted(str(key) for key in image_keys))
+        elif image_key is not None:
+            selected_image_keys = (str(image_key),)
+        else:
+            selected_image_keys = configured_image_keys
+        if selected_image_keys != configured_image_keys:
+            raise ValueError(
+                "configured camera keys must match every type='rgb' entry in shape_meta; "
+                f"shape_meta cameras={list(configured_image_keys)}, "
+                f"selected cameras={list(selected_image_keys)}"
+            )
+        for key in configured_image_keys:
+            image_shape = tuple(obs_shape_meta[key]["shape"])
+            if len(image_shape) != 3 or image_shape[0] != 3:
+                raise ValueError(
+                    f"rgb observation {key!r} must have shape [3, H, W], "
+                    f"got {image_shape}"
+                )
+        if wrench_key not in obs_shape_meta:
+            raise ValueError(f"wrench observation {wrench_key!r} is missing from shape_meta")
+        wrench_meta = obs_shape_meta[wrench_key]
+        if wrench_meta.get("type", "low_dim") != "low_dim":
+            raise ValueError(f"{wrench_key!r} must be a low_dim observation")
+        unsupported_obs_keys = set(obs_shape_meta) - set(configured_image_keys) - {
+            wrench_key
+        }
+        if unsupported_obs_keys:
+            raise ValueError(
+                "Force-aware DP only supports rgb cameras plus the configured wrench; "
+                f"unsupported observation keys={sorted(unsupported_obs_keys)}"
+            )
         wrench_shape = tuple(wrench_meta["shape"])
         if wrench_shape != (wrench_history_steps, 6):
             raise ValueError(
@@ -120,6 +156,12 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             raise ValueError("n_action_steps must be in [1, horizon]")
 
         action_dim = action_shape[0]
+        if relative_pose_actions and action_dim != 7:
+            raise ValueError(
+                "relative_pose_actions requires action shape [7] in xyz + xyzw format"
+            )
+        if not action_reference_key:
+            raise ValueError("action_reference_key must not be empty")
         if obs_encoder is None:
             obs_encoder = ForceAwareObsEncoder(
                 pretrained_model_name_or_path=dino_model_name_or_path,
@@ -133,6 +175,18 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 dropout=p_drop_attn,
                 freeze_backbone=freeze_dino_backbone,
                 local_files_only=dino_local_files_only,
+                image_keys=configured_image_keys,
+            )
+        encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
+        if encoder_image_keys and encoder_image_keys != configured_image_keys:
+            raise ValueError(
+                f"obs_encoder cameras={list(encoder_image_keys)} do not match "
+                f"shape_meta cameras={list(configured_image_keys)}"
+            )
+        if len(configured_image_keys) > 1 and not encoder_image_keys:
+            raise ValueError(
+                "a custom obs_encoder for multiple cameras must be constructed with "
+                "matching image_keys"
             )
         context_tokens = n_obs_steps * obs_encoder.context_tokens_per_observation
         if action_expert is None:
@@ -166,8 +220,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.n_action_steps = int(n_action_steps)
         self.n_obs_steps = int(n_obs_steps)
         self.action_dim = int(action_dim)
-        self.image_key = image_key
+        self.image_keys = configured_image_keys
+        self.image_key = configured_image_keys[0] if len(configured_image_keys) == 1 else None
         self.wrench_key = wrench_key
+        self.relative_pose_actions = bool(relative_pose_actions)
+        self.action_reference_key = str(action_reference_key)
         self.scheduler_step_kwargs = scheduler_step_kwargs
         self.optimizer_step = 0
         self.last_curriculum_metrics: Dict[str, float] = {}
@@ -183,15 +240,22 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
     def set_optimizer_step(self, optimizer_step: int) -> None:
         self.optimizer_step = int(optimizer_step)
 
-    def _validate_obs(self, obs_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        missing = {self.image_key, self.wrench_key} - set(obs_dict)
+    def _validate_obs(
+        self, obs_dict: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        missing = set(self.image_keys).union({self.wrench_key}) - set(obs_dict)
         if missing:
             raise KeyError(f"missing force-aware observations: {sorted(missing)}")
-        image = obs_dict[self.image_key][:, : self.n_obs_steps]
+        images = {
+            key: obs_dict[key][:, : self.n_obs_steps]
+            for key in self.image_keys
+        }
         raw_wrench = obs_dict[self.wrench_key][:, : self.n_obs_steps]
-        if image.shape[1] != self.n_obs_steps or raw_wrench.shape[1] != self.n_obs_steps:
+        if raw_wrench.shape[1] != self.n_obs_steps or any(
+            image.shape[1] != self.n_obs_steps for image in images.values()
+        ):
             raise ValueError(f"policy requires {self.n_obs_steps} observation steps")
-        return image, raw_wrench
+        return images, raw_wrench
 
     def _encode_context(
         self,
@@ -199,7 +263,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         apply_curriculum_mask: bool,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        image, raw_wrench = self._validate_obs(obs_dict)
+        images, raw_wrench = self._validate_obs(obs_dict)
         normalized_wrench = self.normalizer[self.wrench_key].normalize(raw_wrench)
         contact = self.contact_detector(raw_wrench)
         probability = self.mask_scheduler.probability(self.optimizer_step)
@@ -216,7 +280,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
         return self.obs_encoder(
-            image=image,
+            images=images,
             wrench_history=normalized_wrench,
             image_token_mask=image_mask,
         )
@@ -262,8 +326,32 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             context=context,
             generator=generator,
         )
-        action_prediction = self.normalizer["action"].unnormalize(normalized_prediction)
-        action_prediction = normalize_pose_quaternions(action_prediction)
+        model_action_prediction = self.normalizer["action"].unnormalize(
+            normalized_prediction
+        )
+        model_action_prediction = normalize_pose_quaternions(model_action_prediction)
+        action_prediction = model_action_prediction
+        if self.relative_pose_actions:
+            if self.action_reference_key not in obs_dict:
+                raise KeyError(
+                    f"relative pose prediction requires obs[{self.action_reference_key!r}] "
+                    "containing the current absolute EE pose as xyz + xyzw"
+                )
+            action_reference = obs_dict[self.action_reference_key]
+            if action_reference.ndim == 3:
+                action_reference = action_reference[:, -1]
+            if action_reference.ndim != 2 or action_reference.shape != (
+                batch_size,
+                7,
+            ):
+                raise ValueError(
+                    f"obs[{self.action_reference_key!r}] must have shape [B, 7] "
+                    f"or [B, T, 7], got {tuple(obs_dict[self.action_reference_key].shape)}"
+                )
+            action_prediction = relative_pose_to_absolute_pose(
+                model_action_prediction,
+                action_reference,
+            )
         start = self.n_obs_steps - 1
         end = min(start + self.n_action_steps, self.horizon)
         selected_action = action_prediction[:, start:end]
@@ -272,6 +360,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         return {
             "action": selected_action,
             "action_pred": action_prediction,
+            "model_action_pred": model_action_prediction,
             "action_target": mean_pose_chunk(selected_action),
         }
 

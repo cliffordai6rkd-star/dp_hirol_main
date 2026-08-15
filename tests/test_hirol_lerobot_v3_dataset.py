@@ -48,7 +48,15 @@ def _shape_meta():
 
 
 class HirolLeRobotV3DatasetActionLayoutTest(unittest.TestCase):
-    def _create_dataset(self, action, *, action_layout, horizon, n_latency_steps=0):
+    def _create_dataset(
+        self,
+        action,
+        *,
+        action_layout,
+        horizon,
+        n_latency_steps=0,
+        relative_pose_actions=False,
+    ):
         _FakeLeRobotV3Dataset.columns = _columns(action)
         with patch(
             "diffusion_policy.dataset.hirol_lerobot_v3_dataset.LeRobotV3Dataset",
@@ -65,6 +73,7 @@ class HirolLeRobotV3DatasetActionLayoutTest(unittest.TestCase):
                 val_ratio=0.0,
                 action_feature_fields=["action.ee_pose"],
                 action_layout=action_layout,
+                relative_pose_actions=relative_pose_actions,
                 preload_images=False,
             )
 
@@ -84,6 +93,7 @@ class HirolLeRobotV3DatasetActionLayoutTest(unittest.TestCase):
         last = dataset[3]
         self.assertEqual(tuple(first["obs"]["wrench_ext"].shape), (2, 8, 6))
         self.assertEqual(tuple(first["action"].shape), (8, 7))
+        self.assertNotIn("action_reference", first["obs"])
         np.testing.assert_array_equal(first["action"][:, 0].numpy(), np.arange(8))
         np.testing.assert_array_equal(last["action"][:, 0].numpy(), 30 + np.arange(8))
 
@@ -125,6 +135,47 @@ class HirolLeRobotV3DatasetActionLayoutTest(unittest.TestCase):
                 action,
                 action_layout="prechunked",
                 horizon=8,
+            )
+
+    def test_prechunked_relative_pose_actions_use_chunk_step_zero_as_reference(self):
+        action = np.zeros((4, 3, 7), dtype=np.float32)
+        action[..., 6] = 1.0
+        for frame_idx in range(4):
+            action[frame_idx, :, 0] = frame_idx + np.array([0.0, 0.1, 0.2])
+
+        dataset = self._create_dataset(
+            action,
+            action_layout="prechunked",
+            horizon=3,
+            relative_pose_actions=True,
+        )
+
+        sample = dataset[2]
+        np.testing.assert_allclose(
+            sample["obs"]["action_reference"].numpy(),
+            [2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            sample["action"][:, 0].numpy(),
+            [0.0, 0.1, 0.2],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            sample["action"][:, 3:7].numpy(),
+            np.tile([0.0, 0.0, 0.0, 1.0], (3, 1)),
+            atol=1e-6,
+        )
+
+    def test_relative_pose_actions_reject_per_step_layout(self):
+        action = np.zeros((4, 7), dtype=np.float32)
+        action[..., 6] = 1.0
+        with self.assertRaisesRegex(ValueError, "requires action_layout='prechunked'"):
+            self._create_dataset(
+                action,
+                action_layout="per_step",
+                horizon=3,
+                relative_pose_actions=True,
             )
 
 

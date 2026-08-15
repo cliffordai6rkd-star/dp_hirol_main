@@ -1,4 +1,5 @@
 import inspect
+from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import torch
@@ -23,6 +24,7 @@ class ForceAwareObsEncoder(nn.Module):
         local_files_only: bool = True,
         image_mean: Sequence[float] = (0.485, 0.456, 0.406),
         image_std: Sequence[float] = (0.229, 0.224, 0.225),
+        image_keys: Optional[Sequence[str]] = None,
         backbone: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -43,6 +45,9 @@ class ForceAwareObsEncoder(nn.Module):
         self.wrench_history_steps = int(wrench_history_steps)
         self.freeze_backbone = bool(freeze_backbone)
         self.force_temporal_encoder_type = force_temporal_encoder
+        self.image_keys = tuple(sorted(str(key) for key in (image_keys or ())))
+        if len(set(self.image_keys)) != len(self.image_keys):
+            raise ValueError("image_keys must not contain duplicates")
 
         if backbone is None:
             try:
@@ -77,6 +82,13 @@ class ForceAwareObsEncoder(nn.Module):
         self.image_modality = nn.Parameter(torch.zeros(1, 1, 1, self.n_emb))
         self.force_modality = nn.Parameter(torch.zeros(1, 1, 1, self.n_emb))
         self.image_mask_token = nn.Parameter(torch.zeros(1, 1, self.n_emb))
+        self.camera_embedding = (
+            nn.Parameter(
+                torch.zeros(1, 1, len(self.image_keys), 1, self.n_emb)
+            )
+            if len(self.image_keys) > 1
+            else None
+        )
 
         if force_temporal_encoder == "gru":
             self.force_encoder = nn.GRU(
@@ -146,6 +158,8 @@ class ForceAwareObsEncoder(nn.Module):
         nn.init.normal_(self.image_modality, std=0.02)
         nn.init.normal_(self.force_modality, std=0.02)
         nn.init.normal_(self.image_mask_token, std=0.02)
+        if self.camera_embedding is not None:
+            nn.init.normal_(self.camera_embedding, std=0.02)
         self._set_backbone_frozen()
 
     @property
@@ -190,20 +204,72 @@ class ForceAwareObsEncoder(nn.Module):
 
     def forward(
         self,
-        image: torch.Tensor,
-        wrench_history: torch.Tensor,
+        image: Optional[torch.Tensor] = None,
+        wrench_history: Optional[torch.Tensor] = None,
         image_token_mask: Optional[torch.Tensor] = None,
+        images: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        if image.ndim != 5:
-            raise ValueError(f"image must be [B, To, C, H, W], got {tuple(image.shape)}")
+        if images is not None and image is not None:
+            raise ValueError("provide either images or the legacy image argument, not both")
+        if images is None:
+            if image is None:
+                raise ValueError("at least one RGB image observation is required")
+            legacy_key = self.image_keys[0] if len(self.image_keys) == 1 else "image"
+            images = {legacy_key: image}
+        if not isinstance(images, Mapping) or not images:
+            raise ValueError("images must be a non-empty mapping of RGB observation tensors")
+
+        runtime_image_keys = tuple(sorted(str(key) for key in images))
+        if self.image_keys:
+            if runtime_image_keys != self.image_keys:
+                missing = sorted(set(self.image_keys) - set(runtime_image_keys))
+                extra = sorted(set(runtime_image_keys) - set(self.image_keys))
+                raise KeyError(
+                    f"image observations do not match configured cameras; "
+                    f"missing={missing}, extra={extra}"
+                )
+            image_keys = self.image_keys
+        else:
+            if len(runtime_image_keys) != 1:
+                raise ValueError(
+                    "a legacy encoder without image_keys supports exactly one camera"
+                )
+            image_keys = runtime_image_keys
+
+        first_image = images[image_keys[0]]
+        if first_image.ndim != 5:
+            raise ValueError(
+                f"image {image_keys[0]!r} must be [B, To, C, H, W], "
+                f"got {tuple(first_image.shape)}"
+            )
+        batch_size, obs_steps = first_image.shape[:2]
+        for key in image_keys:
+            camera_image = images[key]
+            if camera_image.ndim != 5:
+                raise ValueError(
+                    f"image {key!r} must be [B, To, C, H, W], "
+                    f"got {tuple(camera_image.shape)}"
+                )
+            if camera_image.shape[:2] != (batch_size, obs_steps):
+                raise ValueError(
+                    f"image {key!r} batch/observation dimensions "
+                    f"{tuple(camera_image.shape[:2])} do not match "
+                    f"{(batch_size, obs_steps)}"
+                )
+            if camera_image.shape[2] != 3:
+                raise ValueError(
+                    f"image {key!r} must have 3 channels, got {camera_image.shape[2]}"
+                )
+
+        if wrench_history is None:
+            raise ValueError("wrench_history is required")
         if wrench_history.ndim != 4:
             raise ValueError(
                 "wrench_history must be [B, To, K, D], "
                 f"got {tuple(wrench_history.shape)}"
             )
-        batch_size, obs_steps = image.shape[:2]
         if wrench_history.shape[:2] != (batch_size, obs_steps):
-            raise ValueError("image and wrench batch/observation dimensions must match")
+            raise ValueError("images and wrench batch/observation dimensions must match")
         history_steps = wrench_history.shape[2]
         if obs_steps > self.max_obs_steps:
             raise ValueError(f"obs_steps={obs_steps} exceeds max_obs_steps={self.max_obs_steps}")
@@ -212,26 +278,64 @@ class ForceAwareObsEncoder(nn.Module):
                 f"wrench history has {history_steps} steps, expected {self.wrench_history_steps}"
             )
 
-        flat_image = image.reshape(-1, *image.shape[2:])
-        _, patch_image = self._encode_dino(flat_image)
-        patch_image = self.image_projection(patch_image)
-        patch_count = patch_image.shape[1]
-        patch_image = patch_image.reshape(
-            batch_size, obs_steps, patch_count, self.n_emb
-        )
-
         obs_position = self.obs_position[:, :obs_steps]
-        patch_image = patch_image + obs_position + self.image_modality
+        if image_token_mask is not None and image_token_mask.shape != (
+            batch_size,
+            obs_steps,
+        ):
+            raise ValueError(
+                "image_token_mask must be [B, To], "
+                f"got {tuple(image_token_mask.shape)}"
+            )
 
-        if image_token_mask is not None:
-            if image_token_mask.shape != (batch_size, obs_steps):
-                raise ValueError(
-                    "image_token_mask must be [B, To], "
-                    f"got {tuple(image_token_mask.shape)}"
+        # Match native DP's shared-RGB-model path: cameras with the same tensor
+        # shape are concatenated along the batch axis and encoded in one call.
+        camera_groups = {}
+        for key in image_keys:
+            camera_image = images[key]
+            signature = (
+                tuple(camera_image.shape[2:]),
+                camera_image.dtype,
+                camera_image.device,
+            )
+            camera_groups.setdefault(signature, []).append(key)
+
+        encoded_camera_patches = {}
+        flat_camera_batch = batch_size * obs_steps
+        for grouped_keys in camera_groups.values():
+            flat_images = torch.cat(
+                [
+                    images[key].reshape(-1, *images[key].shape[2:])
+                    for key in grouped_keys
+                ],
+                dim=0,
+            )
+            _, grouped_patches = self._encode_dino(flat_images)
+            grouped_patches = self.image_projection(grouped_patches)
+            for key, patch_image in zip(
+                grouped_keys,
+                grouped_patches.split(flat_camera_batch, dim=0),
+            ):
+                encoded_camera_patches[key] = patch_image.reshape(
+                    batch_size, obs_steps, patch_image.shape[1], self.n_emb
                 )
-            mask = image_token_mask[:, :, None, None]
-            mask_token = self.image_mask_token.reshape(1, 1, 1, self.n_emb)
-            patch_image = torch.where(mask, mask_token, patch_image)
+
+        camera_patch_tokens = []
+        for camera_index, key in enumerate(image_keys):
+            patch_image = encoded_camera_patches[key]
+            patch_image = patch_image + obs_position + self.image_modality
+            if self.camera_embedding is not None:
+                patch_image = (
+                    patch_image + self.camera_embedding[:, :, camera_index]
+                )
+            if image_token_mask is not None:
+                mask = image_token_mask[:, :, None, None]
+                mask_token = self.image_mask_token.reshape(1, 1, 1, self.n_emb)
+                patch_image = torch.where(mask, mask_token, patch_image)
+            camera_patch_tokens.append(patch_image)
+
+        patch_image = torch.cat(camera_patch_tokens, dim=2)
+        patch_count = patch_image.shape[2]
 
         force = self.wrench_projection(wrench_history)
         force = (

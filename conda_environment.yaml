@@ -1,4 +1,4 @@
-name: dp
+name: fdp
 channels:
   - conda-forge
 dependencies:

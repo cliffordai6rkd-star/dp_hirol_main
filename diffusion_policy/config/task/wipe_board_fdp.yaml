@@ -1,4 +1,18 @@
-name: insert_usb_force_aware
+name: wipe_board_force_aware
+
+# Every shape_meta.obs entry with type: rgb is encoded as a camera.
+# Camera keys must also appear in dataset.image_feature_map below.
+wrench_key: wrench_ext
+wrench_history_steps: &wrench_history_steps 4
+# Norm threshold of the selected raw wrench dimensions, before normalization.
+contact_threshold: 0.6
+contact_force_dims: [0, 1, 2]
+contact_history_reducer: mean  # mean, max, or last
+
+# false: absolute xyz + xyzw targets (existing behavior)
+# true: world-frame delta xyz + relative xyzw, anchored at action chunk step 0
+relative_pose_actions: false
+action_reference_key: action_reference
 
 image_shape: &image_shape [3, 192, 256]
 shape_meta: &shape_meta
@@ -6,9 +20,14 @@ shape_meta: &shape_meta
     wrist:
       shape: *image_shape
       type: rgb
+    side:
+      shape: *image_shape
+      type: rgb
+      
     wrench_ext:
-      shape: [8, 6]
+      shape: [*wrench_history_steps, 6]
       type: low_dim
+
   action:
     shape: [7]
 
@@ -16,7 +35,7 @@ shape_meta: &shape_meta
 env_runner: null
 
 normalizer:
-  mode: limits
+  mode: gaussian
   last_n_dims: 1
 
 dataset:
@@ -34,17 +53,20 @@ dataset:
   window_sampling_strategy: idx
   image_feature_map:
     wrist: observation.images.wrist
+    side: observation.images.side
   lowdim_feature_groups:
     wrench_ext:
       - observation.wrench_ext
   action_feature_fields:
     - action.ee_pose
-  action_layout: prechunked
+  action_layout: per_step
+  relative_pose_actions: ${task.relative_pose_actions}
+  action_reference_key: ${task.action_reference_key}
   timestamp_key: timestamp
-  timestamp_step_sec: 0.1
+  timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
   local_files_only: true
-  preload_images: false
+  preload_images: true
   load_result_add: ram
 
   image_randomer_config:
@@ -53,7 +75,7 @@ dataset:
     rotation: false
     color_jitter: true
     color_jitter_params:
-      brightness: 0.3
-      contrast: 0.3
+      brightness: 0.1
+      contrast: 0.15
       saturation: 0.1
       hue: 0.03

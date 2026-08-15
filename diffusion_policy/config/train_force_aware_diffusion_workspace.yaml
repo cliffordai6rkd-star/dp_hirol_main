@@ -1,11 +1,11 @@
 defaults:
   - _self_
-  - task@task: insert_usb_force_aware
+  - task@task: wipe_board_fdp
 
-name: train_insert_usb_force_aware_dit
+name: train_force_aware_dit
 _target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
 
-dataset_path: ${oc.env:INSERT_USB_DATASET_PATH,/home/rei/mnt/code/lcx/nero_ws/runs/insert_usb_lerobotv3_dp}
+dataset_path: ${oc.env:FDP_DATASET_PATH}
 dino_model_path: ${oc.env:DINOV3_MODEL_PATH,facebook/dinov3-vits16-pretrain-lvd1689m}
 
 task_name: ${task.name}
@@ -35,14 +35,15 @@ policy:
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
-  image_key: wrist
-  wrench_key: wrench_ext
+  wrench_key: ${task.wrench_key}
+  relative_pose_actions: ${task.relative_pose_actions}
+  action_reference_key: ${task.action_reference_key}
   num_inference_steps: 8
 
   dino_model_name_or_path: ${dino_model_path}
   dino_local_files_only: true
   freeze_dino_backbone: true
-  wrench_history_steps: 8
+  wrench_history_steps: ${task.wrench_history_steps}
   force_temporal_encoder: gru
   force_encoder_layers: 1
 
@@ -54,11 +55,10 @@ policy:
   p_drop_attn: 0.1
   causal_attn: false
 
-  # Threshold is the norm of raw Fx/Fy/Fz in physical units, before normalization.
-  # Full-dataset initial value: 2 N marks about 16.4% of the 17,178 frames.
-  contact_threshold: 1.5
-  contact_force_dims: [0, 1, 2]
-  contact_history_reducer: mean   #mean max last
+  # Contact detection stays task-owned because force scales vary by task/sensor.
+  contact_threshold: ${task.contact_threshold}
+  contact_force_dims: ${task.contact_force_dims}
+  contact_history_reducer: ${task.contact_history_reducer}
 
   # Ablation choices: current_observation or full_context.
   image_mask_scope: full_context
@@ -66,7 +66,7 @@ policy:
     # Choices: constant, linear, cosine, exponential, piecewise.
     schedule_type: cosine
     start_step: 0
-    end_step: 50000
+    end_step: 30000
     start_probability: 1.0
     end_probability: 0.0
     exponential_rate: 5.0
@@ -80,8 +80,8 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 8
-  num_workers: 6
+  batch_size: 512
+  num_workers: 8
   shuffle: true
   pin_memory: true
   persistent_workers: true
@@ -89,7 +89,7 @@ dataloader:
 
 val_dataloader:
   batch_size: 8
-  num_workers: 4
+  num_workers: 2
   shuffle: false
   pin_memory: true
   persistent_workers: true
@@ -108,12 +108,16 @@ training:
   resume: true
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 300
-  gradient_accumulate_every: 4
+  # Set exactly one of num_epochs and num_optimizer_steps.
+  num_epochs: null
+  num_optimizer_steps: 60000
+  gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
   rollout_every: 100
   checkpoint_every: 10
+  # Set to null to retain the legacy epoch-based checkpoint_every behavior.
+  checkpoint_every_optimizer_steps: 5000
   val_every: 5
   sample_every: 10
   max_train_steps: null
@@ -124,17 +128,17 @@ logging:
   project: nero_force_aware_diffusion
   resume: true
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}
-  tags: [force-aware, dinov3, insert-usb]
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: [force-aware, dinov3, "${task_name}"]
   id: null
   group: null
 
 checkpoint:
   topk:
-    monitor_key: val_loss
+    monitor_key: train_loss
     mode: min
     k: 5
-    format_str: epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt
+    format_str: optimizer_step={optimizer_step:08d}-train_loss={train_loss:.6f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false
 
@@ -142,7 +146,7 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
   sweep:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}

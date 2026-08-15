@@ -18,6 +18,7 @@ from diffusion_policy.common.memory_budget import (
 )
 
 from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.common.pose_util import absolute_pose_to_relative_pose
 from diffusion_policy.common.sampler import create_indices, downsample_mask, get_val_mask
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.dataset.image_result_cache import (
@@ -110,6 +111,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         lowdim_feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
         action_feature_fields: Optional[Sequence[str]] = None,
         action_layout: str = "per_step",
+        relative_pose_actions: bool = False,
+        action_reference_key: str = "action_reference",
         timestamp_key: str = "timestamp",
         timestamp_step_sec: Optional[float] = None,
         timestamp_tolerance_sec: Optional[float] = None,
@@ -140,6 +143,15 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.n_obs_steps = n_obs_steps
         self.n_latency_steps = int(n_latency_steps)
         self.action_layout = action_layout
+        self.relative_pose_actions = bool(relative_pose_actions)
+        self.action_reference_key = str(action_reference_key)
+        if not self.action_reference_key:
+            raise ValueError("action_reference_key must not be empty")
+        if self.relative_pose_actions and self.action_layout != "prechunked":
+            raise ValueError(
+                "relative_pose_actions currently requires action_layout='prechunked' "
+                "so every sample has an explicit current-pose anchor"
+            )
         self.window_sampling_strategy = window_sampling_strategy
         self.timestamp_key = timestamp_key
         self.timestamp_step_sec = timestamp_step_sec
@@ -212,6 +224,22 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
 
         expected_action_shape = tuple(shape_meta["action"]["shape"])
         self._validate_action_shape(expected_action_shape)
+        self.action_reference_data: Optional[np.ndarray] = None
+        if self.relative_pose_actions:
+            if expected_action_shape != (7,):
+                raise ValueError(
+                    "relative_pose_actions requires action shape [7] in xyz + xyzw format"
+                )
+            self.action_reference_data = np.array(
+                self.action_data[:, 0, :],
+                dtype=np.float32,
+                copy=True,
+            )
+            relative_action = absolute_pose_to_relative_pose(
+                torch.from_numpy(self.action_data),
+                torch.from_numpy(self.action_reference_data),
+            )
+            self.action_data = relative_action.numpy().astype(np.float32, copy=False)
 
         effective_budget_bytes = compute_effective_budget_bytes(
             memory_limit_gb=memory_limit_gb,
@@ -575,6 +603,11 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             obs_dict[key] = self.lowdim_data[key][obs_indices, ...].astype(np.float32, copy=False)
 
         action = self._sample_action(sequence_indices)
+        if self.relative_pose_actions:
+            anchor_idx = int(sequence_indices[self.anchor_position])
+            obs_dict[self.action_reference_key] = self.action_reference_data[
+                anchor_idx
+            ].astype(np.float32, copy=False)
 
         return {
             "obs": dict_apply(obs_dict, _safe_torch_from_numpy),

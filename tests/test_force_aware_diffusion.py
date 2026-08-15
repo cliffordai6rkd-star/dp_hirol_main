@@ -9,6 +9,10 @@ from diffusion_policy.model.common.normalizer import (
     LinearNormalizer,
     SingleFieldLinearNormalizer,
 )
+from diffusion_policy.common.pose_util import (
+    absolute_pose_to_relative_pose,
+    relative_pose_to_absolute_pose,
+)
 from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
     ContextTransformerForDiffusion,
 )
@@ -34,8 +38,10 @@ class FakeDinoBackbone(nn.Module):
         )
         self.patch_count = patch_count
         self.projection = nn.Linear(3, hidden_size)
+        self.forward_calls = 0
 
     def forward(self, pixel_values, interpolate_pos_encoding=False):
+        self.forward_calls += 1
         pooled = pixel_values.mean(dim=(-2, -1))
         cls = self.projection(pooled).unsqueeze(1)
         registers = torch.zeros(
@@ -53,7 +59,7 @@ class FakeDinoBackbone(nn.Module):
         )
 
 
-def make_obs_encoder(n_emb=16, temporal_encoder="gru"):
+def make_obs_encoder(n_emb=16, temporal_encoder="gru", image_keys=None):
     return ForceAwareObsEncoder(
         pretrained_model_name_or_path="unused",
         n_emb=n_emb,
@@ -65,6 +71,7 @@ def make_obs_encoder(n_emb=16, temporal_encoder="gru"):
         force_encoder_layers=1,
         dropout=0.0,
         freeze_backbone=True,
+        image_keys=image_keys,
         backbone=FakeDinoBackbone(hidden_size=12),
     )
 
@@ -82,8 +89,12 @@ def make_normalizer():
     return normalizer
 
 
-def make_policy(mask_scope="full_context"):
-    encoder = make_obs_encoder()
+def make_policy(
+    mask_scope="full_context",
+    relative_pose_actions=False,
+    image_keys=("wrist",),
+):
+    encoder = make_obs_encoder(image_keys=image_keys)
     expert = ContextTransformerForDiffusion(
         input_dim=7,
         output_dim=7,
@@ -104,7 +115,10 @@ def make_policy(mask_scope="full_context"):
     policy = ForceAwareDiffusionTransformerPolicy(
         shape_meta={
             "obs": {
-                "wrist": {"shape": [3, 16, 16], "type": "rgb"},
+                **{
+                    key: {"shape": [3, 16, 16], "type": "rgb"}
+                    for key in image_keys
+                },
                 "wrench_ext": {"shape": [8, 6], "type": "low_dim"},
             },
             "action": {"shape": [7]},
@@ -113,8 +127,8 @@ def make_policy(mask_scope="full_context"):
         horizon=8,
         n_action_steps=7,
         n_obs_steps=2,
-        image_key="wrist",
         wrench_key="wrench_ext",
+        relative_pose_actions=relative_pose_actions,
         num_inference_steps=2,
         n_emb=16,
         contact_threshold=5.0,
@@ -188,6 +202,54 @@ def test_force_encoder_returns_eight_tokens_per_observation(temporal_encoder):
     context.sum().backward()
     assert all(parameter.grad is None for parameter in encoder.backbone.parameters())
     assert encoder.wrench_projection.weight.grad is not None
+
+
+def test_force_encoder_encodes_every_configured_camera():
+    encoder = make_obs_encoder(image_keys=("wrist", "side"))
+    context = encoder(
+        images={
+            "wrist": torch.rand(2, 2, 3, 16, 16),
+            "side": torch.rand(2, 2, 3, 16, 16),
+        },
+        wrench_history=torch.randn(2, 2, 8, 6),
+        image_token_mask=torch.tensor([[False, True], [False, False]]),
+    )
+    assert encoder.image_keys == ("side", "wrist")
+    assert encoder.backbone.forward_calls == 1
+    assert context.shape == (2, 16, 16)
+
+
+def test_force_encoder_groups_cameras_with_different_resolutions():
+    encoder = make_obs_encoder(image_keys=("wrist", "side"))
+    context = encoder(
+        images={
+            "wrist": torch.rand(1, 2, 3, 16, 16),
+            "side": torch.rand(1, 2, 3, 12, 20),
+        },
+        wrench_history=torch.randn(1, 2, 8, 6),
+    )
+    assert encoder.backbone.forward_calls == 2
+    assert context.shape == (1, 16, 16)
+
+
+def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
+    policy = make_policy(image_keys=("wrist", "side"))
+    policy.train()
+    batch = {
+        "obs": {
+            "wrist": torch.rand(2, 2, 3, 16, 16),
+            "side": torch.rand(2, 2, 3, 16, 16),
+            "wrench_ext": torch.zeros(2, 2, 8, 6),
+        },
+        "action": torch.randn(2, 8, 7),
+    }
+    loss = policy.compute_loss(batch, optimizer_step=0)
+    assert policy.image_keys == ("side", "wrist")
+    assert loss.ndim == 0 and torch.isfinite(loss)
+
+    del batch["obs"]["side"]
+    with pytest.raises(KeyError, match="side"):
+        policy.compute_loss(batch, optimizer_step=0)
 
 
 def test_context_transformer_output_shape():
@@ -270,3 +332,73 @@ def test_pose_quaternion_normalization_has_identity_fallback():
         normalized[..., 3:7],
         torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]]),
     )
+
+
+def test_relative_pose_round_trip_and_quaternion_sign_invariance():
+    reference = torch.tensor(
+        [[1.0, 2.0, 3.0, 0.0, 0.0, 0.7071068, 0.7071068]]
+    )
+    target = torch.tensor(
+        [[
+            [1.1, 2.2, 2.9, 0.0, 0.0, 1.0, 0.0],
+            [0.9, 2.0, 3.3, 0.0, 0.0, -1.0, 0.0],
+        ]]
+    )
+    relative = absolute_pose_to_relative_pose(target, reference)
+    restored = relative_pose_to_absolute_pose(relative, reference)
+
+    assert torch.allclose(relative[0, 0, :3], torch.tensor([0.1, 0.2, -0.1]))
+    assert torch.allclose(relative[0, 0, 3:7], relative[0, 1, 3:7], atol=1e-6)
+    assert torch.allclose(restored[..., :3], target[..., :3], atol=1e-6)
+    quaternion_similarity = torch.abs(
+        (restored[..., 3:7] * target[..., 3:7]).sum(dim=-1)
+    )
+    assert torch.allclose(quaternion_similarity, torch.ones_like(quaternion_similarity))
+
+
+def test_relative_policy_restores_absolute_prediction_for_controller():
+    policy = make_policy(relative_pose_actions=True)
+    policy.eval()
+    relative_prediction = torch.zeros(2, 8, 7)
+    relative_prediction[..., 0] = 0.05
+    relative_prediction[..., 6] = 1.0
+    normalized_prediction = policy.normalizer["action"].normalize(relative_prediction)
+    policy.conditional_sample = lambda shape, context, generator=None: (
+        normalized_prediction.to(device=context.device, dtype=context.dtype)
+    )
+    obs = {
+        "wrist": torch.rand(2, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(2, 2, 8, 6),
+        "action_reference": torch.tensor(
+            [
+                [1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0],
+                [4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+    }
+
+    result = policy.predict_action(obs)
+
+    assert torch.allclose(result["model_action_pred"], relative_prediction, atol=1e-5)
+    assert torch.allclose(
+        result["action_pred"][..., :3],
+        obs["action_reference"][:, None, :3]
+        + torch.tensor([0.05, 0.0, 0.0]),
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        result["action_target"][..., :3],
+        obs["action_reference"][..., :3] + torch.tensor([0.05, 0.0, 0.0]),
+        atol=1e-5,
+    )
+
+
+def test_relative_policy_requires_current_pose_reference():
+    policy = make_policy(relative_pose_actions=True)
+    policy.eval()
+    obs = {
+        "wrist": torch.rand(1, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(1, 2, 8, 6),
+    }
+    with pytest.raises(KeyError, match="current absolute EE pose"):
+        policy.predict_action(obs)
