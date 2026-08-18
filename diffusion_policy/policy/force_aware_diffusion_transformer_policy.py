@@ -420,6 +420,14 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             raise ValueError(f"unsupported prediction type {prediction_type!r}")
         return F.mse_loss(prediction, target)
 
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        optimizer_step: Optional[int] = None,
+    ) -> torch.Tensor:
+        """DDP-compatible training forward; inference uses ``predict_action``."""
+        return self.compute_loss(batch, optimizer_step=optimizer_step)
+
     def get_optimizer(
         self,
         learning_rate: float,

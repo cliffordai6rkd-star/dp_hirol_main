@@ -24,6 +24,12 @@ export FDP_DATASET_PATH=/opt/lcx/data/wipe_board_lbv3/
 export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
 
 python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace --config-name=train_force_aware_diffusion_workspace
+
+  CUDA_VISIBLE_DEVICES=0,1 \
+  /opt/lcx/conda/envs/dp/bin/torchrun \
+    --standalone \
+    --nproc_per_node=2 \
+    -m diffusion_policy.workspace.train_force_aware_diffusion_workspace
 ```
 
 `FDP_DATASET_PATH` 指向当前任务的数据集目录；`DINOV3_MODEL_PATH` 指向包含 `config.json` 和模型权重的本地 DINOv3 文件夹。默认使用 `cuda:0`、batch size 512、梯度累积 1 次、40000 optimizer steps 和在线 W&B 日志。

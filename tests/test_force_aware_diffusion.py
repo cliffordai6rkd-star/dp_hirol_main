@@ -234,6 +234,11 @@ def test_force_encoder_groups_cameras_with_different_resolutions():
 
 def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
     policy = make_policy(image_keys=("wrist", "side"))
+    assert all(
+        parameter.numel() > 0
+        for parameter in policy.parameters()
+        if parameter.requires_grad
+    )
     policy.train()
     batch = {
         "obs": {
@@ -243,7 +248,8 @@ def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
         },
         "action": torch.randn(2, 8, 7),
     }
-    loss = policy.compute_loss(batch, optimizer_step=0)
+    # Exercise nn.Module.forward, which is the path used by DDP.
+    loss = policy(batch, optimizer_step=0)
     assert policy.image_keys == ("side", "wrist")
     assert loss.ndim == 0 and torch.isfinite(loss)
 

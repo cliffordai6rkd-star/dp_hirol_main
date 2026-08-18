@@ -8,19 +8,26 @@ if __name__ == "__main__":
     os.chdir(root_dir)
 
 import copy
+import contextlib
 import math
 import os
 import pathlib
 import random
+from dataclasses import dataclass
 from typing import Optional
 
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 import wandb
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
+from omegaconf import open_dict
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
@@ -36,6 +43,110 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def enabled(self) -> bool:
+        return self.world_size > 1
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+
+class _NullLogger(contextlib.AbstractContextManager):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def log(self, value, **kwargs) -> None:
+        pass
+
+
+def resolve_amp_dtype(dtype_name: str) -> torch.dtype:
+    normalized = str(dtype_name).lower()
+    dtype_by_name = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    if normalized not in dtype_by_name:
+        raise ValueError(
+            "training.amp.dtype must be one of: bfloat16, bf16, float16, fp16"
+        )
+    return dtype_by_name[normalized]
+
+
+def per_rank_batch_size(
+    batch_size: int,
+    world_size: int,
+    batch_size_is_global: bool,
+) -> int:
+    batch_size = int(batch_size)
+    world_size = int(world_size)
+    if batch_size < 1 or world_size < 1:
+        raise ValueError("batch_size and world_size must be positive")
+    if not batch_size_is_global or world_size == 1:
+        return batch_size
+    if batch_size % world_size != 0:
+        raise ValueError(
+            f"global batch_size={batch_size} must be divisible by world_size={world_size}"
+        )
+    return batch_size // world_size
+
+
+def initialize_distributed(training_cfg) -> DistributedContext:
+    distributed_cfg = training_cfg.get("distributed", {})
+    requested = bool(distributed_cfg.get("enabled", False))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1 and not requested:
+        raise RuntimeError(
+            "torchrun provided WORLD_SIZE > 1, but training.distributed.enabled is false"
+        )
+    if not requested or world_size == 1:
+        return DistributedContext()
+    if not torch.cuda.is_available():
+        raise RuntimeError("multi-GPU training requires CUDA")
+
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} exceeds visible CUDA device count "
+            f"{torch.cuda.device_count()}"
+        )
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend=str(distributed_cfg.get("backend", "nccl")),
+        init_method="env://",
+    )
+    return DistributedContext(
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+    )
+
+
+def shared_output_dir(distributed: DistributedContext) -> str:
+    output_dir = str(HydraConfig.get().runtime.output_dir)
+    if not distributed.enabled:
+        return output_dir
+    values = [output_dir if distributed.is_main else None]
+    dist.broadcast_object_list(
+        values,
+        src=0,
+        device=torch.device("cuda", distributed.local_rank),
+    )
+    return str(values[0])
 
 
 def optimizer_updates_per_epoch(num_batches: int, accumulation_steps: int) -> int:
@@ -69,8 +180,14 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
     include_keys = ("global_step", "optimizer_step", "epoch")
 
-    def __init__(self, cfg: OmegaConf, output_dir: Optional[str] = None):
+    def __init__(
+        self,
+        cfg: OmegaConf,
+        output_dir: Optional[str] = None,
+        distributed: Optional[DistributedContext] = None,
+    ):
         super().__init__(cfg, output_dir=output_dir)
+        self.distributed = distributed or DistributedContext()
         seed = int(cfg.training.seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -86,12 +203,45 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
         self.optimizer = self.model.get_optimizer(**cfg.optimizer)
+        amp_cfg = cfg.training.get("amp", {})
+        amp_enabled = bool(amp_cfg.get("enabled", False))
+        amp_dtype = resolve_amp_dtype(amp_cfg.get("dtype", "bfloat16"))
+        scaler_enabled = amp_enabled and amp_dtype == torch.float16
+        self.grad_scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=scaler_enabled,
+        )
         self.global_step = 0
         self.optimizer_step = 0
         self.epoch = 0
 
+    @property
+    def is_main_process(self) -> bool:
+        return getattr(self, "distributed", DistributedContext()).is_main
+
+    def _autocast(self, cfg, device):
+        amp_cfg = cfg.training.get("amp", {})
+        enabled = bool(amp_cfg.get("enabled", False))
+        if enabled and device.type != "cuda":
+            raise RuntimeError("training.amp.enabled requires a CUDA device")
+        dtype = resolve_amp_dtype(amp_cfg.get("dtype", "bfloat16"))
+        return torch.autocast(
+            device_type=device.type,
+            dtype=dtype,
+            enabled=enabled,
+        )
+
+    def _distributed_mean(self, value: float, device) -> float:
+        distributed = getattr(self, "distributed", DistributedContext())
+        if not distributed.enabled:
+            return float(value)
+        tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return float((tensor / distributed.world_size).item())
+
     def run(self) -> None:
         cfg = copy.deepcopy(self.cfg)
+        distributed = self.distributed
         num_epochs, num_optimizer_steps = resolve_training_limits(cfg.training)
         if cfg.training.debug:
             cfg.training.max_train_steps = 3
@@ -127,8 +277,51 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 raise ValueError(
                     "dataset and policy action_reference_key settings must match"
                 )
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        val_dataloader = DataLoader(dataset.get_validation_dataset(), **cfg.val_dataloader)
+        validation_dataset = dataset.get_validation_dataset()
+        distributed_cfg = cfg.training.get("distributed", {})
+        batch_size_is_global = bool(
+            distributed_cfg.get("batch_size_is_global", True)
+        )
+        train_loader_cfg = OmegaConf.to_container(cfg.dataloader, resolve=True)
+        val_loader_cfg = OmegaConf.to_container(cfg.val_dataloader, resolve=True)
+        train_loader_cfg["batch_size"] = per_rank_batch_size(
+            train_loader_cfg["batch_size"],
+            distributed.world_size,
+            batch_size_is_global,
+        )
+        val_loader_cfg["batch_size"] = per_rank_batch_size(
+            val_loader_cfg["batch_size"],
+            distributed.world_size,
+            batch_size_is_global,
+        )
+
+        train_sampler = None
+        val_sampler = None
+        if distributed.enabled:
+            train_sampler = DistributedSampler(
+                dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                shuffle=bool(train_loader_cfg.pop("shuffle", True)),
+                seed=int(cfg.training.seed),
+            )
+            val_sampler = DistributedSampler(
+                validation_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                shuffle=False,
+            )
+            val_loader_cfg.pop("shuffle", None)
+        train_dataloader = DataLoader(
+            dataset,
+            sampler=train_sampler,
+            **train_loader_cfg,
+        )
+        val_dataloader = DataLoader(
+            validation_dataset,
+            sampler=val_sampler,
+            **val_loader_cfg,
+        )
 
         normalizer = dataset.get_normalizer(**cfg.task.get("normalizer", {}))
         self.model.set_normalizer(normalizer)
@@ -164,7 +357,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             ema.optimization_step = self.optimizer_step
 
         env_runner: Optional[BaseImageRunner] = None
-        if cfg.task.get("env_runner") is not None:
+        if self.is_main_process and cfg.task.get("env_runner") is not None:
             env_runner = hydra.utils.instantiate(
                 cfg.task.env_runner,
                 output_dir=self.output_dir,
@@ -172,12 +365,15 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             if not isinstance(env_runner, BaseImageRunner):
                 raise TypeError("cfg.task.env_runner must instantiate BaseImageRunner")
 
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging,
-        )
-        self.update_wandb_output_dir()
+        if self.is_main_process:
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging,
+            )
+            self.update_wandb_output_dir()
+        else:
+            wandb_run = _NullLogger()
         checkpoint_every_optimizer_steps = cfg.training.get(
             "checkpoint_every_optimizer_steps"
         )
@@ -189,32 +385,61 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 "training.checkpoint_every_optimizer_steps must be positive or null"
             )
         topk_manager = None
-        if checkpoint_every_optimizer_steps is None:
+        if checkpoint_every_optimizer_steps is None and self.is_main_process:
             topk_manager = TopKCheckpointManager(
                 save_dir=os.path.join(self.output_dir, "checkpoints"),
                 **cfg.checkpoint.topk,
             )
 
         device = torch.device(cfg.training.device)
+        amp_cfg = cfg.training.get("amp", {})
+        allow_tf32 = bool(amp_cfg.get("allow_tf32", True))
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
         self.optimizer.zero_grad(set_to_none=True)
 
+        training_model = self.model
+        if distributed.enabled:
+            training_model = DistributedDataParallel(
+                self.model,
+                device_ids=[distributed.local_rank],
+                output_device=distributed.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=bool(
+                    distributed_cfg.get("find_unused_parameters", False)
+                ),
+            )
+
+        # Keep initialization deterministic across ranks, then decorrelate runtime
+        # randomness used by augmentation, noise, and curriculum masking.
+        runtime_seed = int(cfg.training.seed) + distributed.rank
+        torch.manual_seed(runtime_seed)
+        np.random.seed(runtime_seed)
+        random.seed(runtime_seed)
+
         sample_batch = None
         log_path = os.path.join(self.output_dir, "logs.json.txt")
-        with JsonLogger(log_path) as json_logger:
+        logger_context = (
+            JsonLogger(log_path) if self.is_main_process else _NullLogger()
+        )
+        with logger_context as json_logger:
             def training_is_complete() -> bool:
                 if num_epochs is not None:
                     return self.epoch >= num_epochs
                 return self.optimizer_step >= num_optimizer_steps
 
             while not training_is_complete():
+                if train_sampler is not None:
+                    train_sampler.set_epoch(self.epoch)
                 step_log = self._train_epoch(
                     cfg=cfg,
                     dataloader=train_dataloader,
                     device=device,
+                    training_model=training_model,
                     lr_scheduler=lr_scheduler,
                     ema=ema,
                     wandb_run=wandb_run,
@@ -222,12 +447,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     topk_manager=topk_manager,
                     target_optimizer_steps=num_optimizer_steps,
                 )
-                if sample_batch is None:
+                if sample_batch is None and self.is_main_process:
                     sample_batch = next(iter(train_dataloader))
 
                 policy = self.ema_model if self.ema_model is not None else self.model
                 policy.eval()
-                if env_runner is not None and self.epoch % int(cfg.training.rollout_every) == 0:
+                if (
+                    self.is_main_process
+                    and env_runner is not None
+                    and self.epoch % int(cfg.training.rollout_every) == 0
+                ):
                     step_log.update(env_runner.run(policy))
 
                 if self.epoch % int(cfg.training.val_every) == 0:
@@ -236,19 +465,22 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         val_dataloader,
                         device,
                         cfg.training.max_val_steps,
+                        cfg=cfg,
+                        distributed=distributed,
                     )
                     if val_loss is not None:
                         step_log["val_loss"] = val_loss
 
-                if self.epoch % int(cfg.training.sample_every) == 0:
+                if (
+                    self.is_main_process
+                    and self.epoch % int(cfg.training.sample_every) == 0
+                ):
                     batch = dict_apply(
                         sample_batch,
                         lambda value: value.to(device, non_blocking=True),
                     )
-                    with torch.no_grad():
-                        prediction = policy.predict_action(batch["obs"])[
-                            "model_action_pred"
-                        ]
+                    with torch.no_grad(), self._autocast(cfg, device):
+                        prediction = policy.predict_action(batch["obs"])["model_action_pred"]
                         step_log["train_action_mse_error"] = torch.nn.functional.mse_loss(
                             prediction,
                             batch["action"],
@@ -260,8 +492,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     global_step=self.global_step,
                     optimizer_step=self.optimizer_step,
                 )
-                wandb_run.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
+                if self.is_main_process:
+                    wandb_run.log(step_log, step=self.global_step)
+                    json_logger.log(step_log)
                 self.epoch += 1
 
                 checkpoint_every_optimizer_steps = cfg.training.get(
@@ -282,17 +515,20 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         and self.optimizer_step % checkpoint_interval != 0
                     )
                 should_checkpoint = should_checkpoint or should_save_final
-                if should_checkpoint:
+                if should_checkpoint and self.is_main_process:
                     if use_optimizer_step_checkpoints:
                         self._save_optimizer_step_checkpoint(cfg)
                     else:
                         self._save_checkpoints(cfg, step_log, topk_manager)
 
                 policy.train()
+                if distributed.enabled:
+                    dist.barrier()
 
         if self._saving_thread is not None:
             self._saving_thread.join()
-        wandb_run.finish()
+        if self.is_main_process:
+            wandb_run.finish()
 
     def _train_epoch(
         self,
@@ -305,8 +541,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         json_logger,
         topk_manager=None,
         target_optimizer_steps: Optional[int] = None,
+        training_model=None,
     ) -> dict:
         self.model.train()
+        if training_model is None:
+            training_model = self.model
         maximum = len(dataloader)
         if cfg.training.max_train_steps is not None:
             maximum = min(maximum, int(cfg.training.max_train_steps))
@@ -319,6 +558,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             desc=f"Training epoch {self.epoch}",
             leave=False,
             mininterval=float(cfg.training.tqdm_interval_sec),
+            disable=not self.is_main_process,
         ) as progress:
             batch_iterator = iter(progress)
             batch_idx = 0
@@ -333,29 +573,55 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     int(cfg.training.gradient_accumulate_every),
                     maximum - batch_idx,
                 )
-                for _ in range(group_size):
+                group_losses = []
+                for microbatch_idx in range(group_size):
                     batch = next(batch_iterator)
                     batch = dict_apply(
                         batch,
                         lambda value: value.to(device, non_blocking=True),
                     )
-                    raw_loss = self.model.compute_loss(
-                        batch,
-                        optimizer_step=self.optimizer_step,
-                    )
-                    (raw_loss / group_size).backward()
+                    should_sync = microbatch_idx == group_size - 1
+                    sync_context = contextlib.nullcontext()
+                    if (
+                        isinstance(training_model, DistributedDataParallel)
+                        and not should_sync
+                    ):
+                        sync_context = training_model.no_sync()
+                    with sync_context, self._autocast(cfg, device):
+                        if isinstance(training_model, DistributedDataParallel):
+                            raw_loss = training_model(
+                                batch,
+                                optimizer_step=self.optimizer_step,
+                            )
+                        else:
+                            raw_loss = self.model.compute_loss(
+                                batch,
+                                optimizer_step=self.optimizer_step,
+                            )
+                        scaled_loss = raw_loss / group_size
+                    grad_scaler = getattr(self, "grad_scaler", None)
+                    if grad_scaler is None:
+                        grad_scaler = torch.amp.GradScaler(
+                            device.type,
+                            enabled=False,
+                        )
+                    grad_scaler.scale(scaled_loss).backward()
                     loss_value = raw_loss.item()
                     losses.append(loss_value)
+                    group_losses.append(loss_value)
                     progress.set_postfix(loss=loss_value, refresh=False)
                     self.global_step += 1
                     batch_idx += 1
 
+                if grad_scaler.is_enabled():
+                    grad_scaler.unscale_(self.optimizer)
                 if cfg.training.get("max_grad_norm") is not None:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         float(cfg.training.max_grad_norm),
                     )
-                self.optimizer.step()
+                grad_scaler.step(self.optimizer)
+                grad_scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
                 self.optimizer_step += 1
@@ -365,15 +631,19 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     self.ema_model.set_optimizer_step(self.optimizer_step)
 
                 last_log = {
-                    "train_loss": float(np.mean(losses[-group_size:])),
+                    "train_loss": self._distributed_mean(
+                        float(np.mean(group_losses)),
+                        device,
+                    ),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "epoch": self.epoch,
                     "global_step": self.global_step,
                     "optimizer_step": self.optimizer_step,
                     **self.model.last_curriculum_metrics,
                 }
-                wandb_run.log(last_log, step=self.global_step)
-                json_logger.log(last_log)
+                if self.is_main_process:
+                    wandb_run.log(last_log, step=self.global_step)
+                    json_logger.log(last_log)
                 checkpoint_every_optimizer_steps = cfg.training.get(
                     "checkpoint_every_optimizer_steps"
                 )
@@ -384,10 +654,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             "training.checkpoint_every_optimizer_steps must be "
                             "positive or null"
                         )
-                    if self.optimizer_step % checkpoint_interval == 0:
+                    if (
+                        self.optimizer_step % checkpoint_interval == 0
+                        and self.is_main_process
+                    ):
                         self._save_optimizer_step_checkpoint(cfg)
 
-        last_log["train_loss"] = float(np.mean(losses))
+        last_log["train_loss"] = self._distributed_mean(
+            float(np.mean(losses)),
+            device,
+        )
         return last_log
 
     def _save_checkpoints(self, cfg, step_log, topk_manager) -> None:
@@ -426,13 +702,21 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
 
-    @staticmethod
-    def _validate(policy, dataloader, device, max_steps) -> Optional[float]:
-        losses = []
+    def _validate(
+        self,
+        policy,
+        dataloader,
+        device,
+        max_steps,
+        cfg,
+        distributed: Optional[DistributedContext] = None,
+    ) -> Optional[float]:
+        loss_sum = 0.0
+        loss_count = 0
         maximum = len(dataloader)
         if max_steps is not None:
             maximum = min(maximum, int(max_steps))
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast(cfg, device):
             for batch_idx, batch in enumerate(dataloader):
                 if batch_idx >= maximum:
                     break
@@ -440,8 +724,20 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     batch,
                     lambda value: value.to(device, non_blocking=True),
                 )
-                losses.append(policy.compute_loss(batch).item())
-        return float(np.mean(losses)) if losses else None
+                loss_sum += policy.compute_loss(batch).item()
+                loss_count += 1
+
+        distributed = distributed or DistributedContext()
+        if distributed.enabled:
+            totals = torch.tensor(
+                [loss_sum, loss_count],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            loss_sum = float(totals[0].item())
+            loss_count = int(totals[1].item())
+        return loss_sum / loss_count if loss_count else None
 
 
 @hydra.main(
@@ -450,8 +746,20 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
     config_name="train_force_aware_diffusion_workspace",
 )
 def main(cfg):
-    workspace = TrainForceAwareDiffusionWorkspace(cfg)
-    workspace.run()
+    distributed = initialize_distributed(cfg.training)
+    try:
+        if distributed.enabled:
+            with open_dict(cfg):
+                cfg.training.device = f"cuda:{distributed.local_rank}"
+        workspace = TrainForceAwareDiffusionWorkspace(
+            cfg,
+            output_dir=shared_output_dir(distributed),
+            distributed=distributed,
+        )
+        workspace.run()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

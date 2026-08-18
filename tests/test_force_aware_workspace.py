@@ -10,6 +10,8 @@ from omegaconf import OmegaConf
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
     TrainForceAwareDiffusionWorkspace,
     optimizer_updates_per_epoch,
+    per_rank_batch_size,
+    resolve_amp_dtype,
     resolve_training_limits,
 )
 
@@ -41,6 +43,21 @@ class _Logger:
 
 
 class ForceAwareWorkspaceStepTest(unittest.TestCase):
+    def test_amp_dtype_aliases_and_validation(self):
+        self.assertIs(resolve_amp_dtype("bf16"), torch.bfloat16)
+        self.assertIs(resolve_amp_dtype("bfloat16"), torch.bfloat16)
+        self.assertIs(resolve_amp_dtype("fp16"), torch.float16)
+        self.assertIs(resolve_amp_dtype("float16"), torch.float16)
+        with self.assertRaises(ValueError):
+            resolve_amp_dtype("float32")
+
+    def test_global_batch_is_split_evenly_across_ranks(self):
+        self.assertEqual(per_rank_batch_size(512, 2, True), 256)
+        self.assertEqual(per_rank_batch_size(512, 2, False), 512)
+        self.assertEqual(per_rank_batch_size(512, 1, True), 512)
+        with self.assertRaises(ValueError):
+            per_rank_batch_size(511, 2, True)
+
     def test_optimizer_update_count(self):
         self.assertEqual(optimizer_updates_per_epoch(0, 4), 0)
         self.assertEqual(optimizer_updates_per_epoch(5, 2), 3)
