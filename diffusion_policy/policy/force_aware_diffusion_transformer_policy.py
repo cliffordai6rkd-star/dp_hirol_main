@@ -68,6 +68,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         horizon: int,
         n_action_steps: int,
         n_obs_steps: int,
+        action_start_index: Optional[int] = None,
         image_key: Optional[str] = None,
         image_keys: Optional[Sequence[str]] = None,
         wrench_key: str = "wrench_ext",
@@ -154,6 +155,14 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             raise ValueError("action shape must be one-dimensional per timestep")
         if not 1 <= n_action_steps <= horizon:
             raise ValueError("n_action_steps must be in [1, horizon]")
+        if action_start_index is None:
+            action_start_index = n_obs_steps - 1
+        if not 0 <= action_start_index < horizon:
+            raise ValueError("action_start_index must be in [0, horizon)")
+        if not 1 <= n_action_steps <= horizon - action_start_index:
+            raise ValueError(
+                "n_action_steps must fit between action_start_index and horizon"
+            )
 
         action_dim = action_shape[0]
         if relative_pose_actions and action_dim != 7:
@@ -219,6 +228,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.horizon = int(horizon)
         self.n_action_steps = int(n_action_steps)
         self.n_obs_steps = int(n_obs_steps)
+        self.action_start_index = int(action_start_index)
         self.action_dim = int(action_dim)
         self.image_keys = configured_image_keys
         self.image_key = configured_image_keys[0] if len(configured_image_keys) == 1 else None
@@ -352,8 +362,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 model_action_prediction,
                 action_reference,
             )
-        start = self.n_obs_steps - 1
-        end = min(start + self.n_action_steps, self.horizon)
+        start = self.action_start_index
+        end = start + self.n_action_steps
         selected_action = action_prediction[:, start:end]
         if selected_action.shape[1] == 0:
             raise RuntimeError("selected action chunk is empty")
