@@ -17,6 +17,60 @@ conda env create -p /opt/lcx/conda/envs/dp -f conda_environment.yaml
 
 ## 训练
 
+### 双相机纯视觉 DP（DINOv3 + Transformer）
+
+纯 DP 分支只读取 LeRobot v3 中的：
+
+```text
+observation.images.wrist
+observation.images.side
+action.ee_pose
+```
+
+两路相机共享冻结的 DINOv3 ViT-B/16。每路 CLS 特征经拼接和可训练投影后，
+作为 observation token 条件输入 8 层 diffusion Transformer；Transformer
+预测 action diffusion noise。`wrench_ext` 和其他低维状态不进入该策略。
+
+```bash
+export PURE_DP_DATASET_PATH=/mnt/code/lcx/PINN/data/train_episode/wipe_board_lbv3
+export DINOV3_MODEL_PATH=/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m
+
+python train.py \
+  --config-dir=diffusion_policy/config \
+  --config-name=train_pure_diffusion_transformer_workspace
+```
+
+该配置沿用 wipe-board v3 的 25 Hz 时间线：`n_obs_steps=2`、`horizon=8`，
+逐帧 `[7]` 的 `action.ee_pose` 由 DataLoader 组成 `[8,7]` 训练目标，执行时选择
+预测索引 1 到 7。配置文件为：
+
+```text
+diffusion_policy/config/task/wipe_board_pure_dp.yaml
+diffusion_policy/config/train_pure_diffusion_transformer_workspace.yaml
+```
+
+### dp_baseline（FDP 同步训练协议）
+
+`dp_baseline` 使用与 FDP 相同的 Transformer、AMP/DDP、optimizer-step 和 EMA
+训练协议，但观测只包含两路 RGB，不读取 `wrench_ext`。每次训练只需要设置数据集
+和 DINOv3 路径：
+
+```bash
+export DP_BASELINE_DATASET_PATH=/mnt/code/lcx/PINN/data/train_episode/wipe_board_lbv3
+export DINOV3_MODEL_PATH=/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m
+
+python train.py \
+  --config-dir=diffusion_policy/config \
+  --config-name=train_dp_baseline
+```
+
+对应配置为：
+
+```text
+diffusion_policy/config/task/wipe_board_dp_baseline.yaml
+diffusion_policy/config/train_dp_baseline.yaml
+```
+
 在仓库根目录执行以下完整命令：
 
 ```bash

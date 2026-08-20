@@ -1,0 +1,140 @@
+defaults:
+  - _self_
+  - task@task: wipe_board_pure_dp
+
+name: train_wipe_board_pure_dp_dinov3_transformer
+_target_: diffusion_policy.workspace.train_pure_diffusion_transformer_workspace.TrainPureDiffusionTransformerWorkspace
+
+dataset_path: ${oc.env:PURE_DP_DATASET_PATH}
+dino_model_path: ${oc.env:DINOV3_MODEL_PATH}
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: ${name}
+
+horizon: 8
+n_obs_steps: 2
+n_action_steps: 7
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_transformer_image_policy.DiffusionTransformerImagePolicy
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+
+  obs_encoder:
+    _target_: diffusion_policy.model.vision.dinov3_multi_image_obs_encoder.DINOv3MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    pretrained_model_name_or_path: ${dino_model_path}
+    output_dim: 256
+    freeze_backbone: true
+    local_files_only: true
+    pooling: cls
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 8
+  n_layer: 8
+  n_cond_layers: 2
+  n_head: 4
+  n_emb: 256
+  p_drop_emb: 0.0
+  p_drop_attn: 0.1
+  causal_attn: false
+
+normalizer:
+  mode: gaussian
+  last_n_dims: 1
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 4
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+val_dataloader:
+  batch_size: 4
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: true
+  max_ram_gb: 24
+  memory_reserve_gb: 4.0
+  enforce_process_ram_limit: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 300
+  gradient_accumulate_every: 8
+  use_ema: true
+  # The encoder freezes DINOv3 internally but keeps its fusion head trainable.
+  freeze_encoder: false
+  rollout_every: 100
+  checkpoint_every: 10
+  val_every: 5
+  sample_every: 10
+  max_train_steps: null
+  max_val_steps: 50
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: nero_pure_dp
+  resume: true
+  mode: offline
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}
+  tags: [pure-dp, wipe-board, dual-camera, dinov3, transformer]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+    subdir: ${hydra.job.num}

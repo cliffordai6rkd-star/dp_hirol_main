@@ -1,0 +1,54 @@
+name: wipe_board_pure_dp
+
+image_shape: &image_shape [3, 192, 256]
+shape_meta: &shape_meta
+  obs:
+    wrist:
+      shape: *image_shape
+      type: rgb
+    side:
+      shape: *image_shape
+      type: rgb
+  action:
+    shape: [7]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  shape_meta: *shape_meta
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: 0
+  n_obs_steps: ${n_obs_steps}
+  n_latency_steps: 0
+  seed: ${training.seed}
+  val_ratio: 0.1
+  max_train_episodes: null
+  window_sampling_strategy: idx
+  image_feature_map:
+    wrist: observation.images.wrist
+    side: observation.images.side
+  action_feature_fields:
+    - action.ee_pose
+  action_layout: per_step
+  relative_pose_actions: false
+  timestamp_key: timestamp
+  timestamp_step_sec: 0.04
+  timestamp_tolerance_sec: null
+  local_files_only: true
+  preload_images: false
+  load_result_add: ram
+
+  image_randomer_config:
+    resize: false
+    random_crop: false
+    rotation: false
+    color_jitter: true
+    color_jitter_params:
+      brightness: 0.1
+      contrast: 0.15
+      saturation: 0.1
+      hue: 0.03
