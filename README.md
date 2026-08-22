@@ -40,9 +40,9 @@ python train.py \
   --config-name=train_pure_diffusion_transformer_workspace
 ```
 
-该配置沿用 wipe-board v3 的 25 Hz 时间线：`n_obs_steps=2`、`horizon=8`，
-逐帧 `[7]` 的 `action.ee_pose` 由 DataLoader 组成 `[8,7]` 训练目标，执行时选择
-预测索引 1 到 7。配置文件为：
+该配置沿用 wipe-board v3 的 25 Hz 时间线：`n_obs_steps=2`、`horizon=9`，
+逐帧 `[7]` 的 `action.ee_pose` 由 DataLoader 组成 `[9,7]` 训练目标。索引 0
+是 prestep，策略对外返回预测索引 1 到 8，共 8 个未来动作。配置文件为：
 
 ```text
 diffusion_policy/config/task/wipe_board_pure_dp.yaml
@@ -197,23 +197,21 @@ cross-attention 输出保留 force residual。视觉信息只能通过该融合�
 
 ### Action Expert
 
-Diffusion Transformer 对 `[8,7]` 末端位姿序列进行去噪：
+Diffusion Transformer 对 `[9,7]` 末端位姿序列进行去噪：
 
 - 训练 diffusion steps：100。
 - 默认 DDIM 推理 steps：8。
 - action 格式：`[x, y, z, qx, qy, qz, qw]`。
-- 推理沿用 `start = To - 1`，当 `To=2` 时选择预测索引 1 到 7。
-- 跟踪 target 的位置采用算术平均。
-- quaternion 先进行半球符号对齐，再求均值并单位化。
+- 推理沿用 `start = To - 1`，当 `To=2` 时选择预测索引 1 到 8。
+- `action` 保留完整 8 步轨迹，不再生成或返回 chunk 平均 pose。
 
 `predict_action()` 返回：
 
 | 键 | 形状 | 含义 |
 | --- | ---: | --- |
-| `action_pred` | `[B, 8, 7]` | 完整预测 chunk |
-| `model_action_pred` | `[B, 8, 7]` | 模型动作空间中的预测；相对模式下为相对姿态 |
-| `action` | `[B, 7, 7]` | 按 DP 时序语义选择的执行 chunk |
-| `action_target` | `[B, 7]` | 用于控制器跟踪的聚合位姿 |
+| `action_pred` | `[B, 9, 7]` | 包含 prestep 的完整预测窗口 |
+| `model_action_pred` | `[B, 9, 7]` | 模型动作空间中的预测；相对模式下为相对姿态 |
+| `action` | `[B, 8, 7]` | 去掉 prestep 后的 8 步执行 chunk |
 
 ### 可配置相对姿态
 
@@ -242,8 +240,8 @@ python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
 `q_reference^-1 * q_target` 计算，不对四元数直接相减。预切片 action 的第
 0 步是参考绝对位姿。Dataset 会在每个样本的
 `obs["action_reference"]` 中提供该参考，Policy 在推理后将相对预测还原成
-绝对位姿，因此 `action_pred`、`action` 和 `action_target` 的控制器接口保持
-不变；训练空间的原始相对预测位于 `model_action_pred`。
+绝对位姿，因此 `action_pred` 和 `action` 的控制器接口保持不变；训练空间的
+原始相对预测位于 `model_action_pred`。
 
 实机或自定义 rollout 开启相对模式时，调用 `predict_action()` 前必须在
 observation 中加入当前测量的末端绝对位姿：
@@ -251,7 +249,7 @@ observation 中加入当前测量的末端绝对位姿：
 ```python
 obs["action_reference"] = current_ee_pose  # [B, 7], xyz + xyzw
 output = policy.predict_action(obs)
-absolute_target = output["action_target"]
+absolute_action_chunk = output["action"]  # [B, 8, 7]
 ```
 
 切换绝对/相对动作表示后必须使用新的输出目录或关闭 `training.resume`，

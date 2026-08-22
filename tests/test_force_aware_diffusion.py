@@ -25,7 +25,6 @@ from diffusion_policy.model.vision.contact_curriculum import (
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
     ForceAwareDiffusionTransformerPolicy,
-    mean_pose_chunk,
     normalize_pose_quaternions,
 )
 
@@ -99,7 +98,7 @@ def make_policy(
     expert = ContextTransformerForDiffusion(
         input_dim=7,
         output_dim=7,
-        horizon=8,
+        horizon=9,
         n_emb=16,
         n_head=4,
         n_layer=1,
@@ -125,8 +124,8 @@ def make_policy(
             "action": {"shape": [7]},
         },
         noise_scheduler=scheduler,
-        horizon=8,
-        n_action_steps=7,
+        horizon=9,
+        n_action_steps=8,
         n_obs_steps=2,
         wrench_key="wrench_ext",
         relative_pose_actions=relative_pose_actions,
@@ -266,7 +265,7 @@ def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
             "side": torch.rand(2, 2, 3, 16, 16),
             "wrench_ext": torch.zeros(2, 2, 8, 6),
         },
-        "action": torch.randn(2, 8, 7),
+        "action": torch.randn(2, 9, 7),
     }
     # Exercise nn.Module.forward, which is the path used by DDP.
     loss = policy(batch, optimizer_step=0)
@@ -304,7 +303,7 @@ def test_policy_loss_masks_training_contact_and_backpropagates():
             "wrist": torch.rand(2, 2, 3, 16, 16),
             "wrench_ext": torch.zeros(2, 2, 8, 6),
         },
-        "action": torch.randn(2, 8, 7),
+        "action": torch.randn(2, 9, 7),
     }
     batch["obs"]["wrench_ext"][0, -1, -1, 0] = 10.0
     loss = policy.compute_loss(batch, optimizer_step=0)
@@ -318,7 +317,7 @@ def test_policy_loss_masks_training_contact_and_backpropagates():
     )
 
 
-def test_policy_prediction_is_unmasked_and_returns_pose_target():
+def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
     policy = make_policy()
     policy.eval()
     obs = {
@@ -327,27 +326,15 @@ def test_policy_prediction_is_unmasked_and_returns_pose_target():
     }
     obs["wrench_ext"][:, -1, -1, 0] = 10.0
     result = policy.predict_action(obs, generator=torch.Generator().manual_seed(1))
-    assert result["action_pred"].shape == (2, 8, 7)
-    assert result["action"].shape == (2, 7, 7)
-    assert result["action_target"].shape == (2, 7)
+    assert result["action_pred"].shape == (2, 9, 7)
+    assert result["action"].shape == (2, 8, 7)
+    assert "action_target" not in result
     assert torch.allclose(
-        torch.linalg.vector_norm(result["action_target"][:, 3:7], dim=-1),
-        torch.ones(2),
+        torch.linalg.vector_norm(result["action"][..., 3:7], dim=-1),
+        torch.ones(2, 8),
         atol=1e-5,
     )
     assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0.0
-
-
-def test_pose_mean_sign_aligns_quaternions():
-    action = torch.tensor(
-        [[
-            [0.0, 2.0, 4.0, 0.0, 0.0, 0.0, 1.0],
-            [2.0, 4.0, 6.0, 0.0, 0.0, 0.0, -1.0],
-        ]]
-    )
-    target = mean_pose_chunk(action)
-    assert torch.allclose(target[0, :3], torch.tensor([1.0, 3.0, 5.0]))
-    assert torch.allclose(target[0, 3:], torch.tensor([0.0, 0.0, 0.0, 1.0]))
 
 
 def test_pose_quaternion_normalization_has_identity_fallback():
@@ -385,7 +372,7 @@ def test_relative_pose_round_trip_and_quaternion_sign_invariance():
 def test_relative_policy_restores_absolute_prediction_for_controller():
     policy = make_policy(relative_pose_actions=True)
     policy.eval()
-    relative_prediction = torch.zeros(2, 8, 7)
+    relative_prediction = torch.zeros(2, 9, 7)
     relative_prediction[..., 0] = 0.05
     relative_prediction[..., 6] = 1.0
     normalized_prediction = policy.normalizer["action"].normalize(relative_prediction)
@@ -412,9 +399,10 @@ def test_relative_policy_restores_absolute_prediction_for_controller():
         + torch.tensor([0.05, 0.0, 0.0]),
         atol=1e-5,
     )
+    assert result["action"].shape == (2, 8, 7)
     assert torch.allclose(
-        result["action_target"][..., :3],
-        obs["action_reference"][..., :3] + torch.tensor([0.05, 0.0, 0.0]),
+        result["action"][..., :3],
+        obs["action_reference"][:, None, :3] + torch.tensor([0.05, 0.0, 0.0]),
         atol=1e-5,
     )
 

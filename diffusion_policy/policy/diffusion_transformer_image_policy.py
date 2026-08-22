@@ -23,26 +23,6 @@ def _normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torc
     )
 
 
-def _mean_pose_chunk(action: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if action.ndim != 3 or action.shape[1] < 1:
-        raise ValueError("action must be a non-empty [B,T,D] tensor")
-    if action.shape[-1] != 7:
-        return action.mean(dim=1)
-    position = action[..., :3].mean(dim=1)
-    quaternion = action[..., 3:]
-    reference = quaternion[:, :1]
-    signs = torch.where(
-        (quaternion * reference).sum(dim=-1, keepdim=True) < 0,
-        -torch.ones((), dtype=action.dtype, device=action.device),
-        torch.ones((), dtype=action.dtype, device=action.device),
-    )
-    mean = (quaternion * signs).mean(dim=1)
-    norm = torch.linalg.vector_norm(mean, dim=-1, keepdim=True)
-    fallback = F.normalize(reference[:, 0], dim=-1, eps=eps)
-    mean = torch.where(norm > eps, mean / norm.clamp_min(eps), fallback)
-    return torch.cat((position, mean), dim=-1)
-
-
 class DiffusionTransformerImagePolicy(BaseImagePolicy):
     """Pure-image diffusion policy with a Transformer noise predictor."""
 
@@ -191,7 +171,6 @@ class DiffusionTransformerImagePolicy(BaseImagePolicy):
             "action": action,
             "action_pred": action_prediction,
             "model_action_pred": action_prediction,
-            "action_target": _mean_pose_chunk(action),
         }
 
     def compute_loss(

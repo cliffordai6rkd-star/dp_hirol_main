@@ -58,8 +58,8 @@ def _policy() -> DiffusionTransformerImagePolicy:
             prediction_type="epsilon",
         ),
         obs_encoder=_encoder(),
-        horizon=8,
-        n_action_steps=7,
+        horizon=9,
+        n_action_steps=8,
         n_obs_steps=2,
         num_inference_steps=2,
         n_layer=2,
@@ -69,7 +69,7 @@ def _policy() -> DiffusionTransformerImagePolicy:
         causal_attn=False,
     )
     normalizer = LinearNormalizer()
-    normalizer.fit({"action": torch.randn(32, 8, 7)}, last_n_dims=1)
+    normalizer.fit({"action": torch.randn(32, 9, 7)}, last_n_dims=1)
     policy.set_normalizer(normalizer)
     return policy
 
@@ -96,17 +96,17 @@ def test_transformer_policy_predicts_noise_from_images_only() -> None:
         "side": torch.rand(2, 2, 3, 16, 24),
         "wrist": torch.rand(2, 2, 3, 16, 24),
     }
-    action = torch.randn(2, 8, 7)
+    action = torch.randn(2, 9, 7)
     action[..., 3:] = torch.nn.functional.normalize(action[..., 3:], dim=-1)
 
     loss = policy.compute_loss({"obs": obs, "action": action})
     output = policy.predict_action(obs)
 
     assert torch.isfinite(loss)
-    assert output["action_pred"].shape == (2, 8, 7)
-    assert output["action"].shape == (2, 7, 7)
-    assert output["action_target"].shape == (2, 7)
+    assert output["action_pred"].shape == (2, 9, 7)
+    assert output["action"].shape == (2, 8, 7)
+    assert "action_target" not in output
     torch.testing.assert_close(
         torch.linalg.vector_norm(output["action"][..., 3:], dim=-1),
-        torch.ones(2, 7),
+        torch.ones(2, 8),
     )

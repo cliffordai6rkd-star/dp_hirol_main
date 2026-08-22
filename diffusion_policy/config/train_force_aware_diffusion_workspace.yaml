@@ -12,10 +12,10 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: ${name}
 
-horizon: 8
+horizon: 9
 n_obs_steps: 2
-# Preserve DP's start=To-1 selection: indices 1..7 from the 8-step prediction.
-n_action_steps: 7
+# Skip the prestep at index 0 and expose eight future actions at indices 1..8.
+n_action_steps: 8
 
 policy:
   _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy

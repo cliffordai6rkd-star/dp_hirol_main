@@ -154,13 +154,13 @@ LeRobotV3 sample
 
 ### 4.6 DP 推理流
 
-推理从 Gaussian action trajectory 开始，使用 DDIM 从 100 个训练噪声时间步中执行 8 次反向采样。反归一化后统一四元数，再取动作索引 `1..7`。
+推理从 Gaussian action trajectory 开始，使用 DDIM 从 100 个训练噪声时间步中执行 8 次反向采样。反归一化后统一四元数，跳过索引 0 的 prestep，再取动作索引 `1..8`。
 
 策略同时返回：
 
-- `action`：7 步 future chunk，Nero 实际用它跟踪并条件化 WM；
-- `action_pred`：完整 8 步绝对动作；
-- `action_target`：7 步 chunk 的位姿均值，位置算术平均，四元数先统一半球再归一化。
+- `action`：去掉 prestep 后的 8 步 future chunk，Nero 用它按序跟踪并条件化 WM；
+- `action_pred`：包含 prestep 的完整 9 步绝对动作；
+- `model_action_pred`：模型动作空间中的完整 9 步预测，相对动作模式下用于训练和离线评估。
 
 ## 5. PINN World Model V3
 

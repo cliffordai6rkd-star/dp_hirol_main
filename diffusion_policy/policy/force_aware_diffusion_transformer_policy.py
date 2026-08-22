@@ -23,35 +23,6 @@ from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsE
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
 
-def mean_pose_chunk(action: torch.Tensor, quaternion_eps: float = 1e-8) -> torch.Tensor:
-    """Average xyz arithmetically and xyzw quaternions on a common hemisphere."""
-    if action.ndim != 3:
-        raise ValueError(f"action must be [B, T, D], got {tuple(action.shape)}")
-    if action.shape[1] < 1:
-        raise ValueError("cannot aggregate an empty action chunk")
-    if action.shape[-1] != 7:
-        return action.mean(dim=1)
-
-    position = action[..., :3].mean(dim=1)
-    quaternion = action[..., 3:7]
-    reference = quaternion[:, :1]
-    signs = torch.where(
-        (quaternion * reference).sum(dim=-1, keepdim=True) < 0,
-        -torch.ones((), dtype=quaternion.dtype, device=quaternion.device),
-        torch.ones((), dtype=quaternion.dtype, device=quaternion.device),
-    )
-    aligned = quaternion * signs
-    quaternion_mean = aligned.mean(dim=1)
-    norm = torch.linalg.vector_norm(quaternion_mean, dim=-1, keepdim=True)
-    fallback = F.normalize(reference[:, 0], dim=-1, eps=quaternion_eps)
-    quaternion_mean = torch.where(
-        norm > quaternion_eps,
-        quaternion_mean / norm.clamp_min(quaternion_eps),
-        fallback,
-    )
-    return torch.cat([position, quaternion_mean], dim=-1)
-
-
 def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     if action.shape[-1] != 7:
         return action
@@ -396,7 +367,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "action": selected_action,
             "action_pred": action_prediction,
             "model_action_pred": model_action_prediction,
-            "action_target": mean_pose_chunk(selected_action),
         }
 
     def compute_loss(
