@@ -20,6 +20,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
     ContactAwareImageMasker,
     ContactDetector,
     MaskProbabilityScheduler,
+    VectorThresholdGate,
 )
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
@@ -155,6 +156,22 @@ def test_contact_detector_uses_physical_wrench_units():
     assert contact.tolist() == [[False, True], [False, False]]
 
 
+def test_vector_threshold_gate_zeroes_complete_tau_vectors_and_is_serialized():
+    gate = VectorThresholdGate(threshold=1.0, norm="l1")
+    tau = torch.tensor(
+        [[[[0.2, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+           [0.19, 0.19, 0.19, 0.19, 0.19, 0.0, 0.0],
+           [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]]]
+    )
+    gated = gate(tau)
+    assert torch.equal(gated[0, 0, 0], torch.zeros(7))
+    assert torch.equal(gated[0, 0, 1], torch.zeros(7))
+    assert torch.equal(gated[0, 0, 2], tau[0, 0, 2])
+    assert "threshold" in gate.state_dict()
+    assert "enabled" in gate.state_dict()
+    assert "norm_code" in gate.state_dict()
+
+
 @pytest.mark.parametrize("schedule_type", ["linear", "cosine", "exponential"])
 def test_mask_scheduler_has_exact_endpoints(schedule_type):
     scheduler = MaskProbabilityScheduler(
@@ -234,6 +251,9 @@ def test_force_encoder_groups_cameras_with_different_resolutions():
 
 def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
     policy = make_policy(image_keys=("wrist", "side"))
+    assert "input_gate.threshold" in policy.state_dict()
+    assert "input_gate.enabled" in policy.state_dict()
+    assert "input_gate.norm_code" in policy.state_dict()
     assert all(
         parameter.numel() > 0
         for parameter in policy.parameters()

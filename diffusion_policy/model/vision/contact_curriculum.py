@@ -51,6 +51,48 @@ class ContactDetector(nn.Module):
         return reduced > self.threshold
 
 
+class VectorThresholdGate(nn.Module):
+    """Zero complete vectors whose magnitude is below a physical threshold.
+
+    The gate operates on the final vector dimension of a tensor shaped like
+    ``[B, To, K, D]``.  Its threshold and enabled flag are buffers so the
+    preprocessing contract is present in a model state dict as well as in the
+    training config.
+    """
+
+    def __init__(self, threshold: float, norm: str = "l1", enabled: bool = True) -> None:
+        super().__init__()
+        if threshold < 0:
+            raise ValueError("gate threshold must be non-negative")
+        if norm not in {"l1", "l2", "sum"}:
+            raise ValueError("gate norm must be one of 'l1', 'l2', or 'sum'")
+        self.register_buffer("threshold", torch.tensor(float(threshold)))
+        self.register_buffer("enabled", torch.tensor(bool(enabled)))
+        self.norm = "l1" if norm == "sum" else norm
+        self.register_buffer("norm_code", torch.tensor(1 if self.norm == "l1" else 2))
+
+    def magnitude(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim < 1:
+            raise ValueError("gated values must have at least one dimension")
+        if self.norm == "l1":
+            return values.abs().sum(dim=-1)
+        return torch.linalg.vector_norm(values, ord=2, dim=-1)
+
+    def keep_mask(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim < 1:
+            raise ValueError("gated values must have at least one dimension")
+        if not bool(self.enabled.item()):
+            return torch.ones(values.shape[:-1], dtype=torch.bool, device=values.device)
+        threshold = self.threshold.to(device=values.device, dtype=values.dtype)
+        return self.magnitude(values) >= threshold
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim < 1:
+            raise ValueError("gated values must have at least one dimension")
+        keep = self.keep_mask(values)
+        return torch.where(keep.unsqueeze(-1), values, torch.zeros_like(values))
+
+
 class MaskProbabilityScheduler(nn.Module):
     """Map optimizer update steps to contact-image masking probability."""
 

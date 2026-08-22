@@ -4,7 +4,7 @@
 
 核心思想是区分两类力信息：
 
-- 当前 `wrench_ext` 用于帮助高层策略判断接触状态，并生成接触敏感的末端位姿参考。
+- 当前 FDP 使用七轴 `tau_ext` 作为高层策略输入，并生成接触敏感的末端位姿参考。
 - 未来接触力由后续动力学模型预测，作为底层控制器需要显式跟踪的物理目标。
 
 当前仓库已经完成高层 force-aware Diffusion Transformer、LeRobot v3 数据接入和训练工作区。PINN 未来力预测及 OSC-QP 硬件闭环仍属于后续开发阶段。
@@ -56,9 +56,8 @@ diffusion_policy/config/train_pure_diffusion_transformer_workspace.yaml
 和 DINOv3 路径：
 
 ```bash
-export DP_BASELINE_DATASET_PATH=/mnt/code/lcx/PINN/data/train_episode/wipe_board_lbv3
-export DINOV3_MODEL_PATH=/mnt/code/lcx/model/dinov3-vitb16-pretrain-lvd1689m
-
+export DP_BASELINE_DATASET_PATH=/opt/lcx/data/wipe_board_lbv3/
+export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
 python train.py \
   --config-dir=diffusion_policy/config \
   --config-name=train_dp_baseline
@@ -92,12 +91,12 @@ python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace --con
 
 ```text
 Nero 数据采集
-  10 Hz wrist RGB                         100 Hz robot state / wrench_ext
+  10 Hz wrist RGB                         100 Hz robot state / tau_ext
           |                                          |
           +-------------- 时间对齐与窗口化 ----------+
                              |
                image [To, 3, 192, 256]
-               wrench [To, 8, 6]
+               tau_ext [To, 4, 7]
                              |
          +-------------------+-------------------+
          |                                       |
@@ -121,7 +120,7 @@ Nero 数据采集
                   OSC-QP controller (planned)
 ```
 
-高层策略严格只使用 wrist image 和 `wrench_ext`。关节位置、速度、加速度和力矩不输入高层 Diffusion Policy，而是保留给后续接触动力学预测模块。
+高层策略严格只使用 wrist/side image 和七轴 `tau_ext`。`tau_ext` 先在物理单位下计算七轴绝对值之和；小于阈值的整条七维向量置零，达到阈值的向量原样归一化后送入 Diffusion Policy。关节位置、速度、加速度和其他力传感器字段不输入高层策略。
 
 ## 数据契约
 
@@ -260,7 +259,7 @@ absolute_target = output["action_target"]
 
 ## Contact-Aware Curriculum Masking
 
-接触判定使用未归一化、物理单位下的原始 `wrench_ext`，默认计算 `Fx/Fy/Fz` 的模长，并在 8 点历史窗口上取最大值。
+FDP 的 `tau_ext` 输入门控使用未归一化、物理单位下的七轴绝对值之和（L1 范数），当前阈值为 `0.6`；低于阈值时整条七维向量置零。门控阈值、范数类型和启用状态同时写入 force-aware checkpoint 的配置与模型 state dict。
 
 当前全量数据统计下，默认阈值 `2 N` 会标记约 16.4% 的帧。这个值只是数据驱动的初始配置，正式实验应结合回放或接触标注确认。
 

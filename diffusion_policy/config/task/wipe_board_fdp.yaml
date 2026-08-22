@@ -2,12 +2,18 @@ name: wipe_board_force_aware
 
 # Every shape_meta.obs entry with type: rgb is encoded as a camera.
 # Camera keys must also appear in dataset.image_feature_map below.
-wrench_key: wrench_ext
+## The force-aware input is the seven-axis external joint torque.
+wrench_key: tau_ext
+tau_ext_source_key: observation.tau_ext
 wrench_history_steps: &wrench_history_steps 4
-# Norm threshold of the selected raw wrench dimensions, before normalization.
-contact_threshold: 0.6
-contact_force_dims: [0, 1, 2]
-contact_history_reducer: mean  # mean, max, or last
+# Gate in physical torque units before normalization: sum(abs(tau_ext[0:7])).
+input_gate_threshold: 0.6
+input_gate_norm: l1
+input_gate_enabled: true
+# The curriculum sees gated tau_ext, so any retained non-zero vector is contact.
+contact_threshold: 0.0
+contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
+contact_history_reducer: max  # mean, max, or last
 
 # false: absolute xyz + xyzw targets (existing behavior)
 # true: world-frame delta xyz + relative xyzw, anchored at action chunk step 0
@@ -24,8 +30,8 @@ shape_meta: &shape_meta
       shape: *image_shape
       type: rgb
       
-    wrench_ext:
-      shape: [*wrench_history_steps, 6]
+    tau_ext:
+      shape: [*wrench_history_steps, 7]
       type: low_dim
 
   action:
@@ -55,8 +61,8 @@ dataset:
     wrist: observation.images.wrist
     side: observation.images.side
   lowdim_feature_groups:
-    wrench_ext:
-      - observation.wrench_ext
+    tau_ext:
+      - ${task.tau_ext_source_key}
   action_feature_fields:
     - action.ee_pose
   action_layout: per_step

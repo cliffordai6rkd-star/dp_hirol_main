@@ -59,6 +59,9 @@ policy:
   contact_threshold: ${task.contact_threshold}
   contact_force_dims: ${task.contact_force_dims}
   contact_history_reducer: ${task.contact_history_reducer}
+  input_gate_threshold: ${task.input_gate_threshold}
+  input_gate_norm: ${task.input_gate_norm}
+  input_gate_enabled: ${task.input_gate_enabled}
 
   # Ablation choices: current_observation or full_context.
   image_mask_scope: full_context

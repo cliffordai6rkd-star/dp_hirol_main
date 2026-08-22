@@ -63,7 +63,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 512
+  batch_size: 256
   num_workers: 8
   shuffle: true
   pin_memory: true
@@ -105,9 +105,9 @@ training:
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
-  rollout_every: 100
-  checkpoint_every: 10
-  checkpoint_every_optimizer_steps: 5000
+  rollout_every: 20
+  checkpoint_every: 20
+  checkpoint_every_optimizer_steps: null
   val_every: 5
   sample_every: 10
   max_train_steps: null
@@ -125,10 +125,10 @@ logging:
 
 checkpoint:
   topk:
-    monitor_key: train_loss
+    monitor_key: val_action_mse
     mode: min
-    k: 5
-    format_str: optimizer_step={optimizer_step:08d}-train_loss={train_loss:.6f}.ckpt
+    k: 3
+    format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse:.6f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false
 
@@ -140,4 +140,3 @@ hydra:
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
-

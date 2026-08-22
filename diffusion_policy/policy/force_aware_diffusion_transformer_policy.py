@@ -17,6 +17,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
     ContactAwareImageMasker,
     ContactDetector,
     MaskProbabilityScheduler,
+    VectorThresholdGate,
 )
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -59,7 +60,7 @@ def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch
 
 
 class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
-    """Image-wrench Diffusion Transformer for contact-rich manipulation."""
+    """Image plus low-dimensional signal Diffusion Transformer."""
 
     def __init__(
         self,
@@ -91,6 +92,9 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         contact_threshold: float = 5.0,
         contact_force_dims: Sequence[int] = (0, 1, 2),
         contact_history_reducer: str = "max",
+        input_gate_threshold: Optional[float] = None,
+        input_gate_norm: str = "l1",
+        input_gate_enabled: bool = False,
         image_mask_scope: str = "full_context",
         mask_schedule: Optional[dict] = None,
         obs_encoder: Optional[ForceAwareObsEncoder] = None,
@@ -145,10 +149,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 f"unsupported observation keys={sorted(unsupported_obs_keys)}"
             )
         wrench_shape = tuple(wrench_meta["shape"])
-        if wrench_shape != (wrench_history_steps, 6):
+        if len(wrench_shape) != 2 or wrench_shape[0] != wrench_history_steps:
             raise ValueError(
-                f"{wrench_key!r} must have shape ({wrench_history_steps}, 6), "
+                f"{wrench_key!r} must have shape ({wrench_history_steps}, D), "
                 f"got {wrench_shape}"
+            )
+        if input_gate_enabled and wrench_shape[-1] != 7:
+            raise ValueError(
+                "the tau_ext input gate requires a seven-axis input; "
+                f"got {wrench_key!r} shape {wrench_shape}"
             )
         action_shape = tuple(shape_meta["action"]["shape"])
         if len(action_shape) != 1:
@@ -221,6 +230,13 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             force_dims=contact_force_dims,
             history_reducer=contact_history_reducer,
         )
+        if input_gate_threshold is None:
+            input_gate_threshold = 0.0
+        self.input_gate = VectorThresholdGate(
+            threshold=float(input_gate_threshold),
+            norm=input_gate_norm,
+            enabled=input_gate_enabled,
+        )
         self.image_masker = ContactAwareImageMasker(scope=image_mask_scope)
         self.mask_scheduler = MaskProbabilityScheduler(**(mask_schedule or {}))
         self.normalizer = LinearNormalizer()
@@ -274,8 +290,17 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         images, raw_wrench = self._validate_obs(obs_dict)
-        normalized_wrench = self.normalizer[self.wrench_key].normalize(raw_wrench)
-        contact = self.contact_detector(raw_wrench)
+        gate_mask = self.input_gate.keep_mask(raw_wrench)
+        gated_wrench = torch.where(
+            gate_mask.unsqueeze(-1), raw_wrench, torch.zeros_like(raw_wrench)
+        )
+        normalized_wrench = self.normalizer[self.wrench_key].normalize(gated_wrench)
+        # Keep suppressed vectors at the model-space origin even with a
+        # non-zero-mean Gaussian normalizer.
+        normalized_wrench = torch.where(
+            gate_mask.unsqueeze(-1), normalized_wrench, torch.zeros_like(normalized_wrench)
+        )
+        contact = self.contact_detector(gated_wrench)
         probability = self.mask_scheduler.probability(self.optimizer_step)
         image_mask = self.image_masker(
             contact,

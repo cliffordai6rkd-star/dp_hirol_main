@@ -13,7 +13,14 @@ shape_meta: &shape_meta
   action:
     shape: [7]
 
-env_runner: null
+env_runner:
+  _target_: diffusion_policy.env_runner.offline_validation_runner.OfflineValidationRunner
+  dataset_cfg: ${task.dataset}
+  batch_size: 8
+  num_workers: 2
+  max_steps: null
+  sampling_passes: 1
+  seed: ${training.seed}
 
 normalizer:
   mode: gaussian
@@ -36,7 +43,7 @@ dataset:
     wrist: observation.images.wrist
     side: observation.images.side
   action_feature_fields:
-    - action.ee_pose
+    - action.joint
   action_layout: per_step
   relative_pose_actions: false
   timestamp_key: timestamp
@@ -57,4 +64,3 @@ dataset:
       contrast: 0.15
       saturation: 0.1
       hue: 0.03
-
