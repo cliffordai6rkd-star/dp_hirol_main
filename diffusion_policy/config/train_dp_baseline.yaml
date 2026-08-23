@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task@task: wipe_board_dp_baseline
+  - task@task: insert_usb
 
 name: train_dp_baseline
 _target_: diffusion_policy.workspace.train_dp_baseline_workspace.TrainDPBaselineWorkspace
@@ -101,7 +101,7 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: null
-  num_optimizer_steps: 60000
+  num_optimizer_steps: 150000
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
@@ -127,7 +127,7 @@ checkpoint:
   topk:
     monitor_key: val_action_mse
     mode: min
-    k: 3
+    k: 2
     format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse:.6f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false
