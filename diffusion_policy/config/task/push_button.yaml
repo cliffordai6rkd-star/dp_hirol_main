@@ -1,4 +1,4 @@
-name: wipe_board_dp_baseline
+name: push_button
 
 # The baseline keeps the FDP camera/action timeline but removes wrench input.
 image_shape: &image_shape [3, 192, 256]
@@ -16,8 +16,8 @@ shape_meta: &shape_meta
 env_runner:
   _target_: diffusion_policy.env_runner.offline_validation_runner.OfflineValidationRunner
   dataset_cfg: ${task.dataset}
-  batch_size: 8
-  num_workers: 2
+  batch_size: 512
+  num_workers: 16
   max_steps: null
   sampling_passes: 1
   seed: ${training.seed}
@@ -51,7 +51,7 @@ dataset:
   timestamp_tolerance_sec: null
   local_files_only: true
   # Avoid a 38 GiB float32 image preload for the full wipe-board dataset.
-  preload_images: false
+  preload_images: true
   load_result_add: ram
 
   image_randomer_config:

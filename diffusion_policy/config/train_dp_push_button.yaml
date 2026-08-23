@@ -1,8 +1,8 @@
 defaults:
   - _self_
-  - task@task: insert_usb
+  - task@task: push_button
 
-name: train_dp_baseline
+name: train_dp_baseline-push_button
 _target_: diffusion_policy.workspace.train_dp_baseline_workspace.TrainDPBaselineWorkspace
 
 dataset_path: ${oc.env:DP_BASELINE_DATASET_PATH}
@@ -63,16 +63,16 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 256
-  num_workers: 8
+  batch_size: 512
+  num_workers: 16
   shuffle: true
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
 
 val_dataloader:
-  batch_size: 8
-  num_workers: 2
+  batch_size: 256
+  num_workers: 8
   shuffle: false
   pin_memory: true
   persistent_workers: true
