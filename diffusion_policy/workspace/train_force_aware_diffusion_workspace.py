@@ -358,9 +358,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
         env_runner: Optional[BaseImageRunner] = None
         if self.is_main_process and cfg.task.get("env_runner") is not None:
+            env_runner_cfg = cfg.task.env_runner
+            env_runner_kwargs = {"output_dir": self.output_dir}
+            # OfflineValidationRunner declares dataset_cfg and can share the
+            # already-preloaded training dataset instead of decoding videos
+            # again during runner construction.
+            if env_runner_cfg.get("dataset_cfg") is not None:
+                env_runner_kwargs["dataset"] = dataset
             env_runner = hydra.utils.instantiate(
-                cfg.task.env_runner,
-                output_dir=self.output_dir,
+                env_runner_cfg,
+                **env_runner_kwargs,
             )
             if not isinstance(env_runner, BaseImageRunner):
                 raise TypeError("cfg.task.env_runner must instantiate BaseImageRunner")

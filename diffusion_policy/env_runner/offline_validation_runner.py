@@ -25,6 +25,7 @@ class OfflineValidationRunner(BaseImageRunner):
         self,
         output_dir,
         dataset_cfg: Union[DictConfig, BaseImageDataset],
+        dataset: Optional[BaseImageDataset] = None,
         batch_size: int = 8,
         num_workers: int = 2,
         max_steps: Optional[int] = None,
@@ -35,10 +36,14 @@ class OfflineValidationRunner(BaseImageRunner):
         if sampling_passes < 1:
             raise ValueError("sampling_passes must be positive")
 
-        if isinstance(dataset_cfg, BaseImageDataset):
-            dataset = dataset_cfg
-        else:
-            dataset = hydra.utils.instantiate(dataset_cfg)
+        # Reuse the workspace's already-instantiated dataset when provided.
+        # Instantiating dataset_cfg here would decode and preload every video
+        # frame a second time just for offline validation.
+        if dataset is None:
+            if isinstance(dataset_cfg, BaseImageDataset):
+                dataset = dataset_cfg
+            else:
+                dataset = hydra.utils.instantiate(dataset_cfg)
         self.validation_dataset = dataset.get_validation_dataset()
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
