@@ -286,15 +286,14 @@ DINOv3 的 ImageNet 标准化、位置编码插值和接触课程 mask 不属于
 本项目不依赖 Docker。训练环境使用 Python 3.10，并与 `nero_ws` 对齐 NumPy、HDF5、OpenCV、SciPy、MuJoCo 和 Pinocchio 的版本范围。
 
 ```bash
-conda env create -f conda_environment.yaml
-conda activate dp
-python -m pip install --no-deps lerobot==0.4.0
+conda env create -p /opt/lcx/conda/envs/dp -f conda_environment.yaml
+conda activate /opt/lcx/conda/envs/dp
 ```
 
-若环境已经创建，可在仓库根目录执行：
+`conda_environment.yaml` 会同时安装 LeRobot 0.4.0、训练依赖和测试依赖。若环境已经创建，可在仓库根目录执行：
 
 ```bash
-python -m pip install -e ".[training,test]"
+conda env update -p "$CONDA_PREFIX" -f conda_environment.yaml
 ```
 
 `setup.py` 是项目元数据和依赖的唯一来源；`pyproject.toml` 只定义 PEP 517 构建后端和 pytest 配置。

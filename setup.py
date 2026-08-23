@@ -17,7 +17,10 @@ CORE_DEPENDENCIES = [
     "numpy>=2.2,<2.3",
     "h5py>=3.11",
     "scipy>=1.10,<1.16",
-    "opencv-python-headless>=4.9,<4.13",
+    # 4.12 wheels require CXXABI_1.3.15, which is absent on common CUDA
+    # training images. Keep the pip fallback compatible with their system ABI;
+    # the Conda environment uses the conda-forge OpenCV package directly.
+    "opencv-python-headless>=4.9,<4.12",
     "PyYAML>=6.0",
     "matplotlib>=3.7",
     "mujoco>=3.3,<4",
@@ -42,6 +45,7 @@ CORE_DEPENDENCIES = [
     "tqdm>=4.67,<5",
     "Pillow>=11,<13",
     "filelock>=3.16,<4",
+    "pandas>=2.2,<3",
 ]
 
 EXTRAS = {
