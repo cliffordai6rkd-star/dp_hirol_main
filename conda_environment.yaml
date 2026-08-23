@@ -10,9 +10,9 @@ dependencies:
   - pandas>=2.2,<3
   - h5py>=3.11
   - pyyaml>=6.0
-  - opencv>=4.9,<4.13
   # Keep C++ runtime libraries inside the environment for binary wheels
-  # (OpenCV, MuJoCo, and related packages).
+  # (OpenCV, MuJoCo, and related packages). OpenCV itself is pip-managed
+  # below through the project's ABI-compatible <4.12 constraint.
   - libstdcxx-ng>=14
   - libgcc-ng>=14
   - matplotlib>=3.7
