@@ -44,7 +44,9 @@ datasets==4.0.0
 diffusers==0.35.1
 huggingface-hub[hf-transfer,cli]==0.35.3
 transformers==4.57.1
-opencv-python-headless==4.12.0.88
+# Keep the pip wheel below 4.12; newer wheels can conflict with the
+# libjpeg/libtiff ABI in the training image.
+opencv-python-headless==4.11.0.86
 av==15.0.0
 cmake==3.31.6
 imageio[ffmpeg]==2.37.0

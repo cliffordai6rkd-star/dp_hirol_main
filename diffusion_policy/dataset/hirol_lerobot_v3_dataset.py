@@ -4,7 +4,6 @@ import copy
 import logging as log
 import os
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -80,7 +79,14 @@ def _coerce_image(image_value, expected_shape: Sequence[int]) -> np.ndarray:
 
     target_h, target_w = expected_shape[1], expected_shape[2]
     if image_hwc.shape[0] != target_h or image_hwc.shape[1] != target_w:
-        image_hwc = cv2.resize(image_hwc, (target_w, target_h))
+        # Pillow avoids importing OpenCV here.  OpenCV's libtiff/libjpeg
+        # dependencies can conflict with the libraries bundled by PyTorch
+        # when the dataset is imported after torch.
+        image_hwc = np.asarray(
+            Image.fromarray(np.asarray(image_hwc)).resize(
+                (target_w, target_h), Image.Resampling.BILINEAR
+            )
+        )
 
     image_chw = np.transpose(image_hwc, (2, 0, 1)).astype(np.float32)
     image_max = float(image_chw.max()) if image_chw.size else 0.0

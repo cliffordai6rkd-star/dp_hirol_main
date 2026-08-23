@@ -4,7 +4,6 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
 
-import cv2
 import numpy as np
 
 OFFICIAL_AUTO_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
@@ -113,7 +112,9 @@ class LeRobotV3Writer:
                 continue
             spec = self.features[key]
             if spec.get("dtype") in {"video", "image"} and self.image_color_space == "bgr":
-                value = cv2.cvtColor(np.asarray(value), cv2.COLOR_BGR2RGB)
+                # Keep this conversion NumPy-only so importing the dataset
+                # does not pull in OpenCV's conflicting image libraries.
+                value = np.ascontiguousarray(np.asarray(value)[..., ::-1])
             elif tuple(spec.get("shape", ())) == (1,):
                 value = _scalar_value(value)
             lerobot_frame[key] = value
