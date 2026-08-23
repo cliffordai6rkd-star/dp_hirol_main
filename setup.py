@@ -51,6 +51,8 @@ CORE_DEPENDENCIES = [
 EXTRAS = {
     "lerobot": [
         "lerobot==0.4.0",
+        # LeRobot 0.4 uses TorchCodec when available for video decoding.
+        "torchcodec==0.5.0",
     ],
     "training": [
         "accelerate>=1.10,<2",
