@@ -25,5 +25,5 @@ dependencies:
       - -e .[training,test]
       # LeRobot v3 dataset IO used by the training configs.
       - lerobot==0.4.0
-      # Compatible with the PyTorch 2.7 training runtime; LeRobot uses it by default.
-      - torchcodec==0.7.0
+      # LeRobot 0.4.0 requires TorchCodec >=0.2.1,<0.6.0.
+      - torchcodec==0.5

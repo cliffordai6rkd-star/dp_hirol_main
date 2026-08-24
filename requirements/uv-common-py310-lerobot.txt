@@ -50,9 +50,9 @@ opencv-python-headless==4.11.0.86
 av==15.0.0
 cmake==3.31.6
 imageio[ffmpeg]==2.37.0
-# LeRobot 0.4 selects TorchCodec for video decoding when it is installed.
+# LeRobot 0.4 requires TorchCodec >=0.2.1,<0.6.0.
 # The matching FFmpeg shared libraries are provided by conda_environment.yaml.
-torchcodec==0.7.0
+torchcodec==0.5
 jsonlines==4.0.0
 packaging==24.2
 pynput==1.8.1
