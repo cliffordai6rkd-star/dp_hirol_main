@@ -9,8 +9,9 @@ GPU Selection:
 python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
 python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:1
 
-# Multi-GPU training preparation
-CUDA_VISIBLE_DEVICES=0,1,2 python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
+# Multi-GPU data-parallel training (torchrun creates one process per GPU)
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
+    --config-name=train_dp_inert_usb
 
 # CPU training (for debugging)
 python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cpu
@@ -22,30 +23,37 @@ python train.py --config-dir=. --config-name=train_hirol_fr3_unet_abs_jp_ee_stat
     hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_gpu1'
 
 # Multi-GPU server deployment
-CUDA_VISIBLE_DEVICES=2,3 python train.py --config-dir=. --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml \
-    training.device=cuda:0 \
+CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train.py \
+    --config-dir=diffusion_policy/config --config-name=train_force_aware_diffusion_workspace \
     hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_multi_gpu'
 
 Notes:
 - Use CUDA_VISIBLE_DEVICES to control which GPUs are visible to PyTorch
 - training.device=cuda:0 refers to the first visible GPU (after CUDA_VISIBLE_DEVICES filtering)
-- For multi-GPU training, set CUDA_VISIBLE_DEVICES first, then use cuda:0 as primary device
+- For multi-GPU training, use torchrun; each rank maps to its LOCAL_RANK device
 - Check GPU availability with: nvidia-smi
 """
 
 import sys
+import inspect
 # use line-buffering for both stdout and stderr
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)   
 
 import hydra
+import torch.distributed as dist
 from omegaconf import OmegaConf
+from omegaconf import open_dict
 import pathlib
 import os
 import tempfile
 from hydra.core.hydra_config import HydraConfig
 from diffusion_policy.common.config_cli import rewrite_config_reference_argv
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
+    initialize_distributed,
+    shared_output_dir,
+)
 
 # allows arbitrary python code execution in configs using the ${eval:''} resolver
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -218,12 +226,39 @@ def main(cfg: OmegaConf):
     # will use the same time.
     OmegaConf.resolve(cfg)
     
-    cls = hydra.utils.get_class(cfg._target_)
-    resume_output_dir = _infer_resume_output_dir(cfg)
-    if resume_output_dir is not None:
-        print(f"Using resume output_dir: {resume_output_dir}")
-    workspace: BaseWorkspace = cls(cfg, output_dir=resume_output_dir)
-    workspace.run()
+    distributed = initialize_distributed(cfg.training)
+    try:
+        if distributed.enabled:
+            # torchrun assigns one local rank per process.  Never honor a
+            # config-level cuda:N value in DDP mode: it would place every
+            # rank on the same device.
+            with open_dict(cfg):
+                cfg.training.device = f"cuda:{distributed.local_rank}"
+        cls = hydra.utils.get_class(cfg._target_)
+        resume_output_dir = _infer_resume_output_dir(cfg)
+        if resume_output_dir is not None and not distributed.enabled:
+            print(f"Using resume output_dir: {resume_output_dir}")
+
+        # A rank-local Hydra output directory would make each process write a
+        # separate checkpoint tree.  Broadcast rank 0's directory instead.
+        output_dir = resume_output_dir or str(HydraConfig.get().runtime.output_dir)
+        if distributed.enabled:
+            output_dir = shared_output_dir(distributed, output_dir=output_dir)
+
+        init_params = inspect.signature(cls.__init__).parameters
+        if distributed.enabled and "distributed" not in init_params:
+            raise RuntimeError(
+                f"{cls.__name__} does not implement the repository DDP protocol. "
+                "Use a DDP-enabled workspace or launch this config with one process."
+            )
+        workspace_kwargs = {"output_dir": output_dir}
+        if "distributed" in init_params:
+            workspace_kwargs["distributed"] = distributed
+        workspace: BaseWorkspace = cls(cfg, **workspace_kwargs)
+        workspace.run()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     default_config_dir = DEFAULT_CONFIG_DIR

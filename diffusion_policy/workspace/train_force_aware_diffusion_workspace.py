@@ -113,6 +113,12 @@ def initialize_distributed(training_cfg) -> DistributedContext:
             "torchrun provided WORLD_SIZE > 1, but training.distributed.enabled is false"
         )
     if not requested or world_size == 1:
+        if requested and world_size == 1 and torch.cuda.device_count() > 1:
+            print(
+                "[DDP] training.distributed.enabled=true but WORLD_SIZE=1; "
+                "this is single-GPU training. Launch with torchrun for DDP.",
+                flush=True,
+            )
         return DistributedContext()
     if not torch.cuda.is_available():
         raise RuntimeError("multi-GPU training requires CUDA")
@@ -129,6 +135,11 @@ def initialize_distributed(training_cfg) -> DistributedContext:
         backend=str(distributed_cfg.get("backend", "nccl")),
         init_method="env://",
     )
+    print(
+        f"[DDP] rank={rank}/{world_size} local_rank={local_rank} "
+        f"device=cuda:{local_rank} pid={os.getpid()}",
+        flush=True,
+    )
     return DistributedContext(
         rank=rank,
         local_rank=local_rank,
@@ -136,8 +147,14 @@ def initialize_distributed(training_cfg) -> DistributedContext:
     )
 
 
-def shared_output_dir(distributed: DistributedContext) -> str:
-    output_dir = str(HydraConfig.get().runtime.output_dir)
+def shared_output_dir(
+    distributed: DistributedContext,
+    output_dir: Optional[str] = None,
+) -> str:
+    if output_dir is None:
+        output_dir = str(HydraConfig.get().runtime.output_dir)
+    else:
+        output_dir = str(output_dir)
     if not distributed.enabled:
         return output_dir
     values = [output_dir if distributed.is_main else None]
@@ -322,6 +339,13 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             sampler=val_sampler,
             **val_loader_cfg,
         )
+        if distributed.enabled:
+            print(
+                f"[DDP] rank={distributed.rank} train_batch={train_loader_cfg['batch_size']} "
+                f"train_batches={len(train_dataloader)} "
+                f"val_batches={len(val_dataloader)}",
+                flush=True,
+            )
 
         normalizer = dataset.get_normalizer(**cfg.task.get("normalizer", {}))
         self.model.set_normalizer(normalizer)

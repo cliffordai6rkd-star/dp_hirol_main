@@ -61,15 +61,32 @@ export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
 python train.py \
   --config-dir=diffusion_policy/config \
   --config-name=train_dp_baseline
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m diffusion_policy.workspace.train_dp_baseline_workspace --config-name=train_dp_inert_usb dataloader.batch_size=256
 ```
+
+单进程命令只使用一张 GPU；`training.distributed.enabled: true` 不会自动创建
+进程。要进行真正的数据并行训练，使用 `torchrun`，不要用 `python train.py`：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export DP_BASELINE_DATASET_PATH=/opt/lcx/data/wipe_board_lbv3/
+export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
+
+torchrun --standalone --nproc_per_node=2 train.py \
+  --config-name=train_dp_inert_usb
+```
+
+仓库也提供了等价的 `scripts/train_ddp.sh`。启动日志应分别出现
+`[DDP] rank=0/2 ... device=cuda:0` 和 `rank=1/2 ... device=cuda:1`；
+如果只出现单进程提示，说明启动方式仍然不是 DDP。
+
+根目录的 `multi_gpu_train.sh` 保留给 Ray 多随机种子实验：它启动的是多个
+相互独立的单卡任务，不会合并梯度，不能替代上述 DDP 命令。
 
 对应配置为：
 
 ```text
-diffusion_policy/config/task/wipe_board_dp_baseline.yaml
-diffusion_policy/config/train_dp_baseline.yaml
+diffusion_policy/config/task/insert_usb.yaml
+diffusion_policy/config/train_dp_inert_usb.yaml
 ```
 
 在仓库根目录执行以下完整命令：
@@ -78,16 +95,19 @@ diffusion_policy/config/train_dp_baseline.yaml
 export FDP_DATASET_PATH=/opt/lcx/data/wipe_board_lbv3/
 export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
 
-python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace --config-name=train_force_aware_diffusion_workspace
+# Single GPU
+python train.py --config-name=train_force_aware_diffusion_workspace
 
-  CUDA_VISIBLE_DEVICES=0,1 \
+# DDP
+CUDA_VISIBLE_DEVICES=0,1 \
   /opt/lcx/conda/envs/dp/bin/torchrun \
     --standalone \
     --nproc_per_node=2 \
-    -m diffusion_policy.workspace.train_force_aware_diffusion_workspace
+    train.py \
+    --config-name=train_force_aware_diffusion_workspace
 ```
 
-`FDP_DATASET_PATH` 指向当前任务的数据集目录；`DINOV3_MODEL_PATH` 指向包含 `config.json` 和模型权重的本地 DINOv3 文件夹。默认使用 `cuda:0`、batch size 512、梯度累积 1 次、40000 optimizer steps 和在线 W&B 日志。
+`FDP_DATASET_PATH` 指向当前任务的数据集目录；`DINOV3_MODEL_PATH` 指向包含 `config.json` 和模型权重的本地 DINOv3 文件夹。默认使用全局 batch size 512、梯度累积 1 次、60000 optimizer steps 和在线 W&B 日志；DDP 时该 batch 会按 rank 均分。
 
 ## 系统结构
 

@@ -1,0 +1,7 @@
+# Backward-compatible name for the original DP baseline experiment.
+# Keep new experiments on the task-specific train_dp_* configs.
+defaults:
+  - train_dp_inert_usb
+  - _self_
+
+name: train_dp_baseline
