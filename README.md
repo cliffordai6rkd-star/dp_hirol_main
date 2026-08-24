@@ -61,6 +61,8 @@ export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
 python train.py \
   --config-dir=diffusion_policy/config \
   --config-name=train_dp_baseline
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 -m diffusion_policy.workspace.train_dp_baseline_workspace --config-name=train_dp_inert_usb dataloader.batch_size=256
 ```
 
 对应配置为：

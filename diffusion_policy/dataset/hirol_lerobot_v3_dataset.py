@@ -3,6 +3,7 @@ from typing import Dict, List, Mapping, Optional, Sequence
 import copy
 import logging as log
 import os
+import shutil
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from diffusion_policy.dataset.image_result_cache import (
     open_or_build_image_result_cache,
     read_image_result,
     use_disk_result_cache,
+    use_shared_ram_result_cache,
 )
 from diffusion_policy.dataset.img_randomer import Image_randomer
 
@@ -170,9 +172,16 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             self.sampler_pad_after = self.pad_after
         self.anchor_position = max(0, min(self.sequence_length - 1, (n_obs_steps or 1) - 1))
         self.image_data: Dict[str, np.ndarray] = {}
-        self.load_result_add = load_result_add
         self.load_result_cache_path = None
         load_result_on_disk = use_disk_result_cache(load_result_add)
+        distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if distributed_world_size > 1 and preload_images and not load_result_on_disk:
+            load_result_add = "shared_ram"
+            load_result_on_disk = True
+            log.info(
+                "WORLD_SIZE=%d: using one shared-RAM image cache for all ranks.",
+                distributed_world_size,
+            )
         self.image_randomer_config = image_randomer_config
         self.image_randomer = (
             Image_randomer(dict(image_randomer_config))
@@ -252,6 +261,28 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             memory_reserve_gb=memory_reserve_gb,
         )
         estimated_preload_bytes = self._estimate_image_preload_bytes()
+        if use_shared_ram_result_cache(load_result_add):
+            shared_cache_dir = os.environ.get(
+                "DP_SHARED_IMAGE_CACHE_DIR", "/dev/shm/diffusion_policy_image_cache"
+            )
+            os.makedirs(shared_cache_dir, exist_ok=True)
+            shared_ram_free_bytes = shutil.disk_usage(shared_cache_dir).free
+            reserve_bytes = int(float(memory_reserve_gb) * (1024 ** 3))
+            required_bytes = estimated_preload_bytes + reserve_bytes
+            if shared_ram_free_bytes < required_bytes:
+                fallback_location = os.environ.get(
+                    "DP_SHARED_IMAGE_CACHE_FALLBACK", "ssd"
+                )
+                log.warning(
+                    "Shared RAM cache requires %s including reserve, but only %s is free; "
+                    "falling back to %r.",
+                    format_gb(required_bytes),
+                    format_gb(shared_ram_free_bytes),
+                    fallback_location,
+                )
+                load_result_add = fallback_location
+                load_result_on_disk = use_disk_result_cache(load_result_add)
+        self.load_result_add = load_result_add
         if effective_budget_bytes is not None:
             log.info(
                 "HirolLeRobotV3Dataset RAM budget: effective=%s, estimated image-preload=%s",

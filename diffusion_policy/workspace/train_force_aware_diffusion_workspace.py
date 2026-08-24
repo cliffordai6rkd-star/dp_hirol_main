@@ -672,7 +672,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         self._save_optimizer_step_checkpoint(
                             cfg,
                             topk_manager=topk_manager,
-                            metric_dict=step_log,
+                            metric_dict=last_log,
                         )
 
         last_log["train_loss"] = self._distributed_mean(

@@ -50,7 +50,8 @@ dataset:
   timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
   local_files_only: true
-  # Avoid a 38 GiB float32 image preload for the full wipe-board dataset.
+  # Single GPU uses RAM preload. Under torchrun, the dataset automatically
+  # promotes this to one shared /dev/shm cache so ranks do not duplicate it.
   preload_images: true
   load_result_add: ram
 

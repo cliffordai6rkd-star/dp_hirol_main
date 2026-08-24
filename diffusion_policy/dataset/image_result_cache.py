@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 CACHE_VERSION = 2
 RAM_RESULT_LOCATIONS = {None, "", "ram", "memory", "mem"}
+SHARED_RAM_RESULT_LOCATIONS = {"shared_ram", "ram_shared", "shm", "tmpfs"}
 _REGISTERED_CLEANUPS = set()
 _CLEANUP_LOGGERS = {}
 _SIGNAL_HANDLERS_INSTALLED = False
@@ -26,6 +27,14 @@ def use_disk_result_cache(load_result_add) -> bool:
     if isinstance(load_result_add, str):
         return load_result_add.strip().lower() not in RAM_RESULT_LOCATIONS
     return True
+
+
+def use_shared_ram_result_cache(load_result_add) -> bool:
+    """Return whether the cache should live in a shared RAM-backed directory."""
+    return (
+        isinstance(load_result_add, str)
+        and load_result_add.strip().lower() in SHARED_RAM_RESULT_LOCATIONS
+    )
 
 
 def build_cache_metadata(
@@ -170,6 +179,11 @@ def _register_cache_cleanup(cache_path: str, logger=None) -> None:
         return
 
     cache_path = os.path.abspath(cache_path)
+    # Shared-RAM caches are intentionally persistent for the lifetime of the
+    # machine/job.  Removing them from one DDP rank at interpreter shutdown can
+    # race with another rank still reading the same mmap/zarr arrays.
+    if cache_path.startswith("/dev/shm/"):
+        return
     if cache_path in _REGISTERED_CLEANUPS:
         return
     _REGISTERED_CLEANUPS.add(cache_path)
@@ -247,6 +261,10 @@ def _is_valid_cache(cache_path: str, metadata: Mapping) -> bool:
 
 def _resolve_cache_path(load_result_add, dataset_path: str, metadata: Mapping) -> str:
     location = os.path.expanduser(str(load_result_add))
+    if location.lower() in SHARED_RAM_RESULT_LOCATIONS:
+        location = os.environ.get(
+            "DP_SHARED_IMAGE_CACHE_DIR", "/dev/shm/diffusion_policy_image_cache"
+        )
     if location.lower() == "ssd":
         location = os.path.join(
             os.path.dirname(os.path.abspath(os.path.expanduser(dataset_path))),
