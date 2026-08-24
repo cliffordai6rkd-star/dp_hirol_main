@@ -1,0 +1,29 @@
+name: fdp
+channels:
+  - conda-forge
+dependencies:
+  # Match nero_ws/environment.yml so collection and training agree on array,
+  # HDF5, camera, and dynamics ABI boundaries.
+  - python=3.10
+  - pip
+  - numpy>=2.2,<2.3
+  - pandas>=2.2,<3
+  - h5py>=3.11
+  - pyyaml>=6.0
+  # Keep C++ runtime libraries inside the environment for binary wheels
+  # (OpenCV, MuJoCo, and related packages). OpenCV itself is pip-managed
+  # below through the project's ABI-compatible <4.12 constraint.
+  - libstdcxx-ng>=14
+  - libgcc-ng>=14
+  # Runtime shared libraries required by TorchCodec's video decoder.
+  - ffmpeg=7.1.1
+  - matplotlib>=3.7
+  - mujoco>=3.3,<4
+  - pinocchio>=3,<4
+  - scipy>=1.10,<1.16
+  - pip:
+      - -e .[training,test]
+      # LeRobot v3 dataset IO used by the training configs.
+      - lerobot==0.4.0
+      # Compatible with the PyTorch 2.7 training runtime; LeRobot uses it by default.
+      - torchcodec==0.7.0

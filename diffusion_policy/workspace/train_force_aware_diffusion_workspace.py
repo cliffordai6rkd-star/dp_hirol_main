@@ -392,7 +392,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 "training.checkpoint_every_optimizer_steps must be positive or null"
             )
         topk_manager = None
-        if checkpoint_every_optimizer_steps is None and self.is_main_process:
+        if self.is_main_process:
             topk_manager = TopKCheckpointManager(
                 save_dir=os.path.join(self.output_dir, "checkpoints"),
                 **cfg.checkpoint.topk,
@@ -524,7 +524,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 should_checkpoint = should_checkpoint or should_save_final
                 if should_checkpoint and self.is_main_process:
                     if use_optimizer_step_checkpoints:
-                        self._save_optimizer_step_checkpoint(cfg)
+                        self._save_optimizer_step_checkpoint(
+                            cfg,
+                            topk_manager=topk_manager,
+                            metric_dict=last_log,
+                        )
                     else:
                         self._save_checkpoints(cfg, step_log, topk_manager)
 
@@ -665,7 +669,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         self.optimizer_step % checkpoint_interval == 0
                         and self.is_main_process
                     ):
-                        self._save_optimizer_step_checkpoint(cfg)
+                        self._save_optimizer_step_checkpoint(
+                            cfg,
+                            topk_manager=topk_manager,
+                            metric_dict=step_log,
+                        )
 
         last_log["train_loss"] = self._distributed_mean(
             float(np.mean(losses)),
@@ -681,31 +689,61 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if topk_manager is None:
             return
 
-        monitor_key = str(cfg.checkpoint.topk.monitor_key)
         metric_dict = {
             key.replace("/", "_"): value for key, value in step_log.items()
         }
-        if monitor_key not in metric_dict:
+        monitor_key = cfg.checkpoint.topk.monitor_key
+        if monitor_key is not None and str(monitor_key) not in metric_dict:
             return
         topk_path = topk_manager.get_ckpt_path(metric_dict)
         if topk_path is not None:
             self.save_checkpoint(path=topk_path, use_thread=False)
 
-    def _save_optimizer_step_checkpoint(self, cfg) -> None:
+    def _save_optimizer_step_checkpoint(
+        self,
+        cfg,
+        topk_manager=None,
+        metric_dict=None,
+    ) -> None:
         step_tag = f"optimizer_step={self.optimizer_step:08d}"
-        if cfg.checkpoint.save_last_ckpt:
-            checkpoint_dir = pathlib.Path(self.output_dir).joinpath("checkpoints")
+        checkpoint_dir = pathlib.Path(self.output_dir).joinpath("checkpoints")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # In step-based mode, let TopKCheckpointManager choose the filename.
+        # With monitor_key=null it keeps the most recent K checkpoints; with a
+        # metric it keeps the best K according to the configured mode.
+        checkpoint_path = None
+        if topk_manager is not None:
+            data = {
+                key.replace("/", "_"): value
+                for key, value in (metric_dict or {}).items()
+            }
+            topk_path = topk_manager.get_ckpt_path(data)
+            if topk_path is not None:
+                checkpoint_path = pathlib.Path(topk_path)
+
+        if checkpoint_path is None and topk_manager is None:
             checkpoint_path = checkpoint_dir.joinpath(f"{step_tag}.ckpt")
+
+        if checkpoint_path is not None:
             self.save_checkpoint(path=checkpoint_path, use_thread=False)
 
             # Keep resume compatibility without duplicating the checkpoint payload.
-            latest_path = self.get_checkpoint_path()
-            temporary_link = checkpoint_dir.joinpath(
-                f".latest-{os.getpid()}.tmp"
+            if cfg.checkpoint.save_last_ckpt:
+                latest_path = self.get_checkpoint_path()
+                temporary_link = checkpoint_dir.joinpath(
+                    f".latest-{os.getpid()}.tmp"
+                )
+                temporary_link.unlink(missing_ok=True)
+                temporary_link.symlink_to(checkpoint_path.name)
+                os.replace(temporary_link, latest_path)
+        elif topk_manager is not None and cfg.checkpoint.save_last_ckpt:
+            # If a metric-based Top-K manager rejects this checkpoint, still keep
+            # a single latest checkpoint for reliable resume.
+            self.save_checkpoint(
+                path=self.get_checkpoint_path(),
+                use_thread=False,
             )
-            temporary_link.unlink(missing_ok=True)
-            temporary_link.symlink_to(checkpoint_path.name)
-            os.replace(temporary_link, latest_path)
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
 
