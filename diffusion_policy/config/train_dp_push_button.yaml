@@ -63,7 +63,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 256
+  batch_size: 512
   num_workers: 4
   shuffle: true
   pin_memory: true
@@ -71,7 +71,7 @@ dataloader:
   prefetch_factor: 2
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 512
   num_workers: 4
   shuffle: false
   pin_memory: true
