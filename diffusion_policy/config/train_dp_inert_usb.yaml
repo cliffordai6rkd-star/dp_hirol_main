@@ -63,7 +63,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 512
+  batch_size: 1024
   num_workers: 4
   shuffle: true
   pin_memory: true
@@ -71,7 +71,7 @@ dataloader:
   prefetch_factor: 2
 
 val_dataloader:
-  batch_size: 128
+  batch_size: 256
   num_workers: 4
   shuffle: false
   pin_memory: true
@@ -100,13 +100,13 @@ training:
     find_unused_parameters: false
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 2000
+  num_epochs: 2500
   num_optimizer_steps: null
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
   rollout_every: 20
-  checkpoint_every: 300
+  checkpoint_every: 500
   # In step-based mode, keep only the final K checkpoints for real-robot
   # evaluation. checkpoint_every is ignored while this is set.
   checkpoint_every_optimizer_steps: null
