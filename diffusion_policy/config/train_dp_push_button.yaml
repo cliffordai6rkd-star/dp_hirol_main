@@ -127,7 +127,7 @@ checkpoint:
   topk:
     monitor_key: val_action_mse
     mode: min
-    k: 2
+    k: 3
     format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse:.6f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false

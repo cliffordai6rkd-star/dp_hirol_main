@@ -16,7 +16,7 @@ shape_meta: &shape_meta
 env_runner:
   _target_: diffusion_policy.env_runner.offline_validation_runner.OfflineValidationRunner
   dataset_cfg: ${task.dataset}
-  batch_size: 512
+  batch_size: 256
   num_workers: 16
   max_steps: null
   sampling_passes: 1
