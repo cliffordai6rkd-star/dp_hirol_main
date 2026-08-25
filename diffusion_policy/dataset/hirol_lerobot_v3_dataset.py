@@ -550,9 +550,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         if requested in {"auto", "cuda", "gpu", "true", "1"}:
             if not torch.cuda.is_available():
                 return None
-            # TorchCodec 0.5 accepts ``cuda``; the current CUDA device is
-            # selected by torchrun (or by the caller) before dataset setup.
-            requested = "cuda"
+            # Use an explicit index: TorchCodec interprets bare ``cuda`` as
+            # cuda:0 even when PyTorch's current device was set to another GPU.
+            requested = f"cuda:{torch.cuda.current_device()}"
         if not requested.startswith("cuda"):
             raise ValueError(
                 "video_decode_device must be None, 'auto', or a CUDA device such as 'cuda:0'"

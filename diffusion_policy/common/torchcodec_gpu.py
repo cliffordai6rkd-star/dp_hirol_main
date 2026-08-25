@@ -61,12 +61,17 @@ class TorchCodecCudaFrameDecoder:
         self.device = str(device)
         self._paths: Dict[tuple, Path] = {}
         self._decoders: Dict[tuple, object] = {}
+        self._path_first_episode_start: Dict[Path, int] = {}
 
         for episode_idx in range(len(self._episode_ranges)):
             for video_key in video_keys:
                 path = self._resolve_video_path(episode_idx, video_key)
                 if path is not None:
                     self._paths[(episode_idx, video_key)] = path
+                    self._path_first_episode_start[path] = min(
+                        self._path_first_episode_start.get(path, self._episode_ranges[episode_idx].start),
+                        self._episode_ranges[episode_idx].start,
+                    )
 
         missing = [
             key
@@ -82,7 +87,8 @@ class TorchCodecCudaFrameDecoder:
         # Probe one decoder now.  This gives a clear, early fallback for the
         # common torchcodec==0.5 CPU-only wheel (Unsupported device: cuda).
         first_key = next(iter(self._paths))
-        self._decoders[first_key] = self._open_decoder(self._paths[first_key])
+        first_path = self._paths[first_key]
+        self._decoders[(first_path, first_key[1])] = self._open_decoder(first_path)
 
     @property
     def available(self) -> bool:
@@ -160,6 +166,11 @@ class TorchCodecCudaFrameDecoder:
         return data
 
     def _decode_one(self, decoder, local_index: int) -> np.ndarray:
+        # The CUDA TorchCodec build is more reliable through the batched API,
+        # even for a single requested frame.
+        if hasattr(decoder, "get_frames_at"):
+            frames = decoder.get_frames_at([int(local_index)])
+            return self._frame_data(frames)
         if hasattr(decoder, "get_frame_at"):
             return self._frame_data(decoder.get_frame_at(int(local_index)))
         try:
@@ -174,14 +185,17 @@ class TorchCodecCudaFrameDecoder:
         episode_idx = bisect_right(self._episode_stops, int(frame_idx))
         if episode_idx >= len(self._episode_ranges):
             episode_idx = len(self._episode_ranges) - 1
-        episode_range = self._episode_ranges[episode_idx]
-        local_index = int(frame_idx) - episode_range.start
-        cache_key = (episode_idx, video_key)
+        path = self._paths.get((episode_idx, video_key))
+        if path is None:
+            raise KeyError(f"No video path for episode={episode_idx}, key={video_key}")
+        # A chunk MP4 commonly contains several episodes.  In that layout the
+        # decoder expects the chunk-global index; for one-file-per-episode
+        # layouts, subtract that episode's start as before.
+        first_start = self._path_first_episode_start[path]
+        local_index = int(frame_idx) - first_start
+        cache_key = (path, video_key)
         decoder = self._decoders.get(cache_key)
         if decoder is None:
-            path = self._paths.get(cache_key)
-            if path is None:
-                raise KeyError(f"No video path for episode={episode_idx}, key={video_key}")
             decoder = self._open_decoder(path)
             self._decoders[cache_key] = decoder
         return self._decode_one(decoder, local_index)

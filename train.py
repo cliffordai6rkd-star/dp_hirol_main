@@ -41,6 +41,7 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)   
 
 import hydra
+import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from omegaconf import open_dict
@@ -234,6 +235,15 @@ def main(cfg: OmegaConf):
             # rank on the same device.
             with open_dict(cfg):
                 cfg.training.device = f"cuda:{distributed.local_rank}"
+        elif torch.cuda.is_available():
+            # Keep CUDA's current device aligned with the single-GPU config.
+            # The optional TorchCodec decoder uses ``device='cuda'`` in auto
+            # mode, which resolves to this current device.
+            configured_device = OmegaConf.select(
+                cfg, "training.device", default=None
+            )
+            if configured_device is not None and str(configured_device).startswith("cuda"):
+                torch.cuda.set_device(torch.device(str(configured_device)))
         cls = hydra.utils.get_class(cfg._target_)
         resume_output_dir = _infer_resume_output_dir(cfg)
         if resume_output_dir is not None and not distributed.enabled:
