@@ -9,7 +9,6 @@ import weakref
 import numpy as np
 import torch
 from PIL import Image
-from tqdm import tqdm
 
 from diffusion_policy.common.lerobot_v3_io import LeRobotV3Dataset
 from diffusion_policy.common.torchcodec_gpu import TorchCodecCudaFrameDecoder
@@ -25,6 +24,7 @@ from diffusion_policy.common.sampler import create_indices, downsample_mask, get
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.dataset.image_result_cache import (
     build_cache_metadata,
+    build_in_memory_image_result_cache,
     open_or_build_image_result_cache,
     read_image_result,
     use_disk_result_cache,
@@ -37,8 +37,12 @@ from diffusion_policy.common.normalize_util import get_image_range_normalizer,  
 
 
 class _RamPreloadCacheEntry:
-    def __init__(self, image_data: Dict[str, np.ndarray]):
+    def __init__(self, image_data: Dict[str, object], store=None):
         self.image_data = image_data
+        # Keep the MemoryStore strongly referenced for the lifetime of the
+        # dataset.  Zarr arrays alone do not provide a clear ownership signal
+        # across zarr 2.x and 3.x.
+        self.store = store
 
 
 # A single training process may construct both a train dataset and an offline
@@ -196,7 +200,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             self.sequence_length = self.horizon + self.n_latency_steps
             self.sampler_pad_after = self.pad_after
         self.anchor_position = max(0, min(self.sequence_length - 1, (n_obs_steps or 1) - 1))
-        self.image_data: Dict[str, np.ndarray] = {}
+        self.image_data: Dict[str, object] = {}
         self.load_result_cache_path = None
         load_result_on_disk = use_disk_result_cache(load_result_add)
         distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -415,8 +419,50 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             cache_entry_ref = _RAM_PRELOAD_CACHE.get(cache_key)
             cache_entry = cache_entry_ref() if cache_entry_ref is not None else None
             if cache_entry is None:
-                self.image_data = self._preload_images()
-                cache_entry = _RamPreloadCacheEntry(self.image_data)
+                image_shapes = {
+                    key: tuple(self.shape_meta["obs"][key]["shape"])
+                    for key in self.rgb_keys
+                }
+                metadata = build_cache_metadata(
+                    source_type="hirol_lerobot_v3",
+                    dataset_path=self.dataset_path,
+                    dataset_length=self.dataset_length,
+                    rgb_keys=self.rgb_keys,
+                    image_shapes=image_shapes,
+                    extra={"image_feature_map": self.image_feature_map},
+                )
+
+                def build_frame(frame_idx):
+                    frame_data = {}
+                    sample = None
+                    for key in self.rgb_keys:
+                        feature_name = self.image_feature_map[key]
+                        value = None
+                        if self._video_decoder is not None:
+                            try:
+                                value = self._video_decoder.decode(frame_idx, feature_name)
+                            except Exception as exc:
+                                self._disable_video_decoder(exc)
+                        if value is None:
+                            if sample is None:
+                                sample = self.lerobot_dataset[frame_idx]
+                            if feature_name not in sample:
+                                raise KeyError(
+                                    f"Feature {feature_name!r} missing from LeRobot sample. "
+                                    f"Available keys: {list(sample.keys())}"
+                                )
+                            value = sample[feature_name]
+                        frame_data[key] = _coerce_image(value, image_shapes[key])
+                    return frame_data
+
+                self.image_data, store = build_in_memory_image_result_cache(
+                    metadata=metadata,
+                    build_frame_fn=build_frame,
+                    desc="Preload LeRobot images into RAM Zarr",
+                    chunk_frames=32,
+                    logger=log,
+                )
+                cache_entry = _RamPreloadCacheEntry(self.image_data, store=store)
                 _RAM_PRELOAD_CACHE[cache_key] = weakref.ref(cache_entry)
             else:
                 log.info(
@@ -578,43 +624,6 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 exc,
             )
             self._video_decoder_warning_emitted = True
-
-    def _preload_images(self) -> Dict[str, np.ndarray]:
-        image_data = {
-            key: np.empty(
-                (self.dataset_length,) + tuple(self.shape_meta["obs"][key]["shape"]),
-                dtype=np.float32,
-            )
-            for key in self.rgb_keys
-        }
-        log.info(
-            "Preloading %d LeRobot frames for %d RGB keys into memory...",
-            self.dataset_length,
-            len(self.rgb_keys),
-        )
-        for frame_idx in tqdm(range(self.dataset_length), desc="Preload LeRobot images"):
-            sample = None
-            for key in self.rgb_keys:
-                feature_name = self.image_feature_map[key]
-                value = None
-                if self._video_decoder is not None:
-                    try:
-                        value = self._video_decoder.decode(frame_idx, feature_name)
-                    except Exception as exc:
-                        self._disable_video_decoder(exc)
-                if value is None:
-                    if sample is None:
-                        sample = self.lerobot_dataset[frame_idx]
-                    if feature_name not in sample:
-                        raise KeyError(
-                            f"Feature {feature_name!r} missing from LeRobot sample. "
-                            f"Available keys: {list(sample.keys())}"
-                        )
-                    value = sample[feature_name]
-                expected_shape = tuple(self.shape_meta["obs"][key]["shape"])
-                image_data[key][frame_idx] = _coerce_image(value, expected_shape)
-        log.info("Finished LeRobot image preload.")
-        return image_data
 
     @staticmethod
     def _build_episode_ends(episode_index: np.ndarray) -> np.ndarray:

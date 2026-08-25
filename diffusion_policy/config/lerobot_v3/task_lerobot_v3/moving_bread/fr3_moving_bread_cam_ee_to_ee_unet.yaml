@@ -62,7 +62,7 @@ dataset:
   local_files_only: true
   # Host requirement for preload_images=true:
   # - Linux training host is preferred because DataLoader workers use fork and can share
-  #   the read-only numpy cache with copy-on-write.
+  #   the read-only in-memory Zarr cache with copy-on-write.
   # - This task has 3 RGB cameras at 224x224 stored as float32 CHW after preload:
   #   3 cameras * 3 * 224 * 224 * 4 bytes ~= 1.72 MiB per frame.
   # - Estimated image cache RAM ~= 1.72 MiB * total_frame_count, before DataLoader

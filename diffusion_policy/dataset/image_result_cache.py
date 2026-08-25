@@ -97,6 +97,42 @@ def open_or_build_image_result_cache(
     return {key: root[key] for key in metadata["rgb_keys"]}, cache_path
 
 
+def build_in_memory_image_result_cache(
+    *,
+    metadata: Mapping,
+    build_frame_fn: Callable[[int], Mapping[str, np.ndarray]],
+    desc: str,
+    chunk_frames: int = 1,
+    logger=None,
+) -> Tuple[Dict[str, zarr.Array], object]:
+    """Build a decoded image cache backed by RAM, exposed as Zarr arrays.
+
+    ``MemoryStore`` is the in-memory equivalent of the directory store used
+    by :func:`open_or_build_image_result_cache`.  Returning the store along
+    with the arrays is intentional: the dataset retains it so the store stays
+    alive when the Zarr arrays are accessed by DataLoader workers.
+    """
+    try:
+        from zarr.storage import MemoryStore
+    except ImportError:  # pragma: no cover - compatibility with old zarr
+        MemoryStore = zarr.MemoryStore
+
+    store = MemoryStore()
+    root = zarr.open(store=store, mode="w")
+    root.attrs["metadata"] = dict(metadata)
+    arrays = _create_cache_arrays(root, metadata, chunk_frames)
+    _fill_cache_arrays(
+        arrays=arrays,
+        metadata=metadata,
+        build_frame_fn=build_frame_fn,
+        desc=desc,
+        chunk_frames=chunk_frames,
+    )
+    if logger is not None:
+        logger.info("Built in-memory Zarr image cache for %d frames.", int(metadata["dataset_length"]))
+    return {key: root[key] for key in metadata["rgb_keys"]}, store
+
+
 def read_image_result(image_data: Mapping[str, object], key: str, indices) -> np.ndarray:
     array = image_data[key]
     try:
@@ -122,48 +158,14 @@ def _build_cache(
     try:
         root = zarr.open(tmp_path, mode="w")
         root.attrs["metadata"] = dict(metadata)
-        arrays = {}
-        dataset_length = int(metadata["dataset_length"])
-        for key in metadata["rgb_keys"]:
-            shape = (dataset_length,) + tuple(metadata["image_shapes"][key])
-            chunks = (min(max(1, chunk_frames), max(1, dataset_length)),) + tuple(
-                metadata["image_shapes"][key]
-            )
-            arrays[key] = root.create_dataset(
-                key,
-                shape=shape,
-                chunks=chunks,
-                dtype=np.float32,
-                compressor=None,
-                overwrite=True,
-            )
-
-        chunk_frames = min(max(1, int(chunk_frames)), max(1, dataset_length))
-        buffers = {
-            key: np.empty(
-                (chunk_frames,) + tuple(metadata["image_shapes"][key]),
-                dtype=np.float32,
-            )
-            for key in metadata["rgb_keys"]
-        }
-
-        for chunk_start in tqdm(range(0, dataset_length, chunk_frames), desc=desc):
-            chunk_end = min(chunk_start + chunk_frames, dataset_length)
-            for frame_idx in range(chunk_start, chunk_end):
-                frame_data = build_frame_fn(frame_idx)
-                local_idx = frame_idx - chunk_start
-                for key, buffer in buffers.items():
-                    image = np.asarray(frame_data[key])
-                    expected_shape = tuple(metadata["image_shapes"][key])
-                    if image.shape != expected_shape:
-                        raise ValueError(
-                            f"Decoded image {key!r} at frame {frame_idx} has shape {image.shape}, "
-                            f"expected {expected_shape}."
-                        )
-                    buffer[local_idx] = image
-
-            for key, array in arrays.items():
-                array[chunk_start:chunk_end] = buffers[key][:(chunk_end - chunk_start)]
+        arrays = _create_cache_arrays(root, metadata, chunk_frames)
+        _fill_cache_arrays(
+            arrays=arrays,
+            metadata=metadata,
+            build_frame_fn=build_frame_fn,
+            desc=desc,
+            chunk_frames=chunk_frames,
+        )
 
         if os.path.exists(cache_path):
             shutil.rmtree(cache_path)
@@ -172,6 +174,59 @@ def _build_cache(
         if os.path.exists(tmp_path):
             shutil.rmtree(tmp_path)
         raise
+
+
+def _create_cache_arrays(root, metadata: Mapping, chunk_frames: int):
+    arrays = {}
+    dataset_length = int(metadata["dataset_length"])
+    chunk_frames = min(max(1, int(chunk_frames)), max(1, dataset_length))
+    for key in metadata["rgb_keys"]:
+        shape = (dataset_length,) + tuple(metadata["image_shapes"][key])
+        chunks = (chunk_frames,) + tuple(metadata["image_shapes"][key])
+        arrays[key] = root.create_dataset(
+            key,
+            shape=shape,
+            chunks=chunks,
+            dtype=np.float32,
+            compressor=None,
+            overwrite=True,
+        )
+    return arrays
+
+
+def _fill_cache_arrays(
+    *,
+    arrays: Mapping[str, object],
+    metadata: Mapping,
+    build_frame_fn: Callable[[int], Mapping[str, np.ndarray]],
+    desc: str,
+    chunk_frames: int,
+) -> None:
+    dataset_length = int(metadata["dataset_length"])
+    chunk_frames = min(max(1, int(chunk_frames)), max(1, dataset_length))
+    buffers = {
+        key: np.empty(
+            (chunk_frames,) + tuple(metadata["image_shapes"][key]),
+            dtype=np.float32,
+        )
+        for key in metadata["rgb_keys"]
+    }
+    for chunk_start in tqdm(range(0, dataset_length, chunk_frames), desc=desc):
+        chunk_end = min(chunk_start + chunk_frames, dataset_length)
+        for frame_idx in range(chunk_start, chunk_end):
+            frame_data = build_frame_fn(frame_idx)
+            local_idx = frame_idx - chunk_start
+            for key, buffer in buffers.items():
+                image = np.asarray(frame_data[key])
+                expected_shape = tuple(metadata["image_shapes"][key])
+                if image.shape != expected_shape:
+                    raise ValueError(
+                        f"Decoded image {key!r} at frame {frame_idx} has shape {image.shape}, "
+                        f"expected {expected_shape}."
+                    )
+                buffer[local_idx] = image
+        for key, array in arrays.items():
+            array[chunk_start:chunk_end] = buffers[key][:(chunk_end - chunk_start)]
 
 
 def _register_cache_cleanup(cache_path: str, logger=None) -> None:

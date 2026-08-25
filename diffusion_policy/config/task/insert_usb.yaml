@@ -55,8 +55,8 @@ dataset:
   # auto uses a CUDA-enabled TorchCodec build when available and falls back
   # automatically with the CPU-only torchcodec==0.5 wheel.
   video_decode_device: auto
-  # Single GPU uses RAM preload. Under torchrun, the dataset automatically
-  # promotes this to one shared /dev/shm cache so ranks do not duplicate it.
+  # Single GPU uses an in-memory Zarr cache. Under torchrun, the dataset
+  # automatically promotes this to one shared /dev/shm Zarr cache.
   preload_images: true
   load_result_add: ram
 
