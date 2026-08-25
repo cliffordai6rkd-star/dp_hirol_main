@@ -94,7 +94,7 @@ training:
     dtype: bfloat16
     allow_tf32: true
   distributed:
-    enabled: true
+    enabled: false
     backend: nccl
     batch_size_is_global: true
     find_unused_parameters: false

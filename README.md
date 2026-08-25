@@ -58,9 +58,7 @@ diffusion_policy/config/train_pure_diffusion_transformer_workspace.yaml
 ```bash
 export DP_BASELINE_DATASET_PATH=/opt/lcx/data/wipe_board_lbv3/
 export DINOV3_MODEL_PATH=/opt/lcx/model/dinov3-vitb16-pretrain-lvd1689m/
-python train.py \
-  --config-dir=diffusion_policy/config \
-  --config-name=train_dp_baseline
+python train.py --config-dir=diffusion_policy/config --config-name=train_dp_inert_usb
 ```
 
 单进程命令只使用一张 GPU；`training.distributed.enabled: true` 不会自动创建
