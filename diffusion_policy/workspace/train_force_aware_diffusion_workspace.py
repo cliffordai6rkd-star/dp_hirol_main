@@ -381,7 +381,14 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             ema.optimization_step = self.optimizer_step
 
         env_runner: Optional[BaseImageRunner] = None
-        if self.is_main_process and cfg.task.get("env_runner") is not None:
+        # Rollouts are rank-0-only by design.  Running them inside the DDP
+        # epoch makes every other rank idle at the next collective.  Keep the
+        # behavior for single-GPU runs; DDP users can run the same evaluator
+        # from a saved checkpoint after training.
+        run_rank0_eval = not distributed.enabled or bool(
+            cfg.training.get("distributed", {}).get("run_rank0_eval", False)
+        )
+        if self.is_main_process and run_rank0_eval and cfg.task.get("env_runner") is not None:
             env_runner_cfg = cfg.task.env_runner
             env_runner_kwargs = {"output_dir": self.output_dir}
             # OfflineValidationRunner declares dataset_cfg and can share the
@@ -511,6 +518,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
                 if (
                     self.is_main_process
+                    and run_rank0_eval
                     and self.epoch % int(cfg.training.sample_every) == 0
                 ):
                     batch = dict_apply(
@@ -564,8 +572,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         self._save_checkpoints(cfg, step_log, topk_manager)
 
                 policy.train()
-                if distributed.enabled:
-                    dist.barrier()
+                # DDP's gradient collectives already synchronize at the next
+                # batch.  An unconditional epoch barrier only amplifies the
+                # rank-0 checkpoint/evaluation stall.
 
         if self._saving_thread is not None:
             self._saving_thread.join()
@@ -673,10 +682,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     self.ema_model.set_optimizer_step(self.optimizer_step)
 
                 last_log = {
-                    "train_loss": self._distributed_mean(
-                        float(np.mean(group_losses)),
-                        device,
-                    ),
+                    # The scalar reduction is deferred to the epoch summary;
+                    # one all-reduce per optimizer step is unnecessary for
+                    # training and was measurable with small per-rank batches.
+                    "train_loss": float(np.mean(group_losses)),
                     "lr": lr_scheduler.get_last_lr()[0],
                     "epoch": self.epoch,
                     "global_step": self.global_step,

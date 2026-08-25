@@ -12,6 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from diffusion_policy.common.lerobot_v3_io import LeRobotV3Dataset
+from diffusion_policy.common.torchcodec_gpu import TorchCodecCudaFrameDecoder
 from diffusion_policy.common.memory_budget import (
     compute_effective_budget_bytes,
     estimate_array_nbytes,
@@ -141,6 +142,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         local_files_only: bool = True,
         # None lets LeRobot select its installed TorchCodec backend.
         video_backend: Optional[str] = None,
+        # ``auto`` uses a CUDA TorchCodec decoder when the installed build
+        # supports it, and falls back to LeRobot's normal decoder otherwise.
+        video_decode_device: Optional[str] = None,
         preload_images: bool = False,
         memory_limit_gb: Optional[float] = None,
         memory_reserve_gb: float = 2.0,
@@ -180,6 +184,11 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.timestamp_key = timestamp_key
         self.timestamp_step_sec = timestamp_step_sec
         self.timestamp_tolerance_sec = timestamp_tolerance_sec
+        self.video_decode_device = (
+            None if video_decode_device is None else str(video_decode_device).lower()
+        )
+        self._video_decoder = None
+        self._video_decoder_warning_emitted = False
         if self.action_layout == "prechunked":
             self.sequence_length = int(n_obs_steps or 1)
             self.sampler_pad_after = 0
@@ -278,6 +287,28 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             memory_reserve_gb=memory_reserve_gb,
         )
         estimated_preload_bytes = self._estimate_image_preload_bytes()
+        # A float32 preload is intentionally retained for compatibility with
+        # the model input pipeline, but do not let an undersized host enter
+        # swap.  SSD cache remains a CPU-side decoded cache and is reusable by
+        # later runs.
+        if preload_images and not load_result_on_disk and memory_limit_gb is None:
+            available_bytes = self._available_memory_bytes()
+            reserve_bytes = int(float(memory_reserve_gb) * (1024 ** 3))
+            if available_bytes is not None and estimated_preload_bytes + reserve_bytes > int(
+                available_bytes * 0.9
+            ):
+                fallback_location = os.environ.get(
+                    "DP_IMAGE_CACHE_FALLBACK", "ssd"
+                )
+                log.warning(
+                    "Image preload needs %s plus reserve, but only %s host memory is available; "
+                    "using %r decoded cache to avoid swap.",
+                    format_gb(estimated_preload_bytes),
+                    format_gb(available_bytes),
+                    fallback_location,
+                )
+                load_result_add = fallback_location
+                load_result_on_disk = use_disk_result_cache(load_result_add)
         if use_shared_ram_result_cache(load_result_add):
             shared_cache_dir = os.environ.get(
                 "DP_SHARED_IMAGE_CACHE_DIR", "/dev/shm/diffusion_policy_image_cache"
@@ -330,17 +361,31 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 },
             )
 
+            self._video_decoder = self._make_video_decoder()
+
             def build_frame(frame_idx):
-                sample = self.lerobot_dataset[frame_idx]
                 frame_data = {}
+                sample = None
                 for key in self.rgb_keys:
                     feature_name = self.image_feature_map[key]
-                    if feature_name not in sample:
-                        raise KeyError(
-                            f"Feature {feature_name!r} missing from LeRobot sample. "
-                            f"Available keys: {list(sample.keys())}"
-                        )
-                    frame_data[key] = _coerce_image(sample[feature_name], image_shapes[key])
+                    if self._video_decoder is not None:
+                        try:
+                            value = self._video_decoder.decode(frame_idx, feature_name)
+                        except Exception as exc:
+                            self._disable_video_decoder(exc)
+                            value = None
+                    else:
+                        value = None
+                    if value is None:
+                        if sample is None:
+                            sample = self.lerobot_dataset[frame_idx]
+                        if feature_name not in sample:
+                            raise KeyError(
+                                f"Feature {feature_name!r} missing from LeRobot sample. "
+                                f"Available keys: {list(sample.keys())}"
+                            )
+                        value = sample[feature_name]
+                    frame_data[key] = _coerce_image(value, image_shapes[key])
                 return frame_data
 
             self.image_data, self.load_result_cache_path = open_or_build_image_result_cache(
@@ -349,10 +394,12 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 metadata=metadata,
                 build_frame_fn=build_frame,
                 desc="Build LeRobot decoded image cache",
+                chunk_frames=32,
                 logger=log,
             )
             self.lerobot_dataset.close()
         elif preload_images:
+            self._video_decoder = self._make_video_decoder()
             cache_key = (
                 os.path.abspath(self.dataset_path),
                 int(self.dataset_length),
@@ -482,6 +529,56 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             total += self.dataset_length * estimate_array_nbytes(expected_shape, np.float32)
         return total
 
+    @staticmethod
+    def _available_memory_bytes() -> Optional[int]:
+        try:
+            import psutil
+
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            try:
+                pages = os.sysconf("SC_AVPHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return int(pages * page_size)
+            except (AttributeError, OSError, ValueError):
+                return None
+
+    def _make_video_decoder(self):
+        requested = self.video_decode_device
+        if requested in {None, "", "none", "cpu", "false", "0"}:
+            return None
+        if requested in {"auto", "cuda", "gpu", "true", "1"}:
+            if not torch.cuda.is_available():
+                return None
+            # TorchCodec 0.5 accepts ``cuda``; the current CUDA device is
+            # selected by torchrun (or by the caller) before dataset setup.
+            requested = "cuda"
+        if not requested.startswith("cuda"):
+            raise ValueError(
+                "video_decode_device must be None, 'auto', or a CUDA device such as 'cuda:0'"
+            )
+        try:
+            decoder = TorchCodecCudaFrameDecoder(
+                lerobot_dataset=self.lerobot_dataset,
+                episode_ranges=self.episode_ranges,
+                video_keys=[self.image_feature_map[key] for key in self.rgb_keys],
+                device=requested,
+            )
+            log.info("Using TorchCodec CUDA video decoder on %s", requested)
+            return decoder
+        except Exception as exc:
+            self._disable_video_decoder(exc)
+            return None
+
+    def _disable_video_decoder(self, exc: Exception) -> None:
+        self._video_decoder = None
+        if not self._video_decoder_warning_emitted:
+            log.warning(
+                "TorchCodec CUDA decoding is unavailable; falling back to LeRobot decoder: %s",
+                exc,
+            )
+            self._video_decoder_warning_emitted = True
+
     def _preload_images(self) -> Dict[str, np.ndarray]:
         image_data = {
             key: np.empty(
@@ -496,16 +593,26 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             len(self.rgb_keys),
         )
         for frame_idx in tqdm(range(self.dataset_length), desc="Preload LeRobot images"):
-            sample = self.lerobot_dataset[frame_idx]
+            sample = None
             for key in self.rgb_keys:
                 feature_name = self.image_feature_map[key]
-                if feature_name not in sample:
-                    raise KeyError(
-                        f"Feature {feature_name!r} missing from LeRobot sample. "
-                        f"Available keys: {list(sample.keys())}"
-                    )
+                value = None
+                if self._video_decoder is not None:
+                    try:
+                        value = self._video_decoder.decode(frame_idx, feature_name)
+                    except Exception as exc:
+                        self._disable_video_decoder(exc)
+                if value is None:
+                    if sample is None:
+                        sample = self.lerobot_dataset[frame_idx]
+                    if feature_name not in sample:
+                        raise KeyError(
+                            f"Feature {feature_name!r} missing from LeRobot sample. "
+                            f"Available keys: {list(sample.keys())}"
+                        )
+                    value = sample[feature_name]
                 expected_shape = tuple(self.shape_meta["obs"][key]["shape"])
-                image_data[key][frame_idx] = _coerce_image(sample[feature_name], expected_shape)
+                image_data[key][frame_idx] = _coerce_image(value, expected_shape)
         log.info("Finished LeRobot image preload.")
         return image_data
 

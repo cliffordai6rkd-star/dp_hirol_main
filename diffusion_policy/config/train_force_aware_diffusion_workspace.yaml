@@ -122,6 +122,8 @@ training:
     # Preserve the existing effective batch size: 512 becomes 256 per GPU.
     batch_size_is_global: true
     find_unused_parameters: false
+    # Keep rank-0 offline rollout/sample evaluation out of the DDP critical path.
+    run_rank0_eval: false
   lr_scheduler: cosine
   lr_warmup_steps: 500
   # Set exactly one of num_epochs and num_optimizer_steps.

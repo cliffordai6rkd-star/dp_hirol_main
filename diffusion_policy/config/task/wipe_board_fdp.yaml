@@ -61,6 +61,8 @@ dataset:
   timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
   local_files_only: true
+  # Use CUDA TorchCodec when the environment was built with ENABLE_CUDA=1.
+  video_decode_device: auto
   preload_images: true
   load_result_add: ram
 

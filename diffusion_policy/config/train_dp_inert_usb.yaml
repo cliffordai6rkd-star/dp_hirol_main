@@ -102,6 +102,8 @@ training:
     backend: nccl
     batch_size_is_global: true
     find_unused_parameters: false
+    # DDP skips rank-0 offline rollout/sample work so other ranks do not idle.
+    run_rank0_eval: false
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: 2500

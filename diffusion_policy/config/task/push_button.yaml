@@ -52,6 +52,9 @@ dataset:
   local_files_only: true
   # null lets LeRobot 0.4 select TorchCodec when it is installed.
   video_backend: null
+  # auto uses a CUDA-enabled TorchCodec build when available and falls back
+  # automatically with the CPU-only torchcodec==0.5 wheel.
+  video_decode_device: auto
   # Avoid a 38 GiB float32 image preload for the full wipe-board dataset.
   preload_images: true
   load_result_add: ram
