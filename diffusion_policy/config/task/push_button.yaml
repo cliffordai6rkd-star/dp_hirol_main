@@ -58,7 +58,7 @@ dataset:
     resize: false
     random_crop: false
     rotation: false
-    color_jitter: true
+    color_jitter: false
     color_jitter_params:
       brightness: 0.1
       contrast: 0.15

@@ -74,10 +74,16 @@ class EMAModel:
                 # if data_ptr != 0:
                 #     all_dataptrs.add(data_ptr)
 
+                # Frozen parameters never change after model construction.  In
+                # image policies this includes the entire DINO backbone; EMA
+                # copying it on every optimizer step needlessly transfers
+                # hundreds of megabytes.  The EMA model starts as a deepcopy,
+                # so retaining the frozen value is exact and avoids that cost.
+                if not param.requires_grad:
+                    continue
                 if isinstance(module, _BatchNorm):
-                    # skip batchnorms
-                    ema_param.copy_(param.to(dtype=ema_param.dtype).data)
-                elif not param.requires_grad:
+                    # Keep the legacy BatchNorm behavior for trainable affine
+                    # parameters (EMA is not appropriate for running stats).
                     ema_param.copy_(param.to(dtype=ema_param.dtype).data)
                 else:
                     ema_param.mul_(self.decay)

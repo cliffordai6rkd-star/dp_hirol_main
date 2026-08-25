@@ -4,6 +4,7 @@ import copy
 import logging as log
 import os
 import shutil
+import weakref
 
 import numpy as np
 import torch
@@ -32,6 +33,19 @@ from diffusion_policy.dataset.img_randomer import Image_randomer
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy.common.normalize_util import get_image_range_normalizer,  get_image_identity_normalizer
+
+
+class _RamPreloadCacheEntry:
+    def __init__(self, image_data: Dict[str, np.ndarray]):
+        self.image_data = image_data
+
+
+# A single training process may construct both a train dataset and an offline
+# validation view.  Keep RAM-preloaded frames process-local so an accidental
+# second dataset construction does not reopen and decode every video frame.
+# Weak references ensure a Hydra multirun can release a dataset's RAM after
+# the corresponding job exits.
+_RAM_PRELOAD_CACHE: Dict[tuple, weakref.ReferenceType] = {}
 
 
 def _to_numpy(value):
@@ -336,7 +350,31 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             )
             self.lerobot_dataset.close()
         elif preload_images:
-            self.image_data = self._preload_images()
+            cache_key = (
+                os.path.abspath(self.dataset_path),
+                int(self.dataset_length),
+                tuple(
+                    (
+                        key,
+                        tuple(self.shape_meta["obs"][key]["shape"]),
+                        self.image_feature_map[key],
+                    )
+                    for key in self.rgb_keys
+                ),
+            )
+            cache_entry_ref = _RAM_PRELOAD_CACHE.get(cache_key)
+            cache_entry = cache_entry_ref() if cache_entry_ref is not None else None
+            if cache_entry is None:
+                self.image_data = self._preload_images()
+                cache_entry = _RamPreloadCacheEntry(self.image_data)
+                _RAM_PRELOAD_CACHE[cache_key] = weakref.ref(cache_entry)
+            else:
+                log.info(
+                    "Using process-local RAM image preload cache for %s",
+                    self.dataset_path,
+                )
+                self.image_data = cache_entry.image_data
+            self._ram_cache_entry = cache_entry
             self.lerobot_dataset.close()
 
         val_mask = get_val_mask(

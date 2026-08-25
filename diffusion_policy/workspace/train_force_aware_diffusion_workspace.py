@@ -389,6 +389,13 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             # again during runner construction.
             if env_runner_cfg.get("dataset_cfg") is not None:
                 env_runner_kwargs["dataset"] = dataset
+                # OfflineValidationRunner can use the exact validation view
+                # already attached to this workspace.  This avoids rebuilding
+                # dataset state (and, for lazy video datasets, decoding again).
+                target = str(env_runner_cfg.get("_target_", ""))
+                if target.endswith("OfflineValidationRunner"):
+                    env_runner_kwargs["validation_dataset"] = validation_dataset
+                    env_runner_kwargs["dataloader"] = val_dataloader
             env_runner = hydra.utils.instantiate(
                 env_runner_cfg,
                 **env_runner_kwargs,

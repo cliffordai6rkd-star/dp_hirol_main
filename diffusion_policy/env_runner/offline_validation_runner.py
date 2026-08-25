@@ -26,6 +26,8 @@ class OfflineValidationRunner(BaseImageRunner):
         output_dir,
         dataset_cfg: Union[DictConfig, BaseImageDataset],
         dataset: Optional[BaseImageDataset] = None,
+        validation_dataset: Optional[BaseImageDataset] = None,
+        dataloader: Optional[DataLoader] = None,
         batch_size: int = 8,
         num_workers: int = 2,
         max_steps: Optional[int] = None,
@@ -44,7 +46,16 @@ class OfflineValidationRunner(BaseImageRunner):
                 dataset = dataset_cfg
             else:
                 dataset = hydra.utils.instantiate(dataset_cfg)
-        self.validation_dataset = dataset.get_validation_dataset()
+        # The workspace already creates this view for its validation loader.
+        # Reusing it keeps runner construction side-effect free.  In
+        # particular, datasets that lazily decode videos must not be asked to
+        # build another validation object at this point.
+        self.validation_dataset = (
+            validation_dataset
+            if validation_dataset is not None
+            else dataset.get_validation_dataset()
+        )
+        self.dataloader = dataloader
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.max_steps = max_steps
@@ -52,15 +63,21 @@ class OfflineValidationRunner(BaseImageRunner):
         self.seed = int(seed)
 
     def run(self, policy) -> Dict[str, float]:
-        loader_cfg = {
-            "batch_size": self.batch_size,
-            "num_workers": self.num_workers,
-            "shuffle": False,
-            "pin_memory": policy.device.type == "cuda",
-        }
-        if self.num_workers > 0:
-            loader_cfg["persistent_workers"] = False
-        dataloader = DataLoader(self.validation_dataset, **loader_cfg)
+        if self.dataloader is None:
+            loader_cfg = {
+                "batch_size": self.batch_size,
+                "num_workers": self.num_workers,
+                "shuffle": False,
+                "pin_memory": policy.device.type == "cuda",
+            }
+            if self.num_workers > 0:
+                loader_cfg["persistent_workers"] = False
+            dataloader = DataLoader(self.validation_dataset, **loader_cfg)
+        else:
+            # The workspace-owned loader has persistent workers and the same
+            # validation split used by the training loss, so no new worker
+            # pool (or decoder state) is created for each rollout.
+            dataloader = self.dataloader
 
         device = policy.device
         total_loss = 0.0
