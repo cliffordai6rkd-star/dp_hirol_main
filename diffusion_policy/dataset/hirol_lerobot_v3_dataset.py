@@ -139,6 +139,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         timestamp_step_sec: Optional[float] = None,
         timestamp_tolerance_sec: Optional[float] = None,
         local_files_only: bool = True,
+        # None lets LeRobot select its installed TorchCodec backend.
+        video_backend: Optional[str] = None,
         preload_images: bool = False,
         memory_limit_gb: Optional[float] = None,
         memory_reserve_gb: float = 2.0,
@@ -224,6 +226,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.lerobot_dataset = LeRobotV3Dataset(
             self.dataset_path,
             local_files_only=local_files_only,
+            video_backend=video_backend,
         )
         self.dataset_length = len(self.lerobot_dataset)
 

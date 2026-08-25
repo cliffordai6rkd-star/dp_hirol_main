@@ -110,7 +110,7 @@ training:
   # In step-based mode, keep only the final K checkpoints for real-robot
   # evaluation. checkpoint_every is ignored while this is set.
   checkpoint_every_optimizer_steps: null
-  val_every: 5
+  val_every: 10
   sample_every: 10
   max_train_steps: null
   max_val_steps: 50

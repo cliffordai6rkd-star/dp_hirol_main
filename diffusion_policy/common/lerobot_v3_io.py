@@ -150,6 +150,7 @@ class LeRobotV3Dataset:
         root: str,
         repo_id: Optional[str] = None,
         local_files_only: bool = True,
+        # LeRobot 0.4 selects TorchCodec when video_backend is omitted.
         video_backend: Optional[str] = None,
     ):
         LeRobotDataset = _import_lerobot_dataset()

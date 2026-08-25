@@ -50,6 +50,8 @@ dataset:
   timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
   local_files_only: true
+  # null lets LeRobot 0.4 select TorchCodec when it is installed.
+  video_backend: null
   # Single GPU uses RAM preload. Under torchrun, the dataset automatically
   # promotes this to one shared /dev/shm cache so ranks do not duplicate it.
   preload_images: true
