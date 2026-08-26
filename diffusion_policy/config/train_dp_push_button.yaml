@@ -6,6 +6,7 @@ name: train_dp_baseline-push_button
 _target_: diffusion_policy.workspace.train_dp_baseline_workspace.TrainDPBaselineWorkspace
 
 dataset_path: ${oc.env:DP_BASELINE_DATASET_PATH}
+dino_model_path: ${oc.env:DINOV3_MODEL_PATH}
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
@@ -33,18 +34,13 @@ policy:
     prediction_type: epsilon
 
   obs_encoder:
-    _target_: diffusion_policy.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    _target_: diffusion_policy.model.vision.dinov3_multi_image_obs_encoder.DINOv3MultiImageObsEncoder
     shape_meta: ${shape_meta}
-    rgb_model:
-      _target_: diffusion_policy.model.vision.model_getter.get_resnet
-      name: resnet18
-      weights: IMAGENET1K_V1
-    resize_shape: [224, 224]
-    crop_shape: null
-    random_crop: false
-    use_group_norm: false
-    share_rgb_model: true
-    imagenet_norm: true
+    pretrained_model_name_or_path: ${dino_model_path}
+    output_dim: 256
+    freeze_backbone: true
+    local_files_only: true
+    pooling: cls
 
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
@@ -131,7 +127,7 @@ logging:
   resume: true
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-  tags: [dp-baseline, pure-visual, dual-camera, imagenet-resnet18, transformer]
+  tags: [dp-baseline, pure-visual, dual-camera, dinov3, transformer]
   id: null
   group: null
 
