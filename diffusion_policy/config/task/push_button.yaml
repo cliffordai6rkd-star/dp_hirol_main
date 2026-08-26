@@ -58,6 +58,8 @@ dataset:
   # Avoid a 38 GiB float32 image preload for the full wipe-board dataset.
   preload_images: true
   load_result_add: ram
+  image_cache_dtype: uint8
+  image_cache_chunk_frames: 64
 
   image_randomer_config:
     resize: false

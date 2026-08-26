@@ -30,7 +30,7 @@ def _as_path(value, root: Path) -> Optional[Path]:
 
 
 class TorchCodecCudaFrameDecoder:
-    """Decode individual LeRobot frames with a CUDA TorchCodec decoder.
+    """Decode LeRobot frames with a CUDA TorchCodec decoder.
 
     LeRobot metadata changed slightly between 0.3 and 0.4.  Path resolution is
     therefore deliberately introspective and fails closed: if paths cannot be
@@ -155,47 +155,95 @@ class TorchCodecCudaFrameDecoder:
 
     @staticmethod
     def _frame_data(frame) -> np.ndarray:
+        """Convert one TorchCodec frame to a CPU NumPy array."""
         data = getattr(frame, "data", frame)
         if isinstance(data, Mapping):
             data = data.get("data", data.get("frame"))
         if torch.is_tensor(data):
+            # Keep the host transfer in one place.  ``decode_many`` transfers
+            # the whole batch at once, avoiding a CUDA sync for every frame.
             data = data.detach().cpu().numpy()
         data = np.asarray(data)
         if data.ndim == 4 and data.shape[0] == 1:
             data = data[0]
         return data
 
-    def _decode_one(self, decoder, local_index: int) -> np.ndarray:
-        # The CUDA TorchCodec build is more reliable through the batched API,
-        # even for a single requested frame.
-        if hasattr(decoder, "get_frames_at"):
-            frames = decoder.get_frames_at([int(local_index)])
-            return self._frame_data(frames)
-        if hasattr(decoder, "get_frame_at"):
-            return self._frame_data(decoder.get_frame_at(int(local_index)))
-        try:
-            return self._frame_data(decoder[int(local_index)])
-        except (AttributeError, TypeError, IndexError):
-            if hasattr(decoder, "get_frames_at"):
-                frames = decoder.get_frames_at([int(local_index)])
-                return self._frame_data(frames)
-            raise
+    @classmethod
+    def _frame_data_batch(cls, frames, expected_count: int) -> Sequence[np.ndarray]:
+        data = getattr(frames, "data", frames)
+        if isinstance(data, Mapping):
+            data = data.get("data", data.get("frames", data.get("frame")))
+        if torch.is_tensor(data):
+            data = data.detach().cpu().numpy()
+        data = np.asarray(data)
+        if data.ndim == 3 and expected_count == 1:
+            data = data[None, ...]
+        if data.ndim < 4 or data.shape[0] != expected_count:
+            # Some TorchCodec versions return a sequence of frame objects
+            # rather than a stacked tensor.
+            try:
+                source = data if data.ndim == 1 and len(data) == expected_count else frames
+                values = [cls._frame_data(item) for item in source]
+            except TypeError:
+                values = [cls._frame_data(data)]
+            if len(values) == expected_count:
+                return values
+            raise RuntimeError(
+                f"TorchCodec returned {data.shape} for {expected_count} requested frames"
+            )
+        return [np.asarray(data[index]) for index in range(expected_count)]
 
-    def decode(self, frame_idx: int, video_key: str) -> np.ndarray:
-        episode_idx = bisect_right(self._episode_stops, int(frame_idx))
-        if episode_idx >= len(self._episode_ranges):
-            episode_idx = len(self._episode_ranges) - 1
-        path = self._paths.get((episode_idx, video_key))
-        if path is None:
-            raise KeyError(f"No video path for episode={episode_idx}, key={video_key}")
-        # A chunk MP4 commonly contains several episodes.  In that layout the
-        # decoder expects the chunk-global index; for one-file-per-episode
-        # layouts, subtract that episode's start as before.
-        first_start = self._path_first_episode_start[path]
-        local_index = int(frame_idx) - first_start
+    def _decode_many(self, decoder, local_indices: Sequence[int]) -> Sequence[np.ndarray]:
+        local_indices = [int(index) for index in local_indices]
+        if hasattr(decoder, "get_frames_at"):
+            try:
+                frames = decoder.get_frames_at(local_indices)
+            except TypeError:
+                frames = decoder.get_frames_at(indices=local_indices)
+            return self._frame_data_batch(frames, len(local_indices))
+        if len(local_indices) == 1 and hasattr(decoder, "get_frame_at"):
+            return [self._frame_data(decoder.get_frame_at(local_indices[0]))]
+        return [self._frame_data(decoder[index]) for index in local_indices]
+
+    def _decode_one(self, decoder, local_index: int) -> np.ndarray:
+        """Backward-compatible single-frame helper."""
+        return self._decode_many(decoder, [local_index])[0]
+
+    def _decoder_for(self, path: Path, video_key: str):
         cache_key = (path, video_key)
         decoder = self._decoders.get(cache_key)
         if decoder is None:
             decoder = self._open_decoder(path)
             self._decoders[cache_key] = decoder
-        return self._decode_one(decoder, local_index)
+        return decoder
+
+    def decode_many(self, frame_indices: Sequence[int], video_key: str) -> Sequence[np.ndarray]:
+        """Decode several global frame indices with one call per video file.
+
+        Requests can straddle episode/video boundaries; indices are grouped by
+        decoder and returned in the same order as the input sequence.
+        """
+        indices = [int(index) for index in frame_indices]
+        if not indices:
+            return []
+        grouped = {}
+        for position, frame_idx in enumerate(indices):
+            episode_idx = bisect_right(self._episode_stops, frame_idx)
+            if episode_idx >= len(self._episode_ranges):
+                episode_idx = len(self._episode_ranges) - 1
+            path = self._paths.get((episode_idx, video_key))
+            if path is None:
+                raise KeyError(f"No video path for episode={episode_idx}, key={video_key}")
+            local_index = frame_idx - self._path_first_episode_start[path]
+            grouped.setdefault((path, video_key), []).append((position, local_index))
+
+        result = [None] * len(indices)
+        for (path, key), requests in grouped.items():
+            decoder = self._decoder_for(path, key)
+            values = self._decode_many(decoder, [item[1] for item in requests])
+            for (position, _), value in zip(requests, values):
+                result[position] = value
+        return result
+
+    def decode(self, frame_idx: int, video_key: str) -> np.ndarray:
+        return self.decode_many([frame_idx], video_key)[0]

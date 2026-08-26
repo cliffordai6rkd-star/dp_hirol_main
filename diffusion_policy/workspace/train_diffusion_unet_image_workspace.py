@@ -129,6 +129,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         if cfg.task.dataset.get("_target_") in memory_aware_dataset_targets:
             dataset_kwargs["memory_limit_gb"] = max_ram_gb
             dataset_kwargs["memory_reserve_gb"] = memory_reserve_gb
+        configured_device = torch.device(str(cfg.training.device))
+        if configured_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(
+                configured_device.index
+                if configured_device.index is not None
+                else torch.cuda.current_device()
+            )
         dataset = hydra.utils.instantiate(cfg.task.dataset, **dataset_kwargs)
         assert isinstance(dataset, BaseImageDataset)
         shape_meta = OmegaConf.to_container(cfg.shape_meta, resolve=True)
@@ -248,6 +255,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             cfg.training.sample_every = 1
 
         debug_print_steps = max(1, int(OmegaConf.select(cfg, "training.debug_print_steps", default=100)))
+        profile_sync = bool(
+            OmegaConf.select(cfg, "training.profile_sync", default=False)
+        ) and torch.cuda.is_available()
         wandb_rgb_steps = OmegaConf.select(cfg, "training.wandb_rgb_steps", default=None)
         if wandb_rgb_steps is not None:
             wandb_rgb_steps = max(1, int(wandb_rgb_steps))
@@ -296,16 +306,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         # GPU内存使用监控
                         memory_allocated = 0
                         memory_reserved = 0
-                        if batch_idx % 10 == 0:  # 每10个batch检查一次
+                        if profile_sync and batch_idx % 10 == 0:  # 每10个batch检查一次
                             torch.cuda.synchronize()
                             memory_allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
                             memory_reserved = torch.cuda.memory_reserved(device) / 1024**3   # GB
 
                         # 完整的前向传播和损失计算
-                        torch.cuda.synchronize()
+                        if profile_sync:
+                            torch.cuda.synchronize()
                         forward_start = time.perf_counter()
                         raw_loss = self.model.compute_loss(batch)
-                        torch.cuda.synchronize()
+                        if profile_sync:
+                            torch.cuda.synchronize()
                         forward_time = time.perf_counter() - forward_start
 
                         # 反向传播时间
@@ -389,7 +401,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             and batch_idx >= (cfg.training.max_train_steps-1):
                             break
                         real_batch_used_time = time.perf_counter() - batch_start_time
-                        torch.cuda.synchronize()  # 确保GPU操作完成
+                        if profile_sync:
+                            torch.cuda.synchronize()  # 确保GPU操作完成
                         sync_time = time.perf_counter() - batch_start_time
                         total_iteration_time = time.perf_counter() - iteration_start_time
                         # if batch_idx % debug_print_steps == 0:

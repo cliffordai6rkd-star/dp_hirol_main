@@ -39,9 +39,8 @@ from diffusion_policy.common.normalize_util import get_image_range_normalizer,  
 class _RamPreloadCacheEntry:
     def __init__(self, image_data: Dict[str, object], store=None):
         self.image_data = image_data
-        # Keep the MemoryStore strongly referenced for the lifetime of the
-        # dataset.  Zarr arrays alone do not provide a clear ownership signal
-        # across zarr 2.x and 3.x.
+        # Keep an optional backing store for compatibility with older cache
+        # implementations that used Zarr MemoryStore.
         self.store = store
 
 
@@ -154,6 +153,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         memory_reserve_gb: float = 2.0,
         load_result_add="ram",
         image_randomer_config: Optional[Mapping] = None,
+        image_cache_dtype: str = "uint8",
+        image_cache_chunk_frames: int = 64,
     ):
         super().__init__()
         if window_sampling_strategy not in {"idx", "timestamp"}:
@@ -191,6 +192,13 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.video_decode_device = (
             None if video_decode_device is None else str(video_decode_device).lower()
         )
+        try:
+            self.image_cache_dtype = np.dtype(image_cache_dtype)
+        except TypeError as exc:
+            raise ValueError(f"Unsupported image_cache_dtype={image_cache_dtype!r}") from exc
+        if self.image_cache_dtype not in {np.dtype(np.uint8), np.dtype(np.float32)}:
+            raise ValueError("image_cache_dtype must be 'uint8' or 'float32'")
+        self.image_cache_chunk_frames = max(1, int(image_cache_chunk_frames))
         self._video_decoder = None
         self._video_decoder_warning_emitted = False
         if self.action_layout == "prechunked":
@@ -212,9 +220,18 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 distributed_world_size,
             )
         self.image_randomer_config = image_randomer_config
+        augmentation_enabled = bool(
+            image_randomer_config
+            and (
+                bool(image_randomer_config.get("resize", False))
+                or bool(image_randomer_config.get("random_crop", True))
+                or bool(image_randomer_config.get("rotation", False))
+                or bool(image_randomer_config.get("color_jitter", False))
+            )
+        )
         self.image_randomer = (
             Image_randomer(dict(image_randomer_config))
-            if image_randomer_config is not None
+            if augmentation_enabled
             else None
         )
 
@@ -291,10 +308,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             memory_reserve_gb=memory_reserve_gb,
         )
         estimated_preload_bytes = self._estimate_image_preload_bytes()
-        # A float32 preload is intentionally retained for compatibility with
-        # the model input pipeline, but do not let an undersized host enter
-        # swap.  SSD cache remains a CPU-side decoded cache and is reusable by
-        # later runs.
+        # Keep the decoded cache compact (uint8 by default) and do not let an
+        # undersized host enter swap.  SSD caches remain reusable by later runs.
         if preload_images and not load_result_on_disk and memory_limit_gb is None:
             available_bytes = self._available_memory_bytes()
             reserve_bytes = int(float(memory_reserve_gb) * (1024 ** 3))
@@ -363,45 +378,34 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 extra={
                     "image_feature_map": self.image_feature_map,
                 },
+                dtype=self.image_cache_dtype.name,
             )
 
             self._video_decoder = self._make_video_decoder()
 
             def build_frame(frame_idx):
-                frame_data = {}
-                sample = None
-                for key in self.rgb_keys:
-                    feature_name = self.image_feature_map[key]
-                    if self._video_decoder is not None:
-                        try:
-                            value = self._video_decoder.decode(frame_idx, feature_name)
-                        except Exception as exc:
-                            self._disable_video_decoder(exc)
-                            value = None
-                    else:
-                        value = None
-                    if value is None:
-                        if sample is None:
-                            sample = self.lerobot_dataset[frame_idx]
-                        if feature_name not in sample:
-                            raise KeyError(
-                                f"Feature {feature_name!r} missing from LeRobot sample. "
-                                f"Available keys: {list(sample.keys())}"
-                            )
-                        value = sample[feature_name]
-                    frame_data[key] = _coerce_image(value, image_shapes[key])
-                return frame_data
+                return {
+                    key: values[0]
+                    for key, values in self._build_image_chunk([frame_idx], image_shapes).items()
+                }
+
+            def build_frame_batch(frame_indices):
+                return self._build_image_chunk(frame_indices, image_shapes)
 
             self.image_data, self.load_result_cache_path = open_or_build_image_result_cache(
                 load_result_add=load_result_add,
                 dataset_path=dataset_path,
                 metadata=metadata,
                 build_frame_fn=build_frame,
+                build_frame_batch_fn=build_frame_batch,
                 desc="Build LeRobot decoded image cache",
-                chunk_frames=32,
+                chunk_frames=self.image_cache_chunk_frames,
                 logger=log,
             )
             self.lerobot_dataset.close()
+            # Do not carry a CUDA decoder into forked DataLoader workers after
+            # the full cache has been materialized.
+            self._video_decoder = None
         elif preload_images:
             self._video_decoder = self._make_video_decoder()
             cache_key = (
@@ -412,6 +416,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                         key,
                         tuple(self.shape_meta["obs"][key]["shape"]),
                         self.image_feature_map[key],
+                        self.image_cache_dtype.name,
                     )
                     for key in self.rgb_keys
                 ),
@@ -430,36 +435,24 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                     rgb_keys=self.rgb_keys,
                     image_shapes=image_shapes,
                     extra={"image_feature_map": self.image_feature_map},
+                    dtype=self.image_cache_dtype.name,
                 )
 
                 def build_frame(frame_idx):
-                    frame_data = {}
-                    sample = None
-                    for key in self.rgb_keys:
-                        feature_name = self.image_feature_map[key]
-                        value = None
-                        if self._video_decoder is not None:
-                            try:
-                                value = self._video_decoder.decode(frame_idx, feature_name)
-                            except Exception as exc:
-                                self._disable_video_decoder(exc)
-                        if value is None:
-                            if sample is None:
-                                sample = self.lerobot_dataset[frame_idx]
-                            if feature_name not in sample:
-                                raise KeyError(
-                                    f"Feature {feature_name!r} missing from LeRobot sample. "
-                                    f"Available keys: {list(sample.keys())}"
-                                )
-                            value = sample[feature_name]
-                        frame_data[key] = _coerce_image(value, image_shapes[key])
-                    return frame_data
+                    return {
+                        key: values[0]
+                        for key, values in self._build_image_chunk([frame_idx], image_shapes).items()
+                    }
+
+                def build_frame_batch(frame_indices):
+                    return self._build_image_chunk(frame_indices, image_shapes)
 
                 self.image_data, store = build_in_memory_image_result_cache(
                     metadata=metadata,
                     build_frame_fn=build_frame,
+                    build_frame_batch_fn=build_frame_batch,
                     desc="Preload LeRobot images into RAM Zarr",
-                    chunk_frames=32,
+                    chunk_frames=self.image_cache_chunk_frames,
                     logger=log,
                 )
                 cache_entry = _RamPreloadCacheEntry(self.image_data, store=store)
@@ -472,6 +465,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 self.image_data = cache_entry.image_data
             self._ram_cache_entry = cache_entry
             self.lerobot_dataset.close()
+            self._video_decoder = None
 
         val_mask = get_val_mask(
             n_episodes=len(self.episode_ends),
@@ -572,7 +566,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         total = 0
         for key in self.rgb_keys:
             expected_shape = tuple(self.shape_meta["obs"][key]["shape"])
-            total += self.dataset_length * estimate_array_nbytes(expected_shape, np.float32)
+            total += self.dataset_length * estimate_array_nbytes(
+                expected_shape, self.image_cache_dtype
+            )
         return total
 
     @staticmethod
@@ -714,6 +710,46 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             )
         return _coerce_image(sample[feature_name], expected_shape)
 
+    def _build_image_chunk(
+        self,
+        frame_indices: Sequence[int],
+        image_shapes: Mapping[str, Sequence[int]],
+    ) -> Dict[str, np.ndarray]:
+        """Decode one contiguous cache chunk, batching each camera request."""
+        indices = [int(index) for index in frame_indices]
+        decoded = {}
+        for key in self.rgb_keys:
+            values = None
+            if self._video_decoder is not None:
+                try:
+                    values = self._video_decoder.decode_many(
+                        indices, self.image_feature_map[key]
+                    )
+                except Exception as exc:
+                    self._disable_video_decoder(exc)
+            decoded[key] = values
+
+        result = {key: [] for key in self.rgb_keys}
+        sample_cache: Dict[int, Dict] = {}
+        for local_idx, frame_idx in enumerate(indices):
+            for key in self.rgb_keys:
+                value = None if decoded[key] is None else decoded[key][local_idx]
+                feature_name = self.image_feature_map[key]
+                if value is None:
+                    if frame_idx not in sample_cache:
+                        sample_cache[frame_idx] = self.lerobot_dataset[frame_idx]
+                    sample = sample_cache[frame_idx]
+                    if feature_name not in sample:
+                        raise KeyError(
+                            f"Feature {feature_name!r} missing from LeRobot sample. "
+                            f"Available keys: {list(sample.keys())}"
+                        )
+                    value = sample[feature_name]
+                result[key].append(_coerce_image(value, image_shapes[key]))
+        return {
+            key: np.stack(values, axis=0) for key, values in result.items()
+        }
+
     def _augment_image_sequence(self, images: np.ndarray) -> np.ndarray:
         if self.image_randomer is None:
             return images
@@ -774,6 +810,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         for key in self.rgb_keys:
             if key in self.image_data:
                 images = read_image_result(self.image_data, key, obs_indices)
+                if self.image_cache_dtype == np.dtype(np.uint8):
+                    images = np.asarray(images, dtype=np.float32) / 255.0
             else:
                 expected_shape = tuple(self.shape_meta["obs"][key]["shape"])
                 feature_name = self.image_feature_map[key]

@@ -57,6 +57,8 @@ policy:
   p_drop_emb: 0.0
   p_drop_attn: 0.1
   causal_attn: false
+  # action.joint is seven joint coordinates, not xyz+xyzw.
+  normalize_pose_quaternions: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

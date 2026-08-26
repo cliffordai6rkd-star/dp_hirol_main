@@ -59,6 +59,10 @@ dataset:
   # automatically promotes this to one shared /dev/shm Zarr cache.
   preload_images: true
   load_result_add: ram
+  # Store decoded frames as uint8 (4x smaller than float32) and decode 64
+  # frames per camera call during cache construction.
+  image_cache_dtype: uint8
+  image_cache_chunk_frames: 64
 
   image_randomer_config:
     resize: false

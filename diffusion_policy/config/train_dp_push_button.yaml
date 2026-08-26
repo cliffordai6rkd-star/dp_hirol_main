@@ -57,6 +57,8 @@ policy:
   p_drop_emb: 0.0
   p_drop_attn: 0.1
   causal_attn: false
+  # action.joint is seven joint coordinates, not xyz+xyzw.
+  normalize_pose_quaternions: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -121,6 +123,8 @@ training:
   max_train_steps: null
   max_val_steps: 50
   tqdm_interval_sec: 1.0
+  # Avoid a CUDA->CPU synchronization and W&B write for every microbatch.
+  log_every_optimizer_steps: 50
 
 logging:
   project: nero_dp_baseline

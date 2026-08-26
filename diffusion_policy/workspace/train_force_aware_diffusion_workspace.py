@@ -280,6 +280,21 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if cfg.training.resume and latest_checkpoint.is_file():
             self.load_checkpoint(path=latest_checkpoint)
 
+        # The dataset may construct a CUDA TorchCodec decoder during
+        # instantiation.  Select the configured device first so single-GPU
+        # runs do not accidentally decode on cuda:0 while training on cuda:1.
+        configured_device = torch.device(str(cfg.training.device))
+        if (
+            configured_device.type == "cuda"
+            and torch.cuda.is_available()
+            and not distributed.enabled
+        ):
+            torch.cuda.set_device(
+                configured_device.index
+                if configured_device.index is not None
+                else torch.cuda.current_device()
+            )
+
         dataset: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset)
         if not isinstance(dataset, BaseImageDataset):
             raise TypeError("cfg.task.dataset must instantiate BaseImageDataset")
@@ -526,8 +541,26 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         lambda value: value.to(device, non_blocking=True),
                     )
                     with torch.no_grad(), self._autocast(cfg, device):
-                        prediction = policy.predict_action(batch["obs"])["model_action_pred"]
+                        sample_generator = torch.Generator(device=device)
+                        sample_generator.manual_seed(int(cfg.training.seed))
+                        prediction = policy.predict_action(
+                            batch["obs"],
+                            generator=sample_generator,
+                        )["model_action_pred"]
+                        # Keep this metric in the same normalized action space
+                        # as OfflineValidationRunner.val_action_mse.  The raw
+                        # value is retained separately for physical-unit plots.
+                        normalized_prediction = policy.normalizer["action"].normalize(
+                            prediction
+                        )
+                        normalized_target = policy.normalizer["action"].normalize(
+                            batch["action"]
+                        )
                         step_log["train_action_mse_error"] = torch.nn.functional.mse_loss(
+                            normalized_prediction,
+                            normalized_target,
+                        ).item()
+                        step_log["train_action_mse_error_raw"] = torch.nn.functional.mse_loss(
                             prediction,
                             batch["action"],
                         ).item()
@@ -600,7 +633,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         maximum = len(dataloader)
         if cfg.training.max_train_steps is not None:
             maximum = min(maximum, int(cfg.training.max_train_steps))
-        losses = []
+        log_interval = int(cfg.training.get("log_every_optimizer_steps", 50))
+        if log_interval < 1:
+            raise ValueError("training.log_every_optimizer_steps must be positive")
+        loss_sum = None
+        loss_count = 0
         last_log = {}
 
         with tqdm.tqdm(
@@ -657,10 +694,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             enabled=False,
                         )
                     grad_scaler.scale(scaled_loss).backward()
-                    loss_value = raw_loss.item()
-                    losses.append(loss_value)
-                    group_losses.append(loss_value)
-                    progress.set_postfix(loss=loss_value, refresh=False)
+                    # Keep loss tensors on device through the microbatch loop;
+                    # calling ``item`` here forces a CUDA synchronization.
+                    group_losses.append(raw_loss.detach())
                     self.global_step += 1
                     batch_idx += 1
 
@@ -681,18 +717,33 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     ema.step(self.model)
                     self.ema_model.set_optimizer_step(self.optimizer_step)
 
+                group_loss_tensor = torch.stack(group_losses).mean()
+                loss_sum = group_loss_tensor if loss_sum is None else loss_sum + group_loss_tensor
+                loss_count += 1
+                should_log = (
+                    self.optimizer_step % log_interval == 0
+                    or batch_idx >= maximum
+                    or (
+                        target_optimizer_steps is not None
+                        and self.optimizer_step >= target_optimizer_steps
+                    )
+                )
+                loss_value = None
+                if should_log:
+                    loss_value = float(group_loss_tensor.item())
+                    progress.set_postfix(loss=loss_value, refresh=False)
                 last_log = {
                     # The scalar reduction is deferred to the epoch summary;
                     # one all-reduce per optimizer step is unnecessary for
                     # training and was measurable with small per-rank batches.
-                    "train_loss": float(np.mean(group_losses)),
+                    "train_loss": loss_value,
                     "lr": lr_scheduler.get_last_lr()[0],
                     "epoch": self.epoch,
                     "global_step": self.global_step,
                     "optimizer_step": self.optimizer_step,
                     **self.model.last_curriculum_metrics,
                 }
-                if self.is_main_process:
+                if self.is_main_process and should_log:
                     wandb_run.log(last_log, step=self.global_step)
                     json_logger.log(last_log)
                 checkpoint_every_optimizer_steps = cfg.training.get(
@@ -709,16 +760,18 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         self.optimizer_step % checkpoint_interval == 0
                         and self.is_main_process
                     ):
+                        if last_log["train_loss"] is None:
+                            last_log["train_loss"] = float(group_loss_tensor.item())
                         self._save_optimizer_step_checkpoint(
                             cfg,
                             topk_manager=topk_manager,
                             metric_dict=last_log,
                         )
 
-        last_log["train_loss"] = self._distributed_mean(
-            float(np.mean(losses)),
-            device,
+        epoch_loss = (
+            float((loss_sum / loss_count).item()) if loss_sum is not None else float("nan")
         )
+        last_log["train_loss"] = self._distributed_mean(epoch_loss, device)
         return last_log
 
     def _save_checkpoints(self, cfg, step_log, topk_manager) -> None:

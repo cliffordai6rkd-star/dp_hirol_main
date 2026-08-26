@@ -13,7 +13,7 @@ from filelock import FileLock
 from tqdm import tqdm
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 RAM_RESULT_LOCATIONS = {None, "", "ram", "memory", "mem"}
 SHARED_RAM_RESULT_LOCATIONS = {"shared_ram", "ram_shared", "shm", "tmpfs"}
 _REGISTERED_CLEANUPS = set()
@@ -45,6 +45,7 @@ def build_cache_metadata(
     rgb_keys: Sequence[str],
     image_shapes: Mapping[str, Sequence[int]],
     extra: Optional[Mapping] = None,
+    dtype: str = "float32",
 ) -> Dict:
     metadata = {
         "cache_version": CACHE_VERSION,
@@ -56,7 +57,7 @@ def build_cache_metadata(
             key: [int(v) for v in image_shapes[key]]
             for key in rgb_keys
         },
-        "dtype": "float32",
+        "dtype": str(np.dtype(dtype)),
     }
     if extra:
         metadata["extra"] = _jsonable(extra)
@@ -72,6 +73,7 @@ def open_or_build_image_result_cache(
     desc: str,
     chunk_frames: int = 1,
     logger=None,
+    build_frame_batch_fn: Optional[Callable[[Sequence[int]], Mapping[str, object]]] = None,
 ) -> Tuple[Dict[str, zarr.Array], str]:
     cache_path = _resolve_cache_path(load_result_add, dataset_path, metadata)
     lock_path = cache_path + ".lock"
@@ -89,6 +91,7 @@ def open_or_build_image_result_cache(
                 cache_path=cache_path,
                 metadata=metadata,
                 build_frame_fn=build_frame_fn,
+                build_frame_batch_fn=build_frame_batch_fn,
                 desc=desc,
                 chunk_frames=chunk_frames,
             )
@@ -104,33 +107,34 @@ def build_in_memory_image_result_cache(
     desc: str,
     chunk_frames: int = 1,
     logger=None,
-) -> Tuple[Dict[str, zarr.Array], object]:
-    """Build a decoded image cache backed by RAM, exposed as Zarr arrays.
+    build_frame_batch_fn: Optional[Callable[[Sequence[int]], Mapping[str, object]]] = None,
+) -> Tuple[Dict[str, object], object]:
+    """Build a decoded cache backed by contiguous NumPy arrays in RAM.
 
-    ``MemoryStore`` is the in-memory equivalent of the directory store used
-    by :func:`open_or_build_image_result_cache`.  Returning the store along
-    with the arrays is intentional: the dataset retains it so the store stays
-    alive when the Zarr arrays are accessed by DataLoader workers.
+    Disk caches remain Zarr-backed, while RAM caches avoid the per-access Zarr
+    indexing layer and are directly shareable through forked DataLoader
+    workers.  The second return value is kept for API compatibility.
     """
-    try:
-        from zarr.storage import MemoryStore
-    except ImportError:  # pragma: no cover - compatibility with old zarr
-        MemoryStore = zarr.MemoryStore
-
-    store = MemoryStore()
-    root = zarr.open(store=store, mode="w")
-    root.attrs["metadata"] = dict(metadata)
-    arrays = _create_cache_arrays(root, metadata, chunk_frames)
+    dataset_length = int(metadata["dataset_length"])
+    cache_dtype = np.dtype(metadata.get("dtype", "float32"))
+    arrays = {
+        key: np.empty(
+            (dataset_length,) + tuple(metadata["image_shapes"][key]),
+            dtype=cache_dtype,
+        )
+        for key in metadata["rgb_keys"]
+    }
     _fill_cache_arrays(
         arrays=arrays,
         metadata=metadata,
         build_frame_fn=build_frame_fn,
+        build_frame_batch_fn=build_frame_batch_fn,
         desc=desc,
         chunk_frames=chunk_frames,
     )
     if logger is not None:
-        logger.info("Built in-memory Zarr image cache for %d frames.", int(metadata["dataset_length"]))
-    return {key: root[key] for key in metadata["rgb_keys"]}, store
+        logger.info("Built in-memory NumPy image cache for %d frames.", dataset_length)
+    return arrays, None
 
 
 def read_image_result(image_data: Mapping[str, object], key: str, indices) -> np.ndarray:
@@ -148,6 +152,7 @@ def _build_cache(
     cache_path: str,
     metadata: Mapping,
     build_frame_fn: Callable[[int], Mapping[str, np.ndarray]],
+    build_frame_batch_fn: Optional[Callable[[Sequence[int]], Mapping[str, object]]] = None,
     desc: str,
     chunk_frames: int,
 ) -> None:
@@ -163,6 +168,7 @@ def _build_cache(
             arrays=arrays,
             metadata=metadata,
             build_frame_fn=build_frame_fn,
+            build_frame_batch_fn=build_frame_batch_fn,
             desc=desc,
             chunk_frames=chunk_frames,
         )
@@ -187,7 +193,7 @@ def _create_cache_arrays(root, metadata: Mapping, chunk_frames: int):
             key,
             shape=shape,
             chunks=chunks,
-            dtype=np.float32,
+            dtype=np.dtype(metadata.get("dtype", "float32")),
             compressor=None,
             overwrite=True,
         )
@@ -199,23 +205,33 @@ def _fill_cache_arrays(
     arrays: Mapping[str, object],
     metadata: Mapping,
     build_frame_fn: Callable[[int], Mapping[str, np.ndarray]],
+    build_frame_batch_fn: Optional[Callable[[Sequence[int]], Mapping[str, object]]] = None,
     desc: str,
     chunk_frames: int,
 ) -> None:
     dataset_length = int(metadata["dataset_length"])
     chunk_frames = min(max(1, int(chunk_frames)), max(1, dataset_length))
+    cache_dtype = np.dtype(metadata.get("dtype", "float32"))
     buffers = {
         key: np.empty(
             (chunk_frames,) + tuple(metadata["image_shapes"][key]),
-            dtype=np.float32,
+            dtype=cache_dtype,
         )
         for key in metadata["rgb_keys"]
     }
     for chunk_start in tqdm(range(0, dataset_length, chunk_frames), desc=desc):
         chunk_end = min(chunk_start + chunk_frames, dataset_length)
-        for frame_idx in range(chunk_start, chunk_end):
-            frame_data = build_frame_fn(frame_idx)
-            local_idx = frame_idx - chunk_start
+        frame_indices = list(range(chunk_start, chunk_end))
+        if build_frame_batch_fn is not None:
+            batch_data = build_frame_batch_fn(frame_indices)
+        else:
+            batch_data = None
+        for local_idx, frame_idx in enumerate(frame_indices):
+            frame_data = (
+                {key: values[local_idx] for key, values in batch_data.items()}
+                if batch_data is not None
+                else build_frame_fn(frame_idx)
+            )
             for key, buffer in buffers.items():
                 image = np.asarray(frame_data[key])
                 expected_shape = tuple(metadata["image_shapes"][key])
@@ -224,7 +240,12 @@ def _fill_cache_arrays(
                         f"Decoded image {key!r} at frame {frame_idx} has shape {image.shape}, "
                         f"expected {expected_shape}."
                     )
-                buffer[local_idx] = image
+                if cache_dtype == np.dtype(np.uint8):
+                    if np.issubdtype(image.dtype, np.floating):
+                        image = np.rint(np.clip(image, 0.0, 1.0) * 255.0)
+                    buffer[local_idx] = np.asarray(image, dtype=np.uint8)
+                else:
+                    buffer[local_idx] = np.asarray(image, dtype=cache_dtype)
         for key, array in arrays.items():
             array[chunk_start:chunk_end] = buffers[key][:(chunk_end - chunk_start)]
 
@@ -307,7 +328,7 @@ def _is_valid_cache(cache_path: str, metadata: Mapping) -> bool:
             expected_shape = (dataset_length,) + tuple(metadata["image_shapes"][key])
             if tuple(root[key].shape) != expected_shape:
                 return False
-            if np.dtype(root[key].dtype) != np.dtype(np.float32):
+            if np.dtype(root[key].dtype) != np.dtype(metadata.get("dtype", "float32")):
                 return False
         return True
     except Exception:

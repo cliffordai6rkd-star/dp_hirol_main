@@ -42,6 +42,7 @@ class DiffusionTransformerImagePolicy(BaseImagePolicy):
         p_drop_emb: float = 0.0,
         p_drop_attn: float = 0.1,
         causal_attn: bool = False,
+        normalize_pose_quaternions: bool = True,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -81,6 +82,9 @@ class DiffusionTransformerImagePolicy(BaseImagePolicy):
         self.n_action_steps = int(n_action_steps)
         self.action_start_index = action_start_index
         self.action_dim = action_dim
+        # A seven-dimensional action is not necessarily xyz+xyzw.  Joint
+        # position actions must bypass quaternion projection at inference.
+        self.normalize_pose_quaternions = bool(normalize_pose_quaternions)
         self.obs_feature_dim = obs_feature_dim
         self.image_keys = tuple(getattr(obs_encoder, "rgb_keys", ()))
         if not self.image_keys:
@@ -164,7 +168,8 @@ class DiffusionTransformerImagePolicy(BaseImagePolicy):
                 generator=generator,
             )
         )
-        action_prediction = _normalize_pose_quaternions(action_prediction)
+        if self.normalize_pose_quaternions:
+            action_prediction = _normalize_pose_quaternions(action_prediction)
         start = self.action_start_index
         action = action_prediction[:, start : start + self.n_action_steps]
         return {
