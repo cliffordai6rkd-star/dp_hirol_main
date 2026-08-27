@@ -65,7 +65,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 256
+  batch_size: 512
   num_workers: 4
   shuffle: true
   pin_memory: true
@@ -87,7 +87,7 @@ optimizer:
   betas: [0.9, 0.95]
 
 training:
-  device: cuda:0
+  device: cuda:1
   seed: 42
   debug: false
   resume: true
