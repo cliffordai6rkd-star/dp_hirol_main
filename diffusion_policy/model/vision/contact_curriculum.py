@@ -14,6 +14,7 @@ class ContactDetector(nn.Module):
         threshold: float,
         force_dims: Sequence[int] = (0, 1, 2),
         history_reducer: str = "max",
+        norm: str = "l1",
     ) -> None:
         super().__init__()
         if threshold < 0:
@@ -25,9 +26,24 @@ class ContactDetector(nn.Module):
                 f"Unsupported history_reducer={history_reducer!r}; "
                 "expected 'last', 'max', or 'mean'."
             )
+        if norm not in {"l1", "l2", "sum"}:
+            raise ValueError("norm must be one of 'l1', 'l2', or 'sum'")
         self.threshold = float(threshold)
         self.force_dims = tuple(int(dim) for dim in force_dims)
         self.history_reducer = history_reducer
+        self.norm = "l1" if norm == "sum" else norm
+
+    def _magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        if raw_wrench.ndim < 1:
+            raise ValueError("raw_wrench must have at least one dimension")
+        if max(self.force_dims) >= raw_wrench.shape[-1]:
+            raise ValueError(
+                f"force_dims={self.force_dims} exceed wrench dim {raw_wrench.shape[-1]}"
+            )
+        force = raw_wrench[..., list(self.force_dims)]
+        if self.norm == "l1":
+            return force.abs().sum(dim=-1)
+        return torch.linalg.vector_norm(force, ord=2, dim=-1)
 
     def forward(self, raw_wrench: torch.Tensor) -> torch.Tensor:
         if raw_wrench.ndim != 4:
@@ -40,8 +56,7 @@ class ContactDetector(nn.Module):
                 f"force_dims={self.force_dims} exceed wrench dim {raw_wrench.shape[-1]}"
             )
 
-        force = raw_wrench[..., list(self.force_dims)]
-        magnitude = torch.linalg.vector_norm(force, dim=-1)
+        magnitude = self._magnitude(raw_wrench)
         if self.history_reducer == "last":
             reduced = magnitude[..., -1]
         elif self.history_reducer == "max":
@@ -49,6 +64,136 @@ class ContactDetector(nn.Module):
         else:
             reduced = magnitude.mean(dim=-1)
         return reduced > self.threshold
+
+    def token_contact(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        """Return a contact mask for every wrench token.
+
+        This is used for a future window where each token needs its own phase
+        state instead of reducing the complete history to one boolean.
+        """
+        return self._magnitude(raw_wrench) > self.threshold
+
+
+class HysteresisContactDetector(nn.Module):
+    """Causal two-threshold contact state detector.
+
+    The detector enters contact above ``contact_threshold`` and leaves it only
+    below ``free_threshold``.  Values at either boundary and in between retain
+    the previous state.  Input is ``[B, To, K, D]`` and the returned state is
+    ``[B, To]`` so the latch is preserved across the observation sequence.
+    """
+
+    def __init__(
+        self,
+        free_threshold: float,
+        contact_threshold: float,
+        force_dims: Sequence[int] = (0, 1, 2),
+        history_reducer: str = "max",
+        norm: str = "l1",
+    ) -> None:
+        super().__init__()
+        if free_threshold < 0 or contact_threshold < 0:
+            raise ValueError("contact thresholds must be non-negative")
+        if free_threshold >= contact_threshold:
+            raise ValueError("free_threshold must be smaller than contact_threshold")
+        if not force_dims:
+            raise ValueError("force_dims cannot be empty")
+        if history_reducer not in {"last", "max", "mean"}:
+            raise ValueError(
+                f"Unsupported history_reducer={history_reducer!r}; "
+                "expected 'last', 'max', or 'mean'."
+            )
+        if norm not in {"l1", "l2", "sum"}:
+            raise ValueError("norm must be one of 'l1', 'l2', or 'sum'")
+        self.register_buffer("free_threshold", torch.tensor(float(free_threshold)))
+        self.register_buffer("contact_threshold", torch.tensor(float(contact_threshold)))
+        self.force_dims = tuple(int(dim) for dim in force_dims)
+        self.history_reducer = history_reducer
+        self.norm = "l1" if norm == "sum" else norm
+
+    def _reduced_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        if raw_wrench.ndim != 4:
+            raise ValueError(
+                "raw_wrench must have shape [B, To, K, D], "
+                f"got {tuple(raw_wrench.shape)}"
+            )
+        if max(self.force_dims) >= raw_wrench.shape[-1]:
+            raise ValueError(
+                f"force_dims={self.force_dims} exceed wrench dim {raw_wrench.shape[-1]}"
+            )
+        if self.norm == "l1":
+            force = raw_wrench[..., list(self.force_dims)]
+            magnitude = force.abs().sum(dim=-1)
+        else:
+            force = raw_wrench[..., list(self.force_dims)]
+            magnitude = torch.linalg.vector_norm(force, ord=2, dim=-1)
+        if self.history_reducer == "last":
+            return magnitude[..., -1]
+        if self.history_reducer == "max":
+            return magnitude.amax(dim=-1)
+        return magnitude.mean(dim=-1)
+
+    def forward(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        magnitude = self._reduced_magnitude(raw_wrench)
+        batch_size, obs_steps = magnitude.shape
+        result = torch.zeros_like(magnitude, dtype=torch.bool)
+        contact_threshold = self.contact_threshold.to(magnitude)
+        free_threshold = self.free_threshold.to(magnitude)
+        if obs_steps == 0:
+            return result
+        result[:, 0] = magnitude[:, 0] > contact_threshold
+        for index in range(1, obs_steps):
+            result[:, index] = torch.where(
+                result[:, index - 1],
+                magnitude[:, index] >= free_threshold,
+                magnitude[:, index] > contact_threshold,
+            )
+        return result
+
+    def rollout_future(
+        self,
+        raw_wrench: torch.Tensor,
+        initial_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scan a future window using the current latched state.
+
+        ``raw_wrench`` has shape ``[B, To, K, D]`` and ``initial_state`` has
+        shape ``[B, To]``.  The returned mask has shape ``[B, To, K]``.
+        Strict ``> contact_threshold`` enters contact and strict
+        ``< free_threshold`` exits contact; boundary values retain state.
+        """
+        magnitude = self._per_token_magnitude(raw_wrench)
+        if initial_state.shape != magnitude.shape[:2]:
+            raise ValueError(
+                "initial_state must have shape [B, To] matching the future wrench"
+            )
+        contact_threshold = self.contact_threshold.to(magnitude)
+        free_threshold = self.free_threshold.to(magnitude)
+        result = torch.zeros_like(magnitude, dtype=torch.bool)
+        state = initial_state.to(device=magnitude.device, dtype=torch.bool)
+        for index in range(magnitude.shape[-1]):
+            state = torch.where(
+                state,
+                magnitude[..., index] >= free_threshold,
+                magnitude[..., index] > contact_threshold,
+            )
+            result[..., index] = state
+        return result
+
+    def _per_token_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        if raw_wrench.ndim != 4:
+            raise ValueError(
+                "raw_wrench must have shape [B, To, K, D], "
+                f"got {tuple(raw_wrench.shape)}"
+            )
+        if max(self.force_dims) >= raw_wrench.shape[-1]:
+            raise ValueError(
+                f"force_dims={self.force_dims} exceed wrench dim {raw_wrench.shape[-1]}"
+            )
+        force = raw_wrench[..., list(self.force_dims)]
+        if self.norm == "l1":
+            return force.abs().sum(dim=-1)
+        return torch.linalg.vector_norm(force, ord=2, dim=-1)
 
 
 class VectorThresholdGate(nn.Module):

@@ -1,0 +1,177 @@
+defaults:
+  - _self_
+  - task@task: insert_usb_force_aware
+
+name: train_dp_insert_usb_force_aware
+_target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
+
+# Inside Compose this is /workspace/data/...; the relative default keeps the
+# same config usable from the repository root outside Docker.
+dataset_path: ${oc.env:DP_DATASET_PATH,data/insert_usb_50hz_lerobot_v3}
+dino_model_path: ${oc.env:DINOV3_MODEL_PATH,facebook/dinov3-vits16-pretrain-lvd1689m}
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: ${name}
+
+horizon: 9
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+
+# Contact hysteresis is exposed at the train-config level so it can be
+# overridden directly, e.g. `free_threshold=0.4 contact_threshold=1.2`.
+free_threshold: ${task.free_threshold}
+contact_threshold: ${task.contact_threshold}
+contact_norm: ${task.contact_norm}
+freeze_dino_backbone: true
+freeze_modules: []
+
+policy:
+  _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
+  shape_meta: ${shape_meta}
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  wrench_key: ${task.wrench_key}
+  phase_wrench_key: ${task.phase_wrench_key}
+  future_phase_wrench_key: ${task.future_phase_wrench_key}
+  wrench_history_steps: ${task.future_wrench_steps}
+  relative_pose_actions: ${task.relative_pose_actions}
+  action_reference_key: ${task.action_reference_key}
+  num_inference_steps: 8
+
+  dino_model_name_or_path: ${dino_model_path}
+  dino_local_files_only: true
+  freeze_dino_backbone: ${freeze_dino_backbone}
+  # Freeze selectors are persisted in each checkpoint.  Use [cross_attn] for
+  # the later DINOv3 + cross-attention frozen stage.
+  freeze_modules: ${freeze_modules}
+  force_temporal_encoder: gru
+  force_encoder_layers: 1
+
+  n_emb: 256
+  n_head: 4
+  n_layer: 8
+  n_cond_layers: 1
+  p_drop_emb: 0.0
+  p_drop_attn: 0.1
+  causal_attn: false
+
+  free_threshold: ${free_threshold}
+  contact_threshold: ${contact_threshold}
+  contact_force_dims: ${task.contact_force_dims}
+  contact_history_reducer: ${task.contact_history_reducer}
+  contact_norm: ${contact_norm}
+  input_gate_enabled: false
+  image_mask_scope: full_context
+  mask_schedule:
+    schedule_type: cosine
+    start_step: 0
+    end_step: 30000
+    start_probability: 1.0
+    end_probability: 0.0
+    exponential_rate: 5.0
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 128
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+optimizer:
+  learning_rate: 1.0e-4
+  action_expert_weight_decay: 1.0e-3
+  fusion_weight_decay: 1.0e-6
+  betas: [0.9, 0.95]
+
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: false
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  distributed:
+    # torchrun creates one rank per visible GPU.  Plain `python train.py`
+    # still falls back to one process when WORLD_SIZE=1.
+    enabled: true
+    backend: nccl
+    batch_size_is_global: true
+    find_unused_parameters: false
+    run_rank0_eval: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: null
+  num_optimizer_steps: 60000
+  gradient_accumulate_every: 1
+  max_grad_norm: 1.0
+  use_ema: true
+  rollout_every: 100
+  checkpoint_every: 5000
+  checkpoint_every_optimizer_steps: 5000
+  val_every: 5
+  sample_every: 10
+  max_train_steps: null
+  max_val_steps: 50
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: nero_force_aware_diffusion
+  resume: false
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+  tags: [force-aware, future-wrench, tau-ext-hysteresis, dinov3]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 3
+    format_str: optimizer_step={optimizer_step:08d}-train_loss={train_loss:.6f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

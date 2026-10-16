@@ -135,6 +135,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         window_sampling_strategy: str = "idx",
         image_feature_map: Optional[Mapping[str, str]] = None,
         lowdim_feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
+        windowed_lowdim_feature_groups: Optional[Mapping[str, Mapping]] = None,
         action_feature_fields: Optional[Sequence[str]] = None,
         action_layout: str = "per_step",
         relative_pose_actions: bool = False,
@@ -248,8 +249,19 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             key: list(values)
             for key, values in (lowdim_feature_groups or {}).items()
         }
+        self.windowed_lowdim_feature_groups = {
+            str(key): dict(value)
+            for key, value in (windowed_lowdim_feature_groups or {}).items()
+        }
+        unknown_windowed = set(self.windowed_lowdim_feature_groups) - set(self.lowdim_keys)
+        if unknown_windowed:
+            raise ValueError(
+                "windowed_lowdim_feature_groups contains keys that are not low_dim "
+                f"observations: {sorted(unknown_windowed)}"
+            )
         for key in self.lowdim_keys:
-            self.lowdim_feature_groups.setdefault(key, [f"observation.{key}"])
+            if key not in self.windowed_lowdim_feature_groups:
+                self.lowdim_feature_groups.setdefault(key, [f"observation.{key}"])
 
         self.action_feature_fields = list(action_feature_fields or ["action"])
 
@@ -269,19 +281,71 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             self.episode_ranges,
             explicit_step_sec=timestamp_step_sec,
         )
+        self._window_anchor_timestamps = {}
+        for config in self.windowed_lowdim_feature_groups.values():
+            anchor_key = config.get("anchor_timestamp_key")
+            if anchor_key and anchor_key not in self._window_anchor_timestamps:
+                anchor = self._load_column(anchor_key, dtype=np.float64).reshape(-1)
+                if anchor.shape[0] != self.dataset_length:
+                    raise ValueError(
+                        f"anchor timestamp column {anchor_key!r} has {anchor.shape[0]} rows, "
+                        f"expected {self.dataset_length}"
+                    )
+                self._window_anchor_timestamps[anchor_key] = self._timestamp_seconds(anchor)
 
-        self.lowdim_data = {
-            key: self._concat_columns(self.lowdim_feature_groups[key], dtype=np.float32)
-            for key in self.lowdim_keys
-        }
+        self.lowdim_data = {}
+        self.windowed_lowdim_data = {}
+        for key in self.lowdim_keys:
+            if key in self.windowed_lowdim_feature_groups:
+                config = self.windowed_lowdim_feature_groups[key]
+                source_keys = config.get("source_keys", config.get("source_key"))
+                if source_keys is None:
+                    raise ValueError(
+                        f"windowed lowdim feature {key!r} requires source_key(s)"
+                    )
+                if isinstance(source_keys, str):
+                    source_keys = [source_keys]
+                source = self._concat_columns(source_keys, dtype=np.float32)
+                steps = int(config.get("steps", tuple(obs_shape_meta[key]["shape"])[0]))
+                stride = int(config.get("stride", 1))
+                start_offset = int(config.get("start_offset", -(steps - 1) * stride))
+                if steps < 1 or stride < 1:
+                    raise ValueError(
+                        f"windowed lowdim feature {key!r} requires positive steps/stride"
+                    )
+                if start_offset + (steps - 1) * stride < 0 and config.get("pad_mode", "edge") not in {"edge", "clip"}:
+                    raise ValueError(
+                        f"windowed lowdim feature {key!r} uses negative offsets and must use pad_mode='edge'"
+                    )
+                self.windowed_lowdim_feature_groups[key] = {
+                    **config,
+                    "source_keys": list(source_keys),
+                    "steps": steps,
+                    "stride": stride,
+                    "start_offset": start_offset,
+                    "pad_mode": config.get("pad_mode", "edge"),
+                }
+                self.windowed_lowdim_data[key] = self._build_windowed_lowdim(
+                    source,
+                    self.windowed_lowdim_feature_groups[key],
+                )
+            else:
+                self.lowdim_data[key] = self._concat_columns(
+                    self.lowdim_feature_groups[key], dtype=np.float32
+                )
         self.action_data = self._concat_columns(self.action_feature_fields, dtype=np.float32)
 
         for key in self.lowdim_keys:
             expected = tuple(obs_shape_meta[key]["shape"])
-            if self.lowdim_data[key].shape[1:] != expected:
+            actual = (
+                self.windowed_lowdim_data[key].shape[1:]
+                if key in self.windowed_lowdim_data
+                else self.lowdim_data[key].shape[1:]
+            )
+            if actual != expected:
                 raise ValueError(
-                    f"Lowdim feature {key!r} has shape {self.lowdim_data[key].shape[1:]}, "
-                    f"expected {expected}. Source fields: {self.lowdim_feature_groups[key]}"
+                    f"Lowdim feature {key!r} has shape {actual}, expected {expected}. "
+                    f"Source fields: {self.windowed_lowdim_feature_groups.get(key, self.lowdim_feature_groups.get(key))}"
                 )
 
         expected_action_shape = tuple(shape_meta["action"]["shape"])
@@ -484,6 +548,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             pad_after=self.sampler_pad_after,
             episode_mask=self.train_mask,
         )
+        self.indices = self._filter_indices_for_windowed_features(self.indices)
 
     def _get_hf_dataset(self):
         return None
@@ -515,6 +580,85 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         if len(arrays) == 1:
             return arrays[0].astype(dtype, copy=False)
         return np.concatenate(arrays, axis=-1).astype(dtype, copy=False)
+
+    def _build_windowed_lowdim(self, source: np.ndarray, config: Mapping) -> np.ndarray:
+        """Materialize a fixed-rate low-dimensional window for every row.
+
+        ``start_offset`` and ``stride`` are expressed in source rows.  Edge
+        clipping is used at episode boundaries so history windows can be
+        left-padded; future windows are filtered out of the sampler below.
+        """
+        steps = int(config["steps"])
+        stride = int(config["stride"])
+        start_offset = int(config["start_offset"])
+        result = np.empty((self.dataset_length, steps, source.shape[-1]), dtype=np.float32)
+        offsets = start_offset + stride * np.arange(steps, dtype=np.int64)
+        offsets_sec = config.get("offsets_sec")
+        anchor_key = config.get("anchor_timestamp_key")
+        source_timestamps = self._timestamp_seconds(self.timestamps)
+        anchor_timestamps = (
+            self._window_anchor_timestamps[anchor_key]
+            if anchor_key
+            else None
+        )
+        if offsets_sec is not None:
+            offsets_sec = np.asarray(offsets_sec, dtype=np.float64).reshape(-1)
+            if offsets_sec.shape[0] != steps:
+                raise ValueError(
+                    f"windowed lowdim offsets_sec has {offsets_sec.shape[0]} values, "
+                    f"expected {steps}"
+                )
+            if anchor_timestamps is None:
+                raise ValueError("offsets_sec requires anchor_timestamp_key")
+        for episode_range in self.episode_ranges:
+            start = int(episode_range.start)
+            end = int(episode_range.stop) - 1
+            if offsets_sec is not None:
+                targets = anchor_timestamps[start : end + 1, None] + offsets_sec[None, :]
+                local_source_times = source_timestamps[start : end + 1]
+                local_indices = _nearest_indices(local_source_times, targets)
+                indices = local_indices + start
+            else:
+                anchors = np.arange(start, end + 1, dtype=np.int64)[:, None]
+                indices = np.clip(anchors + offsets[None, :], start, end)
+            result[start : end + 1] = source[indices]
+        return result
+
+    @staticmethod
+    def _timestamp_seconds(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if finite.size and np.nanmedian(np.abs(finite)) > 1.0e12:
+            return values * 1.0e-9
+        return values
+
+    def _anchor_index_from_sampler_row(self, row: Sequence[int]) -> int:
+        buffer_start, buffer_end, sample_start, sample_end = map(int, row)
+        position = int(self.anchor_position)
+        if position < sample_start:
+            return buffer_start
+        if position >= sample_end:
+            return max(buffer_start, buffer_end - 1)
+        return buffer_start + position - sample_start
+
+    def _filter_indices_for_windowed_features(self, indices: np.ndarray) -> np.ndarray:
+        positive_margins = []
+        for config in self.windowed_lowdim_feature_groups.values():
+            last_offset = int(config["start_offset"]) + (
+                int(config["steps"]) - 1
+            ) * int(config["stride"])
+            if last_offset > 0:
+                positive_margins.append(last_offset)
+        if not positive_margins or len(indices) == 0:
+            return indices
+        margin = max(positive_margins)
+        keep = []
+        for row in indices:
+            anchor = self._anchor_index_from_sampler_row(row)
+            episode = int(self.episode_index[anchor])
+            episode_end = int(self.episode_ends[episode])
+            keep.append(anchor + margin < episode_end)
+        return indices[np.asarray(keep, dtype=bool)]
 
     def _validate_action_shape(self, expected_action_shape: Sequence[int]) -> None:
         expected_action_shape = tuple(expected_action_shape)
@@ -778,6 +922,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             pad_after=self.sampler_pad_after,
             episode_mask=self.val_mask,
         )
+        val_set.indices = val_set._filter_indices_for_windowed_features(val_set.indices)
         val_set.image_randomer = None
         val_set.image_randomer_config = None
         return val_set
@@ -787,7 +932,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         normalizer = LinearNormalizer()
         normalizer["action"] = SingleFieldLinearNormalizer.create_fit(self.action_data,**kwargs)
         for key in self.lowdim_keys:
-            normalizer[key] = SingleFieldLinearNormalizer.create_fit(self.lowdim_data[key],**kwargs)
+            values = self.windowed_lowdim_data.get(key, self.lowdim_data.get(key))
+            normalizer[key] = SingleFieldLinearNormalizer.create_fit(values,**kwargs)
         for key in self.rgb_keys:
             normalizer[key] = get_image_range_normalizer() 
         return normalizer
@@ -832,7 +978,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
 
 
         for key in self.lowdim_keys:
-            obs_dict[key] = self.lowdim_data[key][obs_indices, ...].astype(np.float32, copy=False)
+            values = self.windowed_lowdim_data.get(key, self.lowdim_data.get(key))
+            obs_dict[key] = values[obs_indices, ...].astype(np.float32, copy=False)
 
         action = self._sample_action(sequence_indices)
         if self.relative_pose_actions:

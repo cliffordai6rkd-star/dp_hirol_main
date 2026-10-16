@@ -16,6 +16,7 @@ from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
 from diffusion_policy.model.vision.contact_curriculum import (
     ContactAwareImageMasker,
     ContactDetector,
+    HysteresisContactDetector,
     MaskProbabilityScheduler,
     VectorThresholdGate,
 )
@@ -28,6 +29,49 @@ def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch
         return action
     normalized = normalize_quaternion_xyzw(action[..., 3:7], eps=eps)
     return torch.cat([action[..., :3], normalized], dim=-1)
+
+
+def fill_future_wrench_prefix(
+    raw_wrench: torch.Tensor,
+    future_contact: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fill the free prefix with the first future contact wrench.
+
+    ``raw_wrench`` is ``[B, To, K, D]`` and ``future_contact`` is
+    ``[B, To, K]``.  A window with no future contact is zeroed.  Otherwise,
+    the first contact wrench is copied into every preceding token and the
+    original wrench values are kept from the first contact token onward.
+    The second return value marks windows that contain at least one contact.
+    """
+    if raw_wrench.ndim != 4 or future_contact.ndim != 3:
+        raise ValueError(
+            "raw_wrench must be [B, To, K, D] and future_contact must be [B, To, K]"
+        )
+    if raw_wrench.shape[:3] != future_contact.shape:
+        raise ValueError(
+            "raw_wrench and future_contact must share their [B, To, K] dimensions"
+        )
+    has_contact = future_contact.any(dim=-1)
+    first_index = future_contact.to(torch.int64).argmax(dim=-1)
+    gather_index = first_index[..., None, None].expand(
+        -1, -1, 1, raw_wrench.shape[-1]
+    )
+    first_contact_wrench = raw_wrench.gather(2, gather_index).squeeze(2)
+    token_index = torch.arange(
+        raw_wrench.shape[2], device=raw_wrench.device
+    ).view(1, 1, -1)
+    prefix = token_index < first_index[..., None]
+    filled = torch.where(
+        prefix[..., None],
+        first_contact_wrench[:, :, None, :],
+        raw_wrench,
+    )
+    filled = torch.where(
+        has_contact[:, :, None, None],
+        filled,
+        torch.zeros_like(filled),
+    )
+    return filled, has_contact
 
 
 class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
@@ -44,12 +88,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         image_key: Optional[str] = None,
         image_keys: Optional[Sequence[str]] = None,
         wrench_key: str = "wrench_ext",
+        phase_wrench_key: Optional[str] = None,
+        future_phase_wrench_key: Optional[str] = None,
         relative_pose_actions: bool = False,
         action_reference_key: str = "action_reference",
         num_inference_steps: Optional[int] = None,
         dino_model_name_or_path: str = "facebook/dinov3-vits16-pretrain-lvd1689m",
         dino_local_files_only: bool = True,
         freeze_dino_backbone: bool = True,
+        freeze_modules: Optional[Sequence[str]] = None,
         wrench_history_steps: int = 8,
         n_emb: int = 256,
         n_head: int = 4,
@@ -61,8 +108,10 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         p_drop_attn: float = 0.1,
         causal_attn: bool = False,
         contact_threshold: float = 5.0,
+        free_threshold: Optional[float] = None,
         contact_force_dims: Sequence[int] = (0, 1, 2),
         contact_history_reducer: str = "max",
+        contact_norm: str = "l1",
         input_gate_threshold: Optional[float] = None,
         input_gate_norm: str = "l1",
         input_gate_enabled: bool = False,
@@ -106,14 +155,22 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                     f"rgb observation {key!r} must have shape [3, H, W], "
                     f"got {image_shape}"
                 )
-        if wrench_key not in obs_shape_meta:
-            raise ValueError(f"wrench observation {wrench_key!r} is missing from shape_meta")
+        if phase_wrench_key is None:
+            phase_wrench_key = wrench_key
+        for lowdim_key in (wrench_key, phase_wrench_key, future_phase_wrench_key):
+            if lowdim_key is None:
+                continue
+            if lowdim_key not in obs_shape_meta:
+                raise ValueError(
+                    f"wrench observation {lowdim_key!r} is missing from shape_meta"
+                )
+            if obs_shape_meta[lowdim_key].get("type", "low_dim") != "low_dim":
+                raise ValueError(f"{lowdim_key!r} must be a low_dim observation")
         wrench_meta = obs_shape_meta[wrench_key]
-        if wrench_meta.get("type", "low_dim") != "low_dim":
-            raise ValueError(f"{wrench_key!r} must be a low_dim observation")
-        unsupported_obs_keys = set(obs_shape_meta) - set(configured_image_keys) - {
-            wrench_key
-        }
+        supported_lowdim_keys = {wrench_key, phase_wrench_key}
+        if future_phase_wrench_key is not None:
+            supported_lowdim_keys.add(future_phase_wrench_key)
+        unsupported_obs_keys = set(obs_shape_meta) - set(configured_image_keys) - supported_lowdim_keys
         if unsupported_obs_keys:
             raise ValueError(
                 "Force-aware DP only supports rgb cameras plus the configured wrench; "
@@ -130,6 +187,19 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 "the tau_ext input gate requires a seven-axis input; "
                 f"got {wrench_key!r} shape {wrench_shape}"
             )
+        phase_wrench_shape = tuple(obs_shape_meta[phase_wrench_key]["shape"])
+        if len(phase_wrench_shape) != 2:
+            raise ValueError(
+                f"{phase_wrench_key!r} must have shape [history_steps, D], "
+                f"got {phase_wrench_shape}"
+            )
+        if future_phase_wrench_key is not None:
+            future_phase_shape = tuple(obs_shape_meta[future_phase_wrench_key]["shape"])
+            if len(future_phase_shape) != 2 or future_phase_shape[0] != wrench_history_steps:
+                raise ValueError(
+                    f"{future_phase_wrench_key!r} must have shape "
+                    f"({wrench_history_steps}, D), got {future_phase_shape}"
+                )
         action_shape = tuple(shape_meta["action"]["shape"])
         if len(action_shape) != 1:
             raise ValueError("action shape must be one-dimensional per timestep")
@@ -197,9 +267,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.model = action_expert
         self.noise_scheduler = noise_scheduler
         self.contact_detector = ContactDetector(
-            threshold=contact_threshold,
+            threshold=contact_threshold, force_dims=contact_force_dims,
+            history_reducer=contact_history_reducer,
+            norm=contact_norm,
+        ) if free_threshold is None else HysteresisContactDetector(
+            free_threshold=float(free_threshold),
+            contact_threshold=float(contact_threshold),
             force_dims=contact_force_dims,
             history_reducer=contact_history_reducer,
+            norm=contact_norm,
         )
         if input_gate_threshold is None:
             input_gate_threshold = 0.0
@@ -220,11 +296,16 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.image_keys = configured_image_keys
         self.image_key = configured_image_keys[0] if len(configured_image_keys) == 1 else None
         self.wrench_key = wrench_key
+        self.phase_wrench_key = phase_wrench_key
+        self.future_phase_wrench_key = future_phase_wrench_key
+        self.free_threshold = None if free_threshold is None else float(free_threshold)
         self.relative_pose_actions = bool(relative_pose_actions)
         self.action_reference_key = str(action_reference_key)
         self.scheduler_step_kwargs = scheduler_step_kwargs
         self.optimizer_step = 0
         self.last_curriculum_metrics: Dict[str, float] = {}
+        self.freeze_modules = tuple(str(name) for name in (freeze_modules or ()))
+        self.set_freeze_modules(self.freeze_modules)
         self.num_inference_steps = (
             int(num_inference_steps)
             if num_inference_steps is not None
@@ -237,22 +318,126 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
     def set_optimizer_step(self, optimizer_step: int) -> None:
         self.optimizer_step = int(optimizer_step)
 
+    _FREEZE_ALIASES = {
+        "dino": ("obs_encoder.backbone",),
+        "dinov3": ("obs_encoder.backbone",),
+        "cross_attn": ("obs_encoder.cross_attention",),
+        "cross_attention": ("obs_encoder.cross_attention",),
+        # The complete image/wrench fusion block, including its residual MLP.
+        "cross_fusion": (
+            "obs_encoder.cross_attention",
+            "obs_encoder.cross_output_norm",
+            "obs_encoder.cross_ffn",
+            "obs_encoder.context_norm",
+        ),
+        "dit": ("model",),
+        "action_expert": ("model",),
+    }
+
+    def get_freeze_config(self) -> dict:
+        """Return the freeze settings that should be persisted with a run."""
+        return {
+            "freeze_modules": tuple(self.freeze_modules),
+            "freeze_dino_backbone": bool(
+                getattr(self.obs_encoder, "freeze_backbone", False)
+            ),
+        }
+
+    @classmethod
+    def _expand_freeze_selector(cls, selector: str) -> Tuple[str, ...]:
+        selector = str(selector).strip()
+        if not selector:
+            raise ValueError("freeze_modules cannot contain an empty selector")
+        return cls._FREEZE_ALIASES.get(selector, (selector,))
+
+    def set_freeze_modules(self, selectors: Optional[Sequence[str]]) -> None:
+        """Apply parameter freezing by module prefix.
+
+        Selectors can be module prefixes (for example
+        ``obs_encoder.cross_attention``) or aliases such as ``dino`` and
+        ``cross_attn``.  The DINO ``freeze_dino_backbone`` option remains
+        authoritative for the backbone even when no alias is listed.
+        """
+        selectors = tuple(str(name) for name in (selectors or ()))
+        # Rebuilding a policy from a checkpoint may change the freeze set, so
+        # first restore the normal trainable state and then apply the requested
+        # selectors.  DINO's dedicated option is reapplied below.
+        for parameter in self.parameters():
+            # A few diffusion modules register an empty sentinel parameter to
+            # keep device/dtype inference uniform.  It must stay out of the
+            # optimizer even though it is technically a Parameter.
+            if parameter.numel() > 0:
+                parameter.requires_grad_(True)
+        if getattr(self.obs_encoder, "freeze_backbone", False):
+            self.obs_encoder.backbone.requires_grad_(False)
+
+        prefixes = []
+        for selector in selectors:
+            prefixes.extend(self._expand_freeze_selector(selector))
+        if "obs_encoder.backbone" in prefixes:
+            self.obs_encoder.freeze_backbone = True
+        unmatched = set(prefixes)
+        for name, parameter in self.named_parameters():
+            for prefix in prefixes:
+                if name == prefix or name.startswith(prefix + "."):
+                    parameter.requires_grad_(False)
+                    unmatched.discard(prefix)
+        if unmatched:
+            available = sorted(
+                {name.split(".", 1)[0] for name, _ in self.named_parameters()}
+            )
+            raise ValueError(
+                "freeze_modules selector did not match a policy parameter: "
+                f"{sorted(unmatched)}; top-level modules={available}"
+            )
+        if self.obs_encoder.freeze_backbone:
+            self.obs_encoder._set_backbone_frozen()
+        self.freeze_modules = selectors
+
+    def apply_freeze_config(self, config: Optional[dict]) -> None:
+        """Restore a freeze configuration saved in a checkpoint."""
+        config = dict(config or {})
+        if "freeze_dino_backbone" in config:
+            self.obs_encoder.freeze_backbone = bool(config["freeze_dino_backbone"])
+        self.set_freeze_modules(config.get("freeze_modules", ()))
+        if self.obs_encoder.freeze_backbone:
+            self.obs_encoder._set_backbone_frozen()
+
     def _validate_obs(
         self, obs_dict: Dict[str, torch.Tensor]
-    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        missing = set(self.image_keys).union({self.wrench_key}) - set(obs_dict)
+    ) -> Tuple[
+        Dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
+        required = set(self.image_keys).union(
+            {self.wrench_key, self.phase_wrench_key}
+        )
+        if self.future_phase_wrench_key is not None:
+            required.add(self.future_phase_wrench_key)
+        missing = required - set(obs_dict)
         if missing:
             raise KeyError(f"missing force-aware observations: {sorted(missing)}")
         images = {
             key: obs_dict[key][:, : self.n_obs_steps]
             for key in self.image_keys
         }
+        raw_phase_wrench = obs_dict[self.phase_wrench_key][:, : self.n_obs_steps]
         raw_wrench = obs_dict[self.wrench_key][:, : self.n_obs_steps]
-        if raw_wrench.shape[1] != self.n_obs_steps or any(
+        raw_future_phase_wrench = (
+            obs_dict[self.future_phase_wrench_key][:, : self.n_obs_steps]
+            if self.future_phase_wrench_key is not None
+            else None
+        )
+        if raw_phase_wrench.shape[1] != self.n_obs_steps or raw_wrench.shape[1] != self.n_obs_steps or (
+            raw_future_phase_wrench is not None
+            and raw_future_phase_wrench.shape[1] != self.n_obs_steps
+        ) or any(
             image.shape[1] != self.n_obs_steps for image in images.values()
         ):
             raise ValueError(f"policy requires {self.n_obs_steps} observation steps")
-        return images, raw_wrench
+        return images, raw_phase_wrench, raw_wrench, raw_future_phase_wrench
 
     def _encode_context(
         self,
@@ -260,18 +445,53 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         apply_curriculum_mask: bool,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        images, raw_wrench = self._validate_obs(obs_dict)
-        gate_mask = self.input_gate.keep_mask(raw_wrench)
-        gated_wrench = torch.where(
-            gate_mask.unsqueeze(-1), raw_wrench, torch.zeros_like(raw_wrench)
+        images, raw_phase_wrench, raw_wrench, raw_future_phase_wrench = self._validate_obs(
+            obs_dict
         )
+        if self.phase_wrench_key == self.wrench_key:
+            gate_mask = self.input_gate.keep_mask(raw_wrench)
+            gated_phase_wrench = torch.where(
+                gate_mask.unsqueeze(-1), raw_wrench, torch.zeros_like(raw_wrench)
+            )
+        else:
+            # tau_ext drives the phase latch; the six-dimensional wrench is
+            # the separate signal that becomes the cross-attention query.
+            gated_phase_wrench = raw_phase_wrench
+        contact = self.contact_detector(gated_phase_wrench)
+        if raw_future_phase_wrench is not None:
+            if isinstance(self.contact_detector, HysteresisContactDetector):
+                future_contact = self.contact_detector.rollout_future(
+                    raw_future_phase_wrench,
+                    initial_state=contact,
+                )
+            else:
+                future_contact = self.contact_detector.token_contact(
+                    raw_future_phase_wrench
+                )
+            gated_wrench, future_has_contact = fill_future_wrench_prefix(
+                raw_wrench,
+                future_contact,
+            )
+            model_wrench_mask = future_has_contact[:, :, None, None]
+        else:
+            # Legacy behavior for policies that do not provide a future phase
+            # window.  The insert_usb configuration uses future_tau_ext so
+            # that the gate can preserve an early-contact prefix.
+            contact_for_wrench = contact[:, :, None, None]
+            gated_wrench = torch.where(
+                contact_for_wrench, raw_wrench, torch.zeros_like(raw_wrench)
+            )
+            model_wrench_mask = (
+                gate_mask.unsqueeze(-1)
+                if self.phase_wrench_key == self.wrench_key
+                else contact_for_wrench
+            )
         normalized_wrench = self.normalizer[self.wrench_key].normalize(gated_wrench)
         # Keep suppressed vectors at the model-space origin even with a
         # non-zero-mean Gaussian normalizer.
         normalized_wrench = torch.where(
-            gate_mask.unsqueeze(-1), normalized_wrench, torch.zeros_like(normalized_wrench)
+            model_wrench_mask, normalized_wrench, torch.zeros_like(normalized_wrench)
         )
-        contact = self.contact_detector(gated_wrench)
         probability = self.mask_scheduler.probability(self.optimizer_step)
         image_mask = self.image_masker(
             contact,
@@ -444,11 +664,21 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         fusion_parameters = [
             parameter for parameter in self.obs_encoder.parameters() if parameter.requires_grad
         ]
+        if not action_parameters and not fusion_parameters:
+            raise ValueError(
+                "all policy parameters are frozen; at least one trainable module is required"
+            )
+        parameter_groups = []
+        if action_parameters:
+            parameter_groups.append(
+                {"params": action_parameters, "weight_decay": action_expert_weight_decay}
+            )
+        if fusion_parameters:
+            parameter_groups.append(
+                {"params": fusion_parameters, "weight_decay": fusion_weight_decay}
+            )
         return torch.optim.AdamW(
-            [
-                {"params": action_parameters, "weight_decay": action_expert_weight_decay},
-                {"params": fusion_parameters, "weight_decay": fusion_weight_decay},
-            ],
+            parameter_groups,
             lr=learning_rate,
             betas=betas,
         )

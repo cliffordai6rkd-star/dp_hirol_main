@@ -9,6 +9,7 @@ if __name__ == "__main__":
 
 import copy
 import contextlib
+import dill
 import math
 import os
 import pathlib
@@ -195,7 +196,7 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
 
 
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
-    include_keys = ("global_step", "optimizer_step", "epoch")
+    include_keys = ("global_step", "optimizer_step", "epoch", "freeze_config")
 
     def __init__(
         self,
@@ -215,6 +216,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         )
         if not isinstance(self.model, ForceAwareDiffusionTransformerPolicy):
             raise TypeError("cfg.policy must instantiate ForceAwareDiffusionTransformerPolicy")
+        # This is saved separately from model weights because requires_grad is
+        # not part of a PyTorch state_dict.  It makes a checkpoint self-
+        # describing when DINOv3 or the fusion block is frozen.
+        self.freeze_config = self.model.get_freeze_config()
 
         self.ema_model: Optional[ForceAwareDiffusionTransformerPolicy] = None
         if cfg.training.use_ema:
@@ -231,6 +236,36 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         self.global_step = 0
         self.optimizer_step = 0
         self.epoch = 0
+
+    def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
+        """Restore freeze settings before loading optimizer state.
+
+        A fine-tuning checkpoint may have a different set of trainable
+        parameters from the current config.  Rebuild the optimizer first so
+        its parameter groups agree with the saved model; this also lets a
+        checkpoint switch between full and partial freezing safely.
+        """
+        serialized = payload.get("pickles", {}).get("freeze_config")
+        if serialized is not None:
+            saved_config = dill.loads(serialized)
+            if not isinstance(saved_config, dict):
+                saved_config = {"freeze_modules": tuple(saved_config)}
+            saved_config = dict(saved_config)
+            if saved_config != self.freeze_config:
+                self.model.apply_freeze_config(saved_config)
+                if self.ema_model is not None:
+                    self.ema_model.apply_freeze_config(saved_config)
+                self.freeze_config = self.model.get_freeze_config()
+                optimizer_cfg = OmegaConf.to_container(
+                    self.cfg.optimizer, resolve=True
+                )
+                self.optimizer = self.model.get_optimizer(**optimizer_cfg)
+        return super().load_payload(
+            payload,
+            exclude_keys=exclude_keys,
+            include_keys=include_keys,
+            **kwargs,
+        )
 
     @property
     def is_main_process(self) -> bool:

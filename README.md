@@ -277,9 +277,10 @@ absolute_action_chunk = output["action"]  # [B, 8, 7]
 
 ## Contact-Aware Curriculum Masking
 
-FDP 的 `tau_ext` 输入门控使用未归一化、物理单位下的七轴绝对值之和（L1 范数），当前阈值为 `0.6`；低于阈值时整条七维向量置零。门控阈值、范数类型和启用状态同时写入 force-aware checkpoint 的配置与模型 state dict。
+FDP 使用未归一化、物理单位下的七轴 `tau_ext` 绝对值之和（L1 范数）计算接触阶段。当前配置使用
+`free_threshold=0.65` 和 `contact_threshold=1.5`：超过接触阈值进入接触，低于 free 阈值退出接触，中间区间保持锁存状态。
 
-当前全量数据统计下，默认阈值 `2 N` 会标记约 16.4% 的帧。这个值只是数据驱动的初始配置，正式实验应结合回放或接触标注确认。
+`future_tau_ext` 与未来 `[+40, +320] ms` 的 `future_wrench` 对齐，用于定位未来窗口中的第一个接触 token。如果当前仍是 free 但未来窗口会接触，接触前的 wrench token 使用第一个接触时刻的 6D wrench 向量填充，后续 token 保留原始未来 wrench；未来窗口没有接触时整段置零。
 
 仅在训练阶段执行视觉 mask；验证和推理始终使用完整图像。支持两种范围：
 
@@ -370,110 +371,23 @@ python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
   logging.mode=offline
 ```
 
-### Debug smoke test
+tar -xzf /path/to/diffusion-policy-bundle.tar.gz \
+    -C /path/to/diffusion_policy
 
-该命令只运行少量 train/validation batch，用于先检查本地 DINOv3 权重、DataLoader 和显存：
+docker load -i docker/artifacts/diffusion-policy-train.tar
 
-```bash
-python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
-  --config-name=train_force_aware_diffusion_workspace \
-  training.debug=true \
-  logging.mode=offline \
-  dataloader.num_workers=0 \
-  dataloader.persistent_workers=false \
-  dataloader.prefetch_factor=null \
-  val_dataloader.num_workers=0 \
-  val_dataloader.persistent_workers=false \
-  val_dataloader.prefetch_factor=null
-```
+docker compose -f docker/docker_compose.yaml up -d trainer
 
-### Hydra 参数覆盖
 
-常用参数覆盖示例：
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  train.py \
+  --config-dir=diffusion_policy/config \
+  --config-name=train_dp_insert_usb_force_aware \
+  training.distributed.enabled=true
 
-```bash
-python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
-  --config-name=train_force_aware_diffusion_workspace \
-  policy.contact_threshold=2.5 \
-  policy.image_mask_scope=current_observation \
-  policy.mask_schedule.schedule_type=linear \
-  policy.force_temporal_encoder=gru \
-  dataloader.batch_size=4
-```
+mkdir -p docker/artifacts
+docker save -o docker/artifacts/diffusion-policy-train.tar diffusion-policy:train
 
-主要配置文件：
-
-```text
-diffusion_policy/config/train_force_aware_diffusion_workspace.yaml
-diffusion_policy/config/task/insert_usb_force_aware.yaml
-```
-
-训练工作区单独维护：
-
-- `global_step`：完成的 micro-batch 数。
-- `optimizer_step`：真正执行的 optimizer update 数。
-- `epoch`：已完成的 epoch 数。
-
-梯度累积结束后才更新 optimizer、LR scheduler、EMA 和课程 mask 调度。以上状态都写入 checkpoint，恢复训练不会重复已完成的 epoch。
-
-## 测试
-
-```bash
-pytest -q tests/test_force_aware_diffusion.py
-python tests/test_force_aware_workspace.py
-python tests/test_hirol_lerobot_v3_dataset.py
-```
-
-测试覆盖：
-
-- 接触判定使用原始物理单位。
-- 各类 mask schedule 的端点和中间值。
-- `current_observation` 与 `full_context`。
-- GRU、LSTM、Transformer 和无时序编码器。
-- DINOv3 完全冻结且无梯度。
-- `To * 8` context token 契约。
-- Diffusion loss、sampling 和 action shape。
-- quaternion 符号对齐、单位化和均值 target。
-- prechunked action 的 anchor 与 latency 行为。
-- 梯度累积、optimizer step 和课程调度同步。
-
-## 仓库结构
-
-```text
-diffusion_policy/
-├── config/
-│   ├── task/insert_usb_force_aware.yaml
-│   └── train_force_aware_diffusion_workspace.yaml
-├── dataset/hirol_lerobot_v3_dataset.py
-├── model/
-│   ├── diffusion/context_transformer_for_diffusion.py
-│   └── vision/
-│       ├── contact_curriculum.py
-│       └── force_aware_obs_encoder.py
-├── policy/force_aware_diffusion_transformer_policy.py
-└── workspace/train_force_aware_diffusion_workspace.py
-
-tests/                        data, model and workspace tests
-conda_environment.yaml        local Python 3.10 environment
-setup.py                      package metadata and dependencies
-```
-
-## 当前开发状态
-
-| 模块 | 状态 |
-| --- | --- |
-| 10 Hz 均匀主时间线与历史低维窗口 | 已完成 |
-| 未来 `[8,7]` EE pose action 转换 | 已完成 |
-| LeRobot v3 prechunked DataLoader | 已完成 |
-| Frozen DINOv3 dense patch encoder | 已完成，等待本地真实权重训练 |
-| GRU force tokens 与 cross-attention | 已完成 |
-| Contact-aware curriculum masking | 已完成 |
-| Diffusion Transformer action expert | 已完成 |
-| quaternion-safe chunk target | 已完成 |
-| optimizer-step-aware workspace 与 resume | 已完成 |
-| 一般图像增强 | 接口存在，当前未启用 |
-| Nero 硬件在线 env runner | 未接入 |
-| PINN 未来高频接触力预测 | 开发中 |
-| OSC-QP 力矩闭环 | 规划中 |
-
-第一阶段的目标是先验证：在相同 demonstration 数据上，force-aware cross-attention 和接触课程 mask 是否相对纯视觉策略改善接触阶段的动作稳定性。确认高层策略有效后，再接入未来力预测和底层控制闭环。
+tar --exclude='.git' -czf ../diffusion-policy-bundle.tar.gz .

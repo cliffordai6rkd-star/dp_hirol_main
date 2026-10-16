@@ -1,0 +1,48 @@
+name: diffusion-policy
+
+services:
+  trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.6.3}
+        APT_MIRROR: ${APT_MIRROR:-archive.ubuntu.com}
+    image: diffusion-policy:train
+    container_name: diffusion-policy-trainer
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+    ipc: host
+    # Container /dev/shm for DataLoader workers and the shared image cache.
+    # Four RTX 4090 cards do not determine this value; host RAM does.
+    shm_size: ${SHM_SIZE:-64gb}
+    gpus: all
+    environment:
+      PYTHONPATH: /workspace
+      # W&B is offline by default, so a copied project can train without an
+      # account. Set WANDB_MODE=online and WANDB_API_KEY on the host if needed.
+      WANDB_MODE: ${WANDB_MODE:-offline}
+      WANDB_DIR: /workspace/data/wandb
+      MPLCONFIGDIR: /tmp/matplotlib
+      HF_HOME: /workspace/.cache/huggingface
+      DP_DATASET_PATH: /workspace/data/insert_usb_50hz_lerobot_v3
+      DINOV3_MODEL_PATH: /workspace/model/dinov3-vitb16-pretrain-lvd1689m
+      CONFIG_NAME: ${CONFIG_NAME:-train_dp_insert_usb_force_aware}
+      NPROC_PER_NODE: ${NPROC_PER_NODE:-}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      # Source code, configs, checkpoints and logs remain visible on the host.
+      - ..:/workspace
+      # These two paths can point outside the repository when the dataset or
+      # DINOv3 weights are stored on a shared server volume.
+      - ${DP_DATASET_DIR:-../data}:/workspace/data
+      - ${DINOV3_MODEL_DIR:-../model/dinov3-vitb16-pretrain-lvd1689m}:/workspace/model/dinov3-vitb16-pretrain-lvd1689m:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

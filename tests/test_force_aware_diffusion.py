@@ -19,12 +19,14 @@ from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
 from diffusion_policy.model.vision.contact_curriculum import (
     ContactAwareImageMasker,
     ContactDetector,
+    HysteresisContactDetector,
     MaskProbabilityScheduler,
     VectorThresholdGate,
 )
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
     ForceAwareDiffusionTransformerPolicy,
+    fill_future_wrench_prefix,
     normalize_pose_quaternions,
 )
 
@@ -155,6 +157,62 @@ def test_contact_detector_uses_physical_wrench_units():
     assert contact.tolist() == [[False, True], [False, False]]
 
 
+def test_hysteresis_contact_detector_holds_contact_until_free_threshold():
+    detector = HysteresisContactDetector(
+        free_threshold=1.0,
+        contact_threshold=2.0,
+        force_dims=(0,),
+        history_reducer="last",
+    )
+    signal = torch.tensor(
+        [[[[2.2], [0.0]], [[1.5], [2.2]], [[1.5], [1.5]], [[0.8], [0.8]]]]
+    )
+    assert detector(signal).tolist() == [[False, True, True, False]]
+    boundary_signal = torch.tensor(
+        [[[[2.1]], [[1.0]], [[0.99]]]]
+    )
+    assert detector(boundary_signal).tolist() == [[True, True, False]]
+
+
+def test_hysteresis_contact_detector_supports_l1_norm_and_future_rollout():
+    detector = HysteresisContactDetector(
+        free_threshold=1.0,
+        contact_threshold=1.5,
+        force_dims=(0, 1),
+        history_reducer="last",
+        norm="l1",
+    )
+    # L1=1.6 enters contact while L2 would still be below 1.5.
+    current = torch.tensor([[[[0.8, 0.8]]]])
+    assert detector(current).tolist() == [[True]]
+
+    future = torch.tensor(
+        [[[[0.2, 0.2], [0.4, 0.4], [0.9, 0.8], [1.2, 0.8]]]]
+    )
+    rollout = detector.rollout_future(future, initial_state=torch.tensor([[False]]))
+    assert rollout.tolist() == [[[False, False, True, True]]]
+
+
+def test_future_wrench_prefix_uses_first_contact_vector():
+    raw_wrench = torch.tensor(
+        [[[[1.0, -0.5], [2.0, -1.0], [3.0, -1.5], [4.0, -2.0]]]]
+    )
+    future_contact = torch.tensor([[[False, False, True, True]]])
+    filled, has_contact = fill_future_wrench_prefix(raw_wrench, future_contact)
+    expected = torch.tensor(
+        [[[[3.0, -1.5], [3.0, -1.5], [3.0, -1.5], [4.0, -2.0]]]]
+    )
+    assert torch.equal(filled, expected)
+    assert has_contact.tolist() == [[True]]
+
+    free_only = torch.zeros_like(future_contact)
+    filled_free, has_free_contact = fill_future_wrench_prefix(
+        raw_wrench, free_only
+    )
+    assert torch.equal(filled_free, torch.zeros_like(raw_wrench))
+    assert has_free_contact.tolist() == [[False]]
+
+
 def test_vector_threshold_gate_zeroes_complete_tau_vectors_and_is_serialized():
     gate = VectorThresholdGate(threshold=1.0, norm="l1")
     tau = torch.tensor(
@@ -169,6 +227,30 @@ def test_vector_threshold_gate_zeroes_complete_tau_vectors_and_is_serialized():
     assert "threshold" in gate.state_dict()
     assert "enabled" in gate.state_dict()
     assert "norm_code" in gate.state_dict()
+
+
+def test_policy_freeze_selectors_exclude_cross_attention_from_optimizer():
+    policy = make_policy()
+    policy.set_freeze_modules(["cross_attn"])
+    cross_ids = {
+        id(parameter) for parameter in policy.obs_encoder.cross_attention.parameters()
+    }
+    assert cross_ids
+    assert all(
+        not parameter.requires_grad
+        for parameter in policy.obs_encoder.cross_attention.parameters()
+    )
+    assert any(
+        parameter.requires_grad for parameter in policy.obs_encoder.cross_ffn.parameters()
+    )
+    optimizer = policy.get_optimizer(learning_rate=1.0e-4)
+    optimizer_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert cross_ids.isdisjoint(optimizer_ids)
+    assert policy.get_freeze_config()["freeze_modules"] == ("cross_attn",)
 
 
 @pytest.mark.parametrize("schedule_type", ["linear", "cosine", "exponential"])
