@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - /train_dp_insert_usb_force_aware
+  - _self_
+
+name: train_dp_dinobase_insert_usb
+
+# Retain the same dataset windows, phase sampler, action DiT and 200k updates.
+# Only RGB patch tokens enter the model; no force input or visual masking.
+policy:
+  _target_: diffusion_policy.policy.dino_token_baseline_policy.DinoTokenBaselinePolicy
+  baseline_mode: dino
+  force_temporal_encoder: none
+  force_encoder_layers: 0
+  camera_attention_mode: joint
+  mask_schedule:
+    schedule_type: constant
+    start_probability: 0.0
+    end_probability: 0.0
+
+logging:
+  tags: [baseline, dinov3, image-only, dual-camera, ee-pose]

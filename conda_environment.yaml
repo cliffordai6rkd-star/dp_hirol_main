@@ -22,8 +22,13 @@ dependencies:
   - pinocchio>=3,<4
   - scipy>=1.10,<1.16
   - pip:
+      # Use the CUDA 12.8 wheels required by the RTX 5090 training host.
+      - --extra-index-url=https://download.pytorch.org/whl/cu128
+      - torch==2.7.1+cu128
+      - torchvision==0.22.1+cu128
+      - torchcodec==0.5+cu128
+      # TorchCodec CUDA 0.5 needs libnppicc.so.12 at runtime.
+      - nvidia-npp-cu12==12.4.1.87
       - -e .[training,test]
       # LeRobot v3 dataset IO used by the training configs.
       - lerobot==0.4.0
-      # LeRobot 0.4.0 requires TorchCodec >=0.2.1,<0.6.0.
-      - torchcodec==0.5

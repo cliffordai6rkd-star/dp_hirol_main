@@ -115,6 +115,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         input_gate_threshold: Optional[float] = None,
         input_gate_norm: str = "l1",
         input_gate_enabled: bool = False,
+        camera_attention_mode: str = "joint",
         image_mask_scope: str = "full_context",
         mask_schedule: Optional[dict] = None,
         obs_encoder: Optional[ForceAwareObsEncoder] = None,
@@ -235,6 +236,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 freeze_backbone=freeze_dino_backbone,
                 local_files_only=dino_local_files_only,
                 image_keys=configured_image_keys,
+                camera_attention_mode=camera_attention_mode,
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
@@ -326,6 +328,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         # The complete image/wrench fusion block, including its residual MLP.
         "cross_fusion": (
             "obs_encoder.cross_attention",
+            "obs_encoder.camera_fusion",
             "obs_encoder.cross_output_norm",
             "obs_encoder.cross_ffn",
             "obs_encoder.context_norm",
@@ -377,6 +380,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         if "obs_encoder.backbone" in prefixes:
             self.obs_encoder.freeze_backbone = True
         unmatched = set(prefixes)
+        module_names = {name for name, _ in self.named_modules()}
+        unmatched.difference_update(module_names)
         for name, parameter in self.named_parameters():
             for prefix in prefixes:
                 if name == prefix or name.startswith(prefix + "."):
@@ -458,6 +463,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             # the separate signal that becomes the cross-attention query.
             gated_phase_wrench = raw_phase_wrench
         contact = self.contact_detector(gated_phase_wrench)
+        future_has_contact: Optional[torch.Tensor] = None
         if raw_future_phase_wrench is not None:
             if isinstance(self.contact_detector, HysteresisContactDetector):
                 future_contact = self.contact_detector.rollout_future(
@@ -493,8 +499,16 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             model_wrench_mask, normalized_wrench, torch.zeros_like(normalized_wrench)
         )
         probability = self.mask_scheduler.probability(self.optimizer_step)
+        # The curriculum is meant to remove image evidence only for windows
+        # whose *future* reaches contact.  The current observation is often
+        # still free in these windows, and its tau_ext history is therefore
+        # zero; using ``contact`` here would mask the wrong phase (or miss the
+        # future-contact window entirely).  Keep the legacy current-contact
+        # behavior only for configurations that do not provide a future phase
+        # window.
+        mask_contact = future_has_contact if future_has_contact is not None else contact
         image_mask = self.image_masker(
-            contact,
+            mask_contact,
             probability=probability,
             enabled=apply_curriculum_mask,
             generator=generator,
@@ -502,6 +516,12 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.last_curriculum_metrics = {
             "curriculum/mask_probability": probability,
             "curriculum/contact_fraction": contact.float().mean().item(),
+            "curriculum/current_contact_fraction": contact.float().mean().item(),
+            "curriculum/future_contact_fraction": (
+                future_has_contact.float().mean().item()
+                if future_has_contact is not None
+                else contact.float().mean().item()
+            ),
             "curriculum/masked_image_fraction": image_mask.float().mean().item(),
             "curriculum/optimizer_step": float(self.optimizer_step),
         }

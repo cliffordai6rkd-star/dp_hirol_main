@@ -5,10 +5,10 @@ defaults:
 name: train_dp_insert_usb_force_aware
 _target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
 
-# Inside Compose this is /workspace/data/...; the relative default keeps the
-# same config usable from the repository root outside Docker.
+# Environment variables take precedence; when they are unset, resolve paths
+# relative to the repository root used to launch train.py.
 dataset_path: ${oc.env:DP_DATASET_PATH,data/insert_usb_50hz_lerobot_v3}
-dino_model_path: ${oc.env:DINOV3_MODEL_PATH,facebook/dinov3-vits16-pretrain-lvd1689m}
+dino_model_path: ${oc.env:DINOV3_MODEL_PATH,model/model/dinov3-vitb16-pretrain-lvd1689m}
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
@@ -25,6 +25,16 @@ dataset_obs_steps: ${n_obs_steps}
 free_threshold: ${task.free_threshold}
 contact_threshold: ${task.contact_threshold}
 contact_norm: ${task.contact_norm}
+
+# FIRST-style phase resampling weights: free : pre-contact : contact.
+phase_resampling:
+  enabled: true
+  precontact_seconds: 1.0
+  weights:
+    free: 1.0
+    precontact: 1.0
+    contact: 5.0
+
 freeze_dino_backbone: true
 freeze_modules: []
 
@@ -62,6 +72,9 @@ policy:
   freeze_modules: ${freeze_modules}
   force_temporal_encoder: gru
   force_encoder_layers: 1
+  # Run wrench-to-image attention independently for each camera, then fuse
+  # the resulting wrench tokens before conditioning the DiT.
+  camera_attention_mode: per_camera
 
   n_emb: 256
   n_head: 4
@@ -81,7 +94,7 @@ policy:
   mask_schedule:
     schedule_type: cosine
     start_step: 0
-    end_step: 30000
+    end_step: 10000
     start_probability: 1.0
     end_probability: 0.0
     exponential_rate: 5.0
@@ -95,7 +108,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 128
+  batch_size: 32
   num_workers: 4
   shuffle: true
   pin_memory: true
@@ -103,7 +116,7 @@ dataloader:
   prefetch_factor: 2
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 32
   num_workers: 2
   shuffle: false
   pin_memory: true
@@ -136,14 +149,14 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: null
-  num_optimizer_steps: 60000
+  num_optimizer_steps: 200000
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
   rollout_every: 100
-  checkpoint_every: 5000
-  checkpoint_every_optimizer_steps: 5000
-  val_every: 5
+  checkpoint_every: 2000
+  checkpoint_every_optimizer_steps: 20000
+  val_every: 10
   sample_every: 10
   max_train_steps: null
   max_val_steps: 50
@@ -162,8 +175,8 @@ checkpoint:
   topk:
     monitor_key: train_loss
     mode: min
-    k: 3
-    format_str: optimizer_step={optimizer_step:08d}-train_loss={train_loss:.6f}.ckpt
+    k: 5
+    format_str: FRIST_optimizer_step={optimizer_step:08d}-train_loss={train_loss:.6f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false
 

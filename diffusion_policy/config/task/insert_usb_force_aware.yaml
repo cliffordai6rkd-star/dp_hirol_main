@@ -18,6 +18,7 @@ contact_threshold: 1.5
 contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
 contact_history_reducer: max
 contact_norm: l1
+phase_source_key: observation.tau_ext
 input_gate_enabled: false
 relative_pose_actions: false
 action_reference_key: action_reference
@@ -78,6 +79,7 @@ dataset:
       # The camera timestamp is the anchor.  The source wrench is sampled at
       # the nearest 50 Hz row, so these are +40 ... +320 ms in camera time.
       anchor_timestamp_key: timing.camera_timestamp_ns
+      source_timestamp_key: timing.state_timestamp_ns
       offsets_sec: [0.04, 0.08, 0.12, 0.16, 0.20, 0.24, 0.28, 0.32]
     future_tau_ext:
       source_key: observation.tau_ext
@@ -85,14 +87,20 @@ dataset:
       start_offset: ${task.future_wrench_start_offset}
       stride: ${task.future_wrench_stride}
       anchor_timestamp_key: timing.camera_timestamp_ns
+      source_timestamp_key: timing.state_timestamp_ns
       offsets_sec: [0.04, 0.08, 0.12, 0.16, 0.20, 0.24, 0.28, 0.32]
   action_feature_fields:
-    - action
+    - observation.ee_pose
   action_layout: per_step
   relative_pose_actions: ${task.relative_pose_actions}
   timestamp_key: timestamp
   timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
+  # The first 49 force rows in every USB episode have a fixed zero prefix.
+  # Require observations, force history and future targets to lie beyond it;
+  # genuine zero-force rows later remain eligible.
+  episode_warmup_steps: 49
+  observation_validity_key: timing.camera_valid
   local_files_only: true
   video_backend: null
   video_decode_device: auto
@@ -100,7 +108,14 @@ dataset:
   load_result_add: ram
   image_cache_dtype: uint8
   image_cache_chunk_frames: 64
+  phase_resampling_enabled: ${oc.select:phase_resampling.enabled,false}
+  phase_source_key: ${task.phase_source_key}
+  contact_threshold: ${contact_threshold}
+  contact_force_dims: ${task.contact_force_dims}
+  contact_norm: ${contact_norm}
+  precontact_seconds: ${oc.select:phase_resampling.precontact_seconds,1.0}
   image_randomer_config:
+    shared_across_sequence: true
     resize: false
     random_crop: false
     rotation: false

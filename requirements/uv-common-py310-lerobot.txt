@@ -2,7 +2,13 @@
 # Keep this separate from uv-common.txt, which preserves the older py39/cu116 stack.
 #
 # LeRobot itself is installed with --no-deps in the Dockerfile because its
-# torch<2.8 metadata conflicts with the Nero-aligned PyTorch runtime.
+# torch metadata is resolved explicitly below for the CUDA 12.8 runtime.
+
+# CUDA 12.8 wheels for the RTX 5090/Blackwell training host.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchcodec==0.5+cu128
 
 # Diffusion Policy core runtime.
 numpy==2.2.6
@@ -50,9 +56,8 @@ opencv-python-headless==4.11.0.86
 av==15.0.0
 cmake==3.31.6
 imageio[ffmpeg]==2.37.0
-# LeRobot 0.4 requires TorchCodec >=0.2.1,<0.6.0.
-# The matching FFmpeg shared libraries are provided by conda_environment.yaml.
-torchcodec==0.5
+# TorchCodec CUDA 0.5 requires the CUDA 12 NPP runtime for color conversion.
+nvidia-npp-cu12==12.4.1.87
 jsonlines==4.0.0
 packaging==24.2
 pynput==1.8.1

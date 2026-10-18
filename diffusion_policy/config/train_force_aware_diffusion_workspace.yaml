@@ -46,6 +46,7 @@ policy:
   wrench_history_steps: ${task.wrench_history_steps}
   force_temporal_encoder: gru
   force_encoder_layers: 1
+  camera_attention_mode: per_camera
 
   n_emb: 256
   n_head: 4

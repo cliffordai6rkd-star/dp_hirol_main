@@ -1,4 +1,6 @@
-# Core Python dependencies translated from conda_environment.yaml.
+# LEGACY Python 3.9 / CUDA 11.6 stack for older simulation tasks.
+# The current Python 3.10 + LeRobot training stack is
+# requirements/uv-common-py310-lerobot.txt.
 # Install torch/torchvision from requirements/uv-sim-cu116.txt first or together.
 numpy==1.23.3
 numba==0.56.4
@@ -18,7 +20,7 @@ dill==0.3.5.1
 scikit-video==1.1.11
 scikit-image==0.19.3
 pymunk==6.2.1
-wandb==0.22.3
+wandb==0.21.4
 threadpoolctl==3.1.0
 shapely==1.8.4
 cython==0.29.32

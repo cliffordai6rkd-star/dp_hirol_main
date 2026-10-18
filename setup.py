@@ -30,9 +30,10 @@ CORE_DEPENDENCIES = [
     "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",
     "cmeel-urdfdom>=4,<5; platform_system == 'Linux'",
     "numba>=0.66,<0.67",
-    # Force-aware Diffusion Transformer runtime.
-    "torch>=2.3,<3",
-    "torchvision>=0.18,<1",
+    # Current LeRobot 0.4 / RTX 5090 training runtime.  The CUDA 12.8
+    # wheel index is selected by the pinned requirements and Docker files.
+    "torch>=2.7,<2.8",
+    "torchvision>=0.22,<0.23",
     "hydra-core>=1.3,<1.4",
     "omegaconf>=2.3,<2.4",
     "einops>=0.8,<0.9",
@@ -53,10 +54,13 @@ EXTRAS = {
         "lerobot==0.4.0",
         # LeRobot 0.4 requires TorchCodec >=0.2.1,<0.6.0.
         "torchcodec==0.5",
+        # TorchCodec CUDA 0.5 needs the CUDA 12 NPP runtime on Linux.
+        "nvidia-npp-cu12>=12.4,<13; platform_system == 'Linux'",
     ],
     "training": [
         "accelerate>=1.10,<2",
-        "wandb>=0.21,<0.23",
+        # LeRobot 0.4.0 requires wandb>=0.20,<0.22.
+        "wandb>=0.20,<0.22",
         "tensorboard>=2.15,<3",
         "dill>=0.3.8,<0.4",
     ],

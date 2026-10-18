@@ -6,7 +6,7 @@ Compose 已经配置好 GPU、共享内存、代码、数据、DINOv3 权重和�
 
 ```text
 data/insert_usb_50hz_lerobot_v3/
-model/dinov3-vitb16-pretrain-lvd1689m/
+model/model/dinov3-vitb16-pretrain-lvd1689m/
 ```
 
 ## 本机构建并打包
@@ -60,7 +60,7 @@ free_threshold=0.4 contact_threshold=1.2
 
 ```text
 /workspace/data/insert_usb_50hz_lerobot_v3
-/workspace/model/dinov3-vitb16-pretrain-lvd1689m
+/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
 ```
 
 ## 共享内存
@@ -84,5 +84,5 @@ docker compose -f docker/docker_compose.yaml down
 服务器没有外网时也不影响 Python 依赖，因为镜像已经在本机构建完成。服务器仍需确认 GPU 容器运行时：
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.6.3-cudnn8-runtime-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 nvidia-smi
 ```

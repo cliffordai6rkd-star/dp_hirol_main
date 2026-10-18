@@ -10,6 +10,7 @@ if __name__ == "__main__":
 import copy
 import contextlib
 import dill
+import logging
 import math
 import os
 import pathlib
@@ -33,6 +34,7 @@ from torch.utils.data.distributed import DistributedSampler
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
+from diffusion_policy.common.phase_sampler import PhaseWeightedDistributedSampler
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
@@ -44,6 +46,8 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -364,7 +368,53 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
         train_sampler = None
         val_sampler = None
-        if distributed.enabled:
+        phase_resampling_cfg = cfg.get("phase_resampling", {})
+        if OmegaConf.is_config(phase_resampling_cfg):
+            phase_resampling_cfg = OmegaConf.to_container(
+                phase_resampling_cfg, resolve=True
+            )
+        else:
+            phase_resampling_cfg = dict(phase_resampling_cfg or {})
+        phase_resampling_enabled = bool(
+            phase_resampling_cfg.get("enabled", False)
+        )
+        if phase_resampling_enabled:
+            get_phase_labels = getattr(dataset, "get_phase_labels", None)
+            if not callable(get_phase_labels):
+                raise TypeError(
+                    "phase_resampling.enabled requires the dataset to expose "
+                    "get_phase_labels()"
+                )
+            phase_weights_cfg = phase_resampling_cfg.get(
+                "weights",
+                {"free": 1.0, "precontact": 5.0, "contact": 2.0},
+            )
+            phase_weights = {
+                0: float(phase_weights_cfg.get("free", 1.0)),
+                1: float(phase_weights_cfg.get("precontact", 5.0)),
+                2: float(phase_weights_cfg.get("contact", 2.0)),
+            }
+            train_sampler = PhaseWeightedDistributedSampler(
+                dataset,
+                phase_labels=get_phase_labels(),
+                phase_weights=phase_weights,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                seed=int(cfg.training.seed),
+            )
+            train_loader_cfg.pop("shuffle", None)
+            if self.is_main_process:
+                fractions = train_sampler.expected_phase_fractions
+                log.info(
+                    "Phase resampling enabled: counts=%s, weights=%s, "
+                    "expected fractions={free=%.3f, precontact=%.3f, contact=%.3f}",
+                    train_sampler.phase_counts,
+                    phase_weights,
+                    fractions[0],
+                    fractions[1],
+                    fractions[2],
+                )
+        elif distributed.enabled:
             train_sampler = DistributedSampler(
                 dataset,
                 num_replicas=distributed.world_size,
@@ -372,6 +422,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 shuffle=bool(train_loader_cfg.pop("shuffle", True)),
                 seed=int(cfg.training.seed),
             )
+        if distributed.enabled:
             val_sampler = DistributedSampler(
                 validation_dataset,
                 num_replicas=distributed.world_size,
@@ -547,6 +598,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
                 policy = self.ema_model if self.ema_model is not None else self.model
                 policy.eval()
+                val_plot_path = None
                 if (
                     self.is_main_process
                     and env_runner is not None
@@ -555,7 +607,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     step_log.update(env_runner.run(policy))
 
                 if self.epoch % int(cfg.training.val_every) == 0:
-                    val_loss = self._validate(
+                    val_metrics = self._validate_metrics(
                         policy,
                         val_dataloader,
                         device,
@@ -563,8 +615,14 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         cfg=cfg,
                         distributed=distributed,
                     )
-                    if val_loss is not None:
-                        step_log["val_loss"] = val_loss
+                    if val_metrics is not None:
+                        step_log.update(val_metrics)
+                        if self.is_main_process:
+                            val_plot_path = self._update_validation_plot(
+                                epoch=self.epoch,
+                                optimizer_step=self.optimizer_step,
+                                metrics=val_metrics,
+                            )
 
                 if (
                     self.is_main_process
@@ -608,6 +666,13 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 )
                 if self.is_main_process:
                     wandb_run.log(step_log, step=self.global_step)
+                    if val_plot_path is not None:
+                        # Scalars above provide the normal WandB curves; also
+                        # upload the same artifact that is saved in output_dir.
+                        wandb_run.log(
+                            {"val_loss_plot": wandb.Image(str(val_plot_path))},
+                            step=self.global_step,
+                        )
                     json_logger.log(step_log)
                 self.epoch += 1
 
@@ -875,7 +940,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
 
-    def _validate(
+    def _validate_metrics(
         self,
         policy,
         dataloader,
@@ -883,12 +948,21 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         max_steps,
         cfg,
         distributed: Optional[DistributedContext] = None,
-    ) -> Optional[float]:
+        compute_action_mse: bool = True,
+    ) -> Optional[dict]:
         loss_sum = 0.0
         loss_count = 0
+        action_mse_sum = 0.0
+        action_mse_raw_sum = 0.0
+        action_count = 0
         maximum = len(dataloader)
         if max_steps is not None:
             maximum = min(maximum, int(max_steps))
+        distributed = distributed or DistributedContext()
+        generator = None
+        if compute_action_mse:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(cfg.training.seed) + distributed.rank)
         with torch.no_grad(), self._autocast(cfg, device):
             for batch_idx, batch in enumerate(dataloader):
                 if batch_idx >= maximum:
@@ -900,17 +974,158 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 loss_sum += policy.compute_loss(batch).item()
                 loss_count += 1
 
-        distributed = distributed or DistributedContext()
+                if compute_action_mse:
+                    # Run the complete image-conditioned diffusion sampler and
+                    # compare its predicted action chunk with the demonstration.
+                    # Keep both normalized and physical-unit MSEs: the former is
+                    # balanced across action dimensions, while the latter is the
+                    # direct regression error requested for inspecting actions.
+                    prediction = policy.predict_action(
+                        batch["obs"],
+                        generator=generator,
+                    )["model_action_pred"]
+                    target = batch["action"]
+                    normalized_prediction = policy.normalizer["action"].normalize(
+                        prediction
+                    )
+                    normalized_target = policy.normalizer["action"].normalize(target)
+                    action_mse_sum += torch.nn.functional.mse_loss(
+                        normalized_prediction,
+                        normalized_target,
+                        reduction="sum",
+                    ).item()
+                    action_mse_raw_sum += torch.nn.functional.mse_loss(
+                        prediction,
+                        target,
+                        reduction="sum",
+                    ).item()
+                    action_count += int(target.numel())
+
         if distributed.enabled:
             totals = torch.tensor(
-                [loss_sum, loss_count],
+                [
+                    loss_sum,
+                    loss_count,
+                    action_mse_sum,
+                    action_mse_raw_sum,
+                    action_count,
+                ],
                 device=device,
                 dtype=torch.float64,
             )
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
             loss_sum = float(totals[0].item())
             loss_count = int(totals[1].item())
-        return loss_sum / loss_count if loss_count else None
+            action_mse_sum = float(totals[2].item())
+            action_mse_raw_sum = float(totals[3].item())
+            action_count = int(totals[4].item())
+        if not loss_count:
+            return None
+        metrics = {
+            "val_loss": loss_sum / loss_count,
+        }
+        if compute_action_mse:
+            metrics.update(
+                {
+                    "val_action_mse": (
+                        action_mse_sum / action_count if action_count else float("nan")
+                    ),
+                    "val_action_mse_raw": (
+                        action_mse_raw_sum / action_count if action_count else float("nan")
+                    ),
+                }
+            )
+        return metrics
+
+    def _validate(
+        self,
+        policy,
+        dataloader,
+        device,
+        max_steps,
+        cfg,
+        distributed: Optional[DistributedContext] = None,
+    ) -> Optional[float]:
+        """Backward-compatible diffusion-loss-only validation helper."""
+        metrics = self._validate_metrics(
+            policy=policy,
+            dataloader=dataloader,
+            device=device,
+            max_steps=max_steps,
+            cfg=cfg,
+            distributed=distributed,
+            compute_action_mse=False,
+        )
+        return None if metrics is None else metrics["val_loss"]
+
+    def _update_validation_plot(
+        self,
+        epoch: int,
+        optimizer_step: int,
+        metrics: dict,
+    ) -> Optional[pathlib.Path]:
+        """Append validation metrics and save the output-dir loss figure."""
+        history = getattr(self, "_validation_history", None)
+        if history is None:
+            history = []
+            self._validation_history = history
+        history.append(
+            {
+                "epoch": int(epoch),
+                "optimizer_step": int(optimizer_step),
+                "val_loss": float(metrics["val_loss"]),
+                "val_action_mse": float(metrics["val_action_mse"]),
+                "val_action_mse_raw": float(metrics["val_action_mse_raw"]),
+            }
+        )
+
+        # Use a non-interactive backend because training may run without a
+        # display (remote server, torchrun, or a container).
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg", force=True)
+            from matplotlib import pyplot as plt
+        except Exception as exc:  # pragma: no cover - depends on environment
+            log.warning("Could not create validation loss plot: %s", exc)
+            return None
+
+        output_path = pathlib.Path(self.output_dir).joinpath("val_loss.png")
+        x = [item["epoch"] for item in history]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        axes[0].plot(
+            x,
+            [item["val_loss"] for item in history],
+            marker="o",
+            label="diffusion val_loss",
+        )
+        axes[0].plot(
+            x,
+            [item["val_action_mse"] for item in history],
+            marker="o",
+            label="normalized action MSE",
+        )
+        axes[0].set_xlabel("epoch")
+        axes[0].set_ylabel("loss")
+        axes[0].set_title("Validation losses")
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend()
+
+        axes[1].plot(
+            x,
+            [item["val_action_mse_raw"] for item in history],
+            marker="o",
+            color="tab:orange",
+        )
+        axes[1].set_xlabel("epoch")
+        axes[1].set_ylabel("MSE in action units")
+        axes[1].set_title("Raw validation action MSE")
+        axes[1].grid(True, alpha=0.3)
+
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return output_path
 
 
 @hydra.main(

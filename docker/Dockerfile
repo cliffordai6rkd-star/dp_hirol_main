@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# CUDA 12.6 matches the PyTorch 2.7.1 wheels used by the Nero/LeRobot stack.
-ARG CUDA_VERSION=12.6.3
+# CUDA 12.8 matches the pinned PyTorch/TorchCodec wheels used by the
+# RTX 5090/Blackwell LeRobot training stack.
+ARG CUDA_VERSION=12.8.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG APT_MIRROR=archive.ubuntu.com
@@ -11,7 +12,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
-    PATH=/opt/venv/bin:${PATH}
+    PATH=/opt/venv/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
 
 RUN set -eux; \
     for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*; do \
@@ -64,7 +66,7 @@ COPY diffusion_policy ./diffusion_policy
 
 # Install the CUDA-enabled framework before the rest of the pinned runtime.
 RUN python -m pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu126 \
+    --index-url https://download.pytorch.org/whl/cu128 \
     torch==2.7.1 torchvision==0.22.1
 
 RUN python -m pip install --no-cache-dir \

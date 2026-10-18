@@ -338,7 +338,12 @@ class MaskProbabilityScheduler(nn.Module):
 
 
 class ContactAwareImageMasker(nn.Module):
-    """Sample whole-image token masks for contact observations."""
+    """Sample whole-image token masks for selected contact-target windows.
+
+    The caller supplies the phase condition that should trigger masking.  For
+    future-phase training this is the future-window contact flag, rather than
+    the current observation's contact state.
+    """
 
     def __init__(self, scope: str = "full_context") -> None:
         super().__init__()

@@ -156,6 +156,15 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         image_randomer_config: Optional[Mapping] = None,
         image_cache_dtype: str = "uint8",
         image_cache_chunk_frames: int = 64,
+        phase_resampling_enabled: bool = False,
+        phase_sampling_weights: Optional[Mapping[str, float]] = None,
+        phase_source_key: str = "observation.tau_ext",
+        contact_threshold: Optional[float] = None,
+        contact_force_dims: Sequence[int] = (0, 1, 2),
+        contact_norm: str = "l1",
+        precontact_seconds: float = 1.0,
+        observation_validity_key: Optional[str] = None,
+        episode_warmup_steps: int = 0,
     ):
         super().__init__()
         if window_sampling_strategy not in {"idx", "timestamp"}:
@@ -190,6 +199,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.timestamp_key = timestamp_key
         self.timestamp_step_sec = timestamp_step_sec
         self.timestamp_tolerance_sec = timestamp_tolerance_sec
+        self.episode_warmup_steps = int(episode_warmup_steps)
+        if self.episode_warmup_steps < 0:
+            raise ValueError("episode_warmup_steps must be non-negative")
         self.video_decode_device = (
             None if video_decode_device is None else str(video_decode_device).lower()
         )
@@ -200,6 +212,25 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         if self.image_cache_dtype not in {np.dtype(np.uint8), np.dtype(np.float32)}:
             raise ValueError("image_cache_dtype must be 'uint8' or 'float32'")
         self.image_cache_chunk_frames = max(1, int(image_cache_chunk_frames))
+        self.phase_resampling_enabled = bool(phase_resampling_enabled)
+        self.phase_source_key = str(phase_source_key)
+        self.contact_threshold = (
+            None if contact_threshold is None else float(contact_threshold)
+        )
+        self.contact_force_dims = tuple(int(dim) for dim in contact_force_dims)
+        self.contact_norm = "l1" if contact_norm == "sum" else str(contact_norm)
+        self.precontact_seconds = float(precontact_seconds)
+        default_phase_weights = {"free": 1.0, "precontact": 5.0, "contact": 2.0}
+        self.phase_sampling_weights = {
+            **default_phase_weights,
+            **dict(phase_sampling_weights or {}),
+        }
+        if self.contact_threshold is not None and self.contact_threshold < 0:
+            raise ValueError("contact_threshold must be non-negative")
+        if self.contact_norm not in {"l1", "l2"}:
+            raise ValueError("contact_norm must be 'l1', 'l2', or 'sum'")
+        if self.precontact_seconds < 0:
+            raise ValueError("precontact_seconds must be non-negative")
         self._video_decoder = None
         self._video_decoder_warning_emitted = False
         if self.action_layout == "prechunked":
@@ -221,6 +252,10 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 distributed_world_size,
             )
         self.image_randomer_config = image_randomer_config
+        self.image_randomer_shared = bool(
+            image_randomer_config
+            and image_randomer_config.get("shared_across_sequence", False)
+        )
         augmentation_enabled = bool(
             image_randomer_config
             and (
@@ -276,25 +311,36 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.episode_index = self._load_episode_index()
         self.episode_ends = self._build_episode_ends(self.episode_index)
         self.episode_ranges = self._build_episode_ranges(self.episode_ends)
+        self._phase_source_data = (
+            self._load_column(self.phase_source_key, dtype=np.float32)
+            if self.phase_resampling_enabled
+            else None
+        )
         self.episode_step_sec = self._build_episode_step_sec(
             self.timestamps,
             self.episode_ranges,
             explicit_step_sec=timestamp_step_sec,
         )
+        self._observation_valid = np.ones(self.dataset_length, dtype=bool)
+        if observation_validity_key:
+            flags = self._load_column(observation_validity_key, dtype=np.float64)
+            if flags.size != self.dataset_length or not np.isin(flags, [0, 1]).all():
+                raise ValueError(
+                    f"{observation_validity_key!r} must contain one 0/1 validity flag per row"
+                )
+            self._observation_valid = flags.reshape(-1).astype(bool)
         self._window_anchor_timestamps = {}
         for config in self.windowed_lowdim_feature_groups.values():
-            anchor_key = config.get("anchor_timestamp_key")
-            if anchor_key and anchor_key not in self._window_anchor_timestamps:
-                anchor = self._load_column(anchor_key, dtype=np.float64).reshape(-1)
-                if anchor.shape[0] != self.dataset_length:
-                    raise ValueError(
-                        f"anchor timestamp column {anchor_key!r} has {anchor.shape[0]} rows, "
-                        f"expected {self.dataset_length}"
-                    )
-                self._window_anchor_timestamps[anchor_key] = self._timestamp_seconds(anchor)
+            for key in (config.get("anchor_timestamp_key"), config.get("source_timestamp_key")):
+                if key and key not in self._window_anchor_timestamps:
+                    timestamps = self._load_column(key, dtype=np.float64).reshape(-1)
+                    if timestamps.shape[0] != self.dataset_length or not np.isfinite(timestamps).all():
+                        raise ValueError(f"timestamp column {key!r} must contain one finite timestamp per row")
+                    self._window_anchor_timestamps[key] = self._timestamp_seconds(timestamps)
 
         self.lowdim_data = {}
         self.windowed_lowdim_data = {}
+        self._windowed_lowdim_valid_rows = {}
         for key in self.lowdim_keys:
             if key in self.windowed_lowdim_feature_groups:
                 config = self.windowed_lowdim_feature_groups[key]
@@ -325,9 +371,11 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                     "start_offset": start_offset,
                     "pad_mode": config.get("pad_mode", "edge"),
                 }
+                self._windowed_lowdim_valid_rows[key] = np.empty(self.dataset_length, dtype=bool)
                 self.windowed_lowdim_data[key] = self._build_windowed_lowdim(
                     source,
                     self.windowed_lowdim_feature_groups[key],
+                    valid_rows=self._windowed_lowdim_valid_rows[key],
                 )
             else:
                 self.lowdim_data[key] = self._concat_columns(
@@ -549,6 +597,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             episode_mask=self.train_mask,
         )
         self.indices = self._filter_indices_for_windowed_features(self.indices)
+        self.phase_labels = self._build_phase_labels(self.indices)
 
     def _get_hf_dataset(self):
         return None
@@ -581,7 +630,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             return arrays[0].astype(dtype, copy=False)
         return np.concatenate(arrays, axis=-1).astype(dtype, copy=False)
 
-    def _build_windowed_lowdim(self, source: np.ndarray, config: Mapping) -> np.ndarray:
+    def _build_windowed_lowdim(
+        self, source: np.ndarray, config: Mapping, valid_rows: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """Materialize a fixed-rate low-dimensional window for every row.
 
         ``start_offset`` and ``stride`` are expressed in source rows.  Edge
@@ -595,7 +646,12 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         offsets = start_offset + stride * np.arange(steps, dtype=np.int64)
         offsets_sec = config.get("offsets_sec")
         anchor_key = config.get("anchor_timestamp_key")
-        source_timestamps = self._timestamp_seconds(self.timestamps)
+        source_key = config.get("source_timestamp_key")
+        source_timestamps = (
+            self._window_anchor_timestamps[source_key]
+            if source_key
+            else self._timestamp_seconds(self.timestamps)
+        )
         anchor_timestamps = (
             self._window_anchor_timestamps[anchor_key]
             if anchor_key
@@ -614,13 +670,42 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             start = int(episode_range.start)
             end = int(episode_range.stop) - 1
             if offsets_sec is not None:
-                targets = anchor_timestamps[start : end + 1, None] + offsets_sec[None, :]
                 local_source_times = source_timestamps[start : end + 1]
+                local_anchor_times = anchor_timestamps[start : end + 1]
+                if np.any(np.diff(local_source_times) <= 0):
+                    raise ValueError("windowed lowdim source timestamps must increase within each episode")
+                # Preserve subsecond offsets by subtracting one common origin.
+                origin = local_source_times[0]
+                local_source_times = local_source_times - origin
+                local_anchor_times = local_anchor_times - origin
+                # Catch relative/epoch clock mismatches before nearest-neighbor
+                # clipping can silently turn every token into an episode edge.
+                if (
+                    local_anchor_times.max() < local_source_times[0] - 1.0
+                    or local_anchor_times.min() > local_source_times[-1] + 1.0
+                ):
+                    raise ValueError(
+                        "windowed lowdim anchor/source timestamps use different time origins; "
+                        "set source_timestamp_key to the state timestamp column matching "
+                        f"anchor_timestamp_key={anchor_key!r}"
+                    )
+                targets = local_anchor_times[:, None] + offsets_sec[None, :]
                 local_indices = _nearest_indices(local_source_times, targets)
                 indices = local_indices + start
+                # History can be edge-padded; future targets must exist in
+                # the source episode rather than reuse the final force row.
+                valid = (targets <= local_source_times[-1]).all(axis=1)
+                if np.any(offsets_sec > 0):
+                    valid &= (targets >= local_source_times[0]).all(axis=1)
             else:
                 anchors = np.arange(start, end + 1, dtype=np.int64)[:, None]
-                indices = np.clip(anchors + offsets[None, :], start, end)
+                requested_indices = anchors + offsets[None, :]
+                indices = np.clip(requested_indices, start, end)
+                valid = (requested_indices <= end).all(axis=1)
+            warmup = getattr(self, "episode_warmup_steps", 0)
+            valid &= (indices >= start + warmup).all(axis=1)
+            if valid_rows is not None:
+                valid_rows[start : end + 1] = valid
             result[start : end + 1] = source[indices]
         return result
 
@@ -642,23 +727,94 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         return buffer_start + position - sample_start
 
     def _filter_indices_for_windowed_features(self, indices: np.ndarray) -> np.ndarray:
-        positive_margins = []
-        for config in self.windowed_lowdim_feature_groups.values():
-            last_offset = int(config["start_offset"]) + (
-                int(config["steps"]) - 1
-            ) * int(config["stride"])
-            if last_offset > 0:
-                positive_margins.append(last_offset)
-        if not positive_margins or len(indices) == 0:
+        if len(indices) == 0:
             return indices
-        margin = max(positive_margins)
-        keep = []
-        for row in indices:
-            anchor = self._anchor_index_from_sampler_row(row)
-            episode = int(self.episode_index[anchor])
-            episode_end = int(self.episode_ends[episode])
-            keep.append(anchor + margin < episode_end)
-        return indices[np.asarray(keep, dtype=bool)]
+        sequences = self._sequence_indices_from_sampler_rows(indices)
+        observations = sequences[:, : self.n_obs_steps]
+        episodes = self.episode_index[sequences[:, self.anchor_position]]
+        starts = np.r_[0, self.episode_ends[:-1]]
+        keep = (sequences >= starts[episodes, None] + self.episode_warmup_steps).all(axis=1)
+        keep &= self._observation_valid[observations].all(axis=1)
+        for valid_rows in self._windowed_lowdim_valid_rows.values():
+            keep &= valid_rows[observations].all(axis=1)
+        return indices[keep]
+
+    def _phase_magnitude(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+        if values.ndim < 1:
+            raise ValueError("phase values must have at least one dimension")
+        if not self.contact_force_dims:
+            raise ValueError("contact_force_dims cannot be empty")
+        if max(self.contact_force_dims) >= values.shape[-1]:
+            raise ValueError(
+                f"contact_force_dims={self.contact_force_dims} exceed phase dimension "
+                f"{values.shape[-1]}"
+            )
+        force = values[..., list(self.contact_force_dims)]
+        if self.contact_norm == "l1":
+            return np.abs(force).sum(axis=-1)
+        return np.linalg.vector_norm(force, ord=2, axis=-1)
+
+    def _build_phase_labels(self, indices: np.ndarray) -> np.ndarray:
+        """Return 0=free, 1=pre-contact, 2=contact for each sample window.
+
+        A window is contact-relevant when either its observed tau history or
+        its future tau history contains a token above the contact threshold.
+        Remaining anchors in the one-second interval before the first contact
+        timestamp of their episode are marked pre-contact.
+        """
+        if not self.phase_resampling_enabled:
+            return np.zeros((len(indices),), dtype=np.int8)
+        if self.contact_threshold is None:
+            raise ValueError(
+                "phase resampling requires contact_threshold in the dataset config"
+            )
+        if len(indices) == 0:
+            return np.zeros((0,), dtype=np.int8)
+
+        window_contact = np.zeros((self.dataset_length,), dtype=bool)
+        for key in ("tau_ext", "future_tau_ext"):
+            values = self.windowed_lowdim_data.get(key)
+            if values is None:
+                continue
+            window_contact |= np.asarray(
+                self._phase_magnitude(values) > self.contact_threshold
+            ).any(axis=1)
+
+        source = self._phase_source_data
+        if source is None:
+            source = self._load_column(self.phase_source_key, dtype=np.float32)
+        frame_contact = self._phase_magnitude(source) > self.contact_threshold
+        timestamps = self._timestamp_seconds(self.timestamps)
+        contact_onset = np.full((len(self.episode_ranges),), np.nan, dtype=np.float64)
+        for episode_idx, episode_range in enumerate(self.episode_ranges):
+            local = frame_contact[episode_range.start : episode_range.stop]
+            contact_indices = np.flatnonzero(local)
+            if contact_indices.size:
+                contact_onset[episode_idx] = timestamps[
+                    episode_range.start + int(contact_indices[0])
+                ]
+
+        anchors = np.asarray(
+            [self._anchor_index_from_sampler_row(row) for row in indices],
+            dtype=np.int64,
+        )
+        episodes = self.episode_index[anchors]
+        anchor_timestamps = timestamps[anchors]
+        labels = np.zeros((len(indices),), dtype=np.int8)
+        labels[window_contact[anchors]] = 2
+        precontact = np.zeros_like(labels, dtype=bool)
+        for episode_idx, onset in enumerate(contact_onset):
+            if not np.isfinite(onset):
+                continue
+            in_window = episodes == episode_idx
+            precontact |= (
+                in_window
+                & (anchor_timestamps >= onset - self.precontact_seconds)
+                & (anchor_timestamps < onset)
+            )
+        labels[(labels == 0) & precontact] = 1
+        return labels
 
     def _validate_action_shape(self, expected_action_shape: Sequence[int]) -> None:
         expected_action_shape = tuple(expected_action_shape)
@@ -815,27 +971,38 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 sequence_indices[position] = buffer_start_idx + (position - sample_start_idx)
         return sequence_indices
 
-    def _retime_sequence_indices(self, sequence_indices: np.ndarray) -> np.ndarray:
-        anchor_global_idx = int(sequence_indices[self.anchor_position])
-        anchor_episode_idx = int(self.episode_index[anchor_global_idx])
-        episode_range = self.episode_ranges[anchor_episode_idx]
-        episode_timestamps = self.timestamps[episode_range.start : episode_range.stop]
-        anchor_timestamp = float(self.timestamps[anchor_global_idx])
-        step_sec = self.episode_step_sec[anchor_episode_idx]
+    def _sequence_indices_from_sampler_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Resolve the same rows as __getitem__, in batches for filtering."""
+        sequences = rows[:, :1] + np.arange(self.sequence_length)[None, :] - rows[:, 2:3]
+        sequences = np.clip(sequences, rows[:, :1], rows[:, 1:2] - 1)
+        if self.window_sampling_strategy == "timestamp":
+            sequences = self._retime_anchor_indices(sequences[:, self.anchor_position])
+        return sequences.astype(np.int64, copy=False)
 
-        target_timestamps = anchor_timestamp + (
-            np.arange(self.sequence_length, dtype=np.float64) - self.anchor_position
-        ) * step_sec
-        episode_local_indices = _nearest_indices(episode_timestamps, target_timestamps)
-        if self.timestamp_tolerance_sec is not None:
-            deltas = np.abs(episode_timestamps[episode_local_indices] - target_timestamps)
-            nearest_edge = np.where(target_timestamps <= episode_timestamps[0], 0, len(episode_timestamps) - 1)
-            episode_local_indices = np.where(
-                deltas <= self.timestamp_tolerance_sec,
-                episode_local_indices,
-                nearest_edge,
+    def _retime_sequence_indices(self, sequence_indices: np.ndarray) -> np.ndarray:
+        anchors = np.asarray([sequence_indices[self.anchor_position]], dtype=np.int64)
+        return self._retime_anchor_indices(anchors)[0]
+
+    def _retime_anchor_indices(self, anchors: np.ndarray) -> np.ndarray:
+        episodes = self.episode_index[anchors]
+        result = np.empty((len(anchors), self.sequence_length), dtype=np.int64)
+        offsets = np.arange(self.sequence_length, dtype=np.float64) - self.anchor_position
+        for episode in np.unique(episodes):
+            selected = episodes == episode
+            episode_range = self.episode_ranges[episode]
+            times = self.timestamps[episode_range.start : episode_range.stop]
+            targets = self.timestamps[anchors[selected], None] + (
+                offsets[None, :] * self.episode_step_sec[episode]
             )
-        return episode_range.start + episode_local_indices.astype(np.int64)
+            local_indices = _nearest_indices(times, targets)
+            if self.timestamp_tolerance_sec is not None:
+                deltas = np.abs(times[local_indices] - targets)
+                nearest_edge = np.where(targets <= times[0], 0, len(times) - 1)
+                local_indices = np.where(
+                    deltas <= self.timestamp_tolerance_sec, local_indices, nearest_edge
+                )
+            result[selected] = episode_range.start + local_indices
+        return result
 
     def _load_frame_feature(
         self,
@@ -899,12 +1066,23 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             return images
     
         augmented_images = []
+        shared_seed = None
+        if self.image_randomer_shared:
+            # Draw one seed for this observation window.  Replaying it inside
+            # a forked RNG makes every frame and camera receive the same
+            # spatial/photometric transform without perturbing DataLoader RNG.
+            shared_seed = int(torch.empty((), dtype=torch.int64).random_().item())
         for image_chw in images:
             image_hwc = np.transpose(image_chw, (1, 2, 0))
             image_hwc = np.clip(image_hwc * 255.0, 0, 255).astype(np.uint8)
             image_pil = Image.fromarray(image_hwc)
     
-            augmented = self.image_randomer(image_pil)
+            if shared_seed is None:
+                augmented = self.image_randomer(image_pil)
+            else:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(shared_seed)
+                    augmented = self.image_randomer(image_pil)
             if torch.is_tensor(augmented):
                 augmented = augmented.detach().cpu().numpy()
             augmented = np.asarray(augmented, dtype=np.float32)
@@ -923,17 +1101,37 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             episode_mask=self.val_mask,
         )
         val_set.indices = val_set._filter_indices_for_windowed_features(val_set.indices)
+        val_set.phase_labels = val_set._build_phase_labels(val_set.indices)
         val_set.image_randomer = None
         val_set.image_randomer_config = None
+        val_set.image_randomer_shared = False
         return val_set
+
+    def get_phase_labels(self) -> np.ndarray:
+        """Return phase labels aligned with dataset indices.
+
+        Labels are 0=free, 1=pre-contact, and 2=contact.
+        """
+        return np.asarray(self.phase_labels, dtype=np.int8).copy()
 
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        if len(self.indices) == 0:
+            raise ValueError("Cannot fit a normalizer without valid training windows")
+        sequences = self._sequence_indices_from_sampler_rows(self.indices)
+        observation_rows = np.unique(sequences[:, : self.n_obs_steps])
+        if self.action_layout == "per_step":
+            actions = self.action_data[np.unique(sequences[:, self.n_latency_steps :])]
+        else:
+            anchors = np.unique(sequences[:, self.anchor_position])
+            actions = self.action_data[
+                anchors, self.n_latency_steps : self.n_latency_steps + self.horizon
+            ]
         normalizer = LinearNormalizer()
-        normalizer["action"] = SingleFieldLinearNormalizer.create_fit(self.action_data,**kwargs)
+        normalizer["action"] = SingleFieldLinearNormalizer.create_fit(actions, **kwargs)
         for key in self.lowdim_keys:
             values = self.windowed_lowdim_data.get(key, self.lowdim_data.get(key))
-            normalizer[key] = SingleFieldLinearNormalizer.create_fit(values,**kwargs)
+            normalizer[key] = SingleFieldLinearNormalizer.create_fit(values[observation_rows], **kwargs)
         for key in self.rgb_keys:
             normalizer[key] = get_image_range_normalizer() 
         return normalizer

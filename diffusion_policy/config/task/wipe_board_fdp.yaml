@@ -67,6 +67,7 @@ dataset:
   load_result_add: ram
 
   image_randomer_config:
+    shared_across_sequence: true
     resize: false
     random_crop: false
     rotation: false

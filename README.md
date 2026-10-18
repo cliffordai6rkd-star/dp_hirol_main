@@ -282,6 +282,69 @@ FDP 使用未归一化、物理单位下的七轴 `tau_ext` 绝对值之和（L1
 
 `future_tau_ext` 与未来 `[+40, +320] ms` 的 `future_wrench` 对齐，用于定位未来窗口中的第一个接触 token。如果当前仍是 free 但未来窗口会接触，接触前的 wrench token 使用第一个接触时刻的 6D wrench 向量填充，后续 token 保留原始未来 wrench；未来窗口没有接触时整段置零。
 
+未来窗口使用 `anchor_timestamp_key: timing.camera_timestamp_ns` 和
+`source_timestamp_key: timing.state_timestamp_ns`，按同一绝对时间轴查找最近的状态行。
+普通动作序列继续使用 episode 内的相对 `timestamp`，间隔为 40 ms。
+混用相对时间与绝对时间会报错；超出 episode 时间范围的未来窗口会被过滤。
+
+USB 数据集配置 `episode_warmup_steps: 49`，排除每集固定的零力前缀。
+过滤会检查每张观测对应的完整力历史与未来窗口，因此当前配置最早可用的
+anchor 是 frame_index 58（1.16 s）；后续真实的零力样本仍可训练。
+`observation_validity_key: timing.camera_valid` 同时过滤观测中包含无效相机行的
+窗口，训练集和验证集采用相同规则。Normalizer 仅在有效训练窗口实际使用的
+数据行上拟合。由错误时间采样训练得到的权重需要重新训练。
+
+### USB token baselines
+
+两个对照配置位于 `diffusion_policy/config/baseline_train/`，继承 USB 的数据筛选、
+训练/验证划分、阶段采样、ee_pose 动作目标、DiT、EMA 和 200,000 次 optimizer update。
+它们均关闭图像遮蔽课程：
+
+| 配置 | 输入与融合 |
+| --- | --- |
+| `train_dp_dinobase_insert_usb` | 双相机全部 DINO patch token 直接作为 DiT context，模型前向只读取图像 |
+| `train_dp_selfattn_insert_usb` | 图像 patch token 与直接线性投影的未来 wrench token 拼接，再做 joint self-attention |
+
+192×256 图像、双相机、两帧观测下，context 分别为 768 和 784 个 token。
+selfattn baseline 不使用 GRU、接触门控或接触前 wrench 填充。
+纯图像 baseline 保留数据侧的阶段采样以使用相同样本分布，但模型预测不依赖力数据。
+两个配置沿用 WandB、验证动作 MSE 和 output 下的 `val_loss.png`。
+
+```bash
+python train.py --config-name baseline_train/train_dp_dinobase_insert_usb
+python train.py --config-name baseline_train/train_dp_selfattn_insert_usb
+```
+
+正在跑 USB 训练时，可在另一个终端排队运行，脚本会自动识别训练主进程并等待，
+然后按 dinobase → selfattn 顺序启动新的训练：
+
+```bash
+bash scripts/train_usb_baselines_after_current.sh
+# 只检查等待对象和命令，不训练：
+bash scripts/train_usb_baselines_after_current.sh --dry-run
+# 也可以指定 PID、解释器和两个任务共同采用的 Hydra override：
+bash scripts/train_usb_baselines_after_current.sh --wait-pid 12345 \
+  --python /path/to/env/bin/python -- training.device=cuda:0
+```
+
+队列日志、`status.txt` 和 `exit_codes.tsv` 位于 `data/outputs/baseline_queue/`；
+模型输出按配置名分别保存在普通 Hydra output 目录。等待逻辑检查进程启动时间，
+避免 PID 复用；文件锁避免重复启动同一个队列。第一个 baseline 若失败，仍会尝试
+第二个并记录各自退出码。排队脚本不会向正在等待的原训练进程发送信号。
+
+### FIRST 阶段重采样
+
+`train_dp_insert_usb_force_aware` 默认启用三阶段训练重采样：窗口内的
+`tau_ext` 历史或 `future_tau_ext` 只要出现接触 token，就标记为 contact-relevant；
+其余位于 episode 首次接触前 1 秒内的 anchor 标记为 pre-contact，其他样本标记为
+free。训练采样权重默认为：
+
+```text
+free : pre-contact : contact = 1 : 5 : 2
+```
+
+权重按阶段池归一化后进行有放回采样，因此该比例表示期望采样概率；验证集仍保持原始分布。
+
 仅在训练阶段执行视觉 mask；验证和推理始终使用完整图像。支持两种范围：
 
 ```text
@@ -317,7 +380,26 @@ conda activate /opt/lcx/conda/envs/dp
 conda env update -p "$CONDA_PREFIX" -f conda_environment.yaml
 ```
 
-`setup.py` 是项目元数据和依赖的唯一来源；`pyproject.toml` 只定义 PEP 517 构建后端和 pytest 配置。
+当前 RTX 5090/Blackwell 训练栈固定为 Python 3.10、PyTorch 2.7.1 和
+TorchVision 0.22.1 的 CUDA 12.8 wheel。视频解码使用 TorchCodec 0.5 的
+CUDA 12.8 wheel，并额外安装 `nvidia-npp-cu12` 提供
+`libnppicc.so.12`。如果环境是手动创建的，请从仓库根目录补齐这组 CUDA 依赖：
+
+```bash
+python -m pip install --upgrade \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
+  torchcodec==0.5+cu128 nvidia-npp-cu12==12.4.1.87
+python -m pip install --upgrade "wandb>=0.20,<0.22"
+
+# Make libnppicc.so.12 visible to TorchCodec in pip/Conda environments.
+NPP_LIB=$(find "$CONDA_PREFIX" -type f -name 'libnppicc.so*' -printf '%h\n' | head -n 1)
+export LD_LIBRARY_PATH="$NPP_LIB:${LD_LIBRARY_PATH:-}"
+```
+
+`setup.py` 声明跨安装方式的包依赖范围；CUDA 12.8 训练栈的可复现版本位于
+`requirements/uv-common-py310-lerobot.txt`、`conda_environment.yaml` 和
+`docker/Dockerfile`。`pyproject.toml` 只定义 PEP 517 构建后端和 pytest 配置。
 
 ## DINOv3 权重
 

@@ -6,7 +6,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        CUDA_VERSION: ${CUDA_VERSION:-12.6.3}
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.1}
         APT_MIRROR: ${APT_MIRROR:-archive.ubuntu.com}
     image: diffusion-policy:train
     container_name: diffusion-policy-trainer
@@ -28,7 +28,7 @@ services:
       MPLCONFIGDIR: /tmp/matplotlib
       HF_HOME: /workspace/.cache/huggingface
       DP_DATASET_PATH: /workspace/data/insert_usb_50hz_lerobot_v3
-      DINOV3_MODEL_PATH: /workspace/model/dinov3-vitb16-pretrain-lvd1689m
+      DINOV3_MODEL_PATH: /workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
       CONFIG_NAME: ${CONFIG_NAME:-train_dp_insert_usb_force_aware}
       NPROC_PER_NODE: ${NPROC_PER_NODE:-}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
@@ -38,7 +38,7 @@ services:
       # These two paths can point outside the repository when the dataset or
       # DINOv3 weights are stored on a shared server volume.
       - ${DP_DATASET_DIR:-../data}:/workspace/data
-      - ${DINOV3_MODEL_DIR:-../model/dinov3-vitb16-pretrain-lvd1689m}:/workspace/model/dinov3-vitb16-pretrain-lvd1689m:ro
+      - ${DINOV3_MODEL_DIR:-../model/model/dinov3-vitb16-pretrain-lvd1689m}:/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m:ro
     deploy:
       resources:
         reservations:

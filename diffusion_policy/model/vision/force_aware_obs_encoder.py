@@ -25,6 +25,7 @@ class ForceAwareObsEncoder(nn.Module):
         image_mean: Sequence[float] = (0.485, 0.456, 0.406),
         image_std: Sequence[float] = (0.229, 0.224, 0.225),
         image_keys: Optional[Sequence[str]] = None,
+        camera_attention_mode: str = "joint",
         backbone: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -38,6 +39,10 @@ class ForceAwareObsEncoder(nn.Module):
             )
         if force_encoder_layers < 0:
             raise ValueError("force_encoder_layers must be non-negative")
+        if camera_attention_mode not in {"joint", "per_camera"}:
+            raise ValueError(
+                "camera_attention_mode must be 'joint' or 'per_camera'"
+            )
 
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.n_emb = int(n_emb)
@@ -46,6 +51,7 @@ class ForceAwareObsEncoder(nn.Module):
         self.freeze_backbone = bool(freeze_backbone)
         self.force_temporal_encoder_type = force_temporal_encoder
         self.image_keys = tuple(sorted(str(key) for key in (image_keys or ())))
+        self.camera_attention_mode = str(camera_attention_mode)
         if len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must not contain duplicates")
 
@@ -131,6 +137,25 @@ class ForceAwareObsEncoder(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
+        if self.camera_attention_mode == "per_camera" and len(self.image_keys) > 1:
+            # Each camera gets its own wrench-to-image attention distribution.
+            # Initialize fusion as an average so the new block starts with a
+            # well-scaled representation and can learn camera-specific weights.
+            self.camera_fusion = nn.Linear(
+                self.n_emb * len(self.image_keys), self.n_emb
+            )
+            with torch.no_grad():
+                self.camera_fusion.weight.zero_()
+                identity = torch.eye(self.n_emb)
+                for camera_index in range(len(self.image_keys)):
+                    start = camera_index * self.n_emb
+                    end = start + self.n_emb
+                    self.camera_fusion.weight[:, start:end].copy_(
+                        identity / len(self.image_keys)
+                    )
+                self.camera_fusion.bias.zero_()
+        else:
+            self.camera_fusion = nn.Identity()
         self.cross_dropout = nn.Dropout(dropout)
         self.cross_output_norm = nn.LayerNorm(self.n_emb)
         self.cross_ffn = nn.Sequential(
@@ -141,6 +166,12 @@ class ForceAwareObsEncoder(nn.Module):
             nn.Dropout(dropout),
         )
         self.context_norm = nn.LayerNorm(self.n_emb)
+        # Attention weights are disabled by default because returning them
+        # allocates [batch, heads, force_tokens, image_patches] tensors.  The
+        # episode visualization utility enables this flag for inference.
+        self.capture_cross_attention = False
+        self.last_cross_attention_weights = None
+        self.last_cross_attention_weights_by_camera = None
 
         self.register_buffer(
             "image_mean",
@@ -174,6 +205,13 @@ class ForceAwareObsEncoder(nn.Module):
         if self.freeze_backbone:
             self.backbone.requires_grad_(False)
             self.backbone.eval()
+
+    def set_attention_capture(self, enabled: bool = True) -> None:
+        """Enable or disable storing the latest force-to-image attention."""
+        self.capture_cross_attention = bool(enabled)
+        if not self.capture_cross_attention:
+            self.last_cross_attention_weights = None
+            self.last_cross_attention_weights_by_camera = None
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -334,9 +372,6 @@ class ForceAwareObsEncoder(nn.Module):
                 patch_image = torch.where(mask, mask_token, patch_image)
             camera_patch_tokens.append(patch_image)
 
-        patch_image = torch.cat(camera_patch_tokens, dim=2)
-        patch_count = patch_image.shape[2]
-
         force = self.wrench_projection(wrench_history)
         force = (
             force
@@ -349,15 +384,53 @@ class ForceAwareObsEncoder(nn.Module):
             flat_force, _ = self.force_encoder(flat_force)
         else:
             flat_force = self.force_encoder(flat_force)
-        flat_patches = patch_image.reshape(
-            batch_size * obs_steps, patch_count, self.n_emb
-        )
-        attended, _ = self.cross_attention(
-            query=self.force_norm(flat_force),
-            key=self.image_norm(flat_patches),
-            value=flat_patches,
-            need_weights=False,
-        )
+        query = self.force_norm(flat_force)
+        if self.camera_attention_mode == "joint":
+            patch_image = torch.cat(camera_patch_tokens, dim=2)
+            patch_count = patch_image.shape[2]
+            flat_patches = patch_image.reshape(
+                batch_size * obs_steps, patch_count, self.n_emb
+            )
+            attended, attention_weights = self.cross_attention(
+                query=query,
+                key=self.image_norm(flat_patches),
+                value=flat_patches,
+                need_weights=self.capture_cross_attention,
+                average_attn_weights=False,
+            )
+            if self.capture_cross_attention:
+                self.last_cross_attention_weights = attention_weights.detach()
+            else:
+                self.last_cross_attention_weights = None
+            self.last_cross_attention_weights_by_camera = None
+        else:
+            attended_by_camera = []
+            captured_by_camera = {}
+            for key in image_keys:
+                camera_patches = encoded_camera_patches[key]
+                camera_patches = camera_patches.reshape(
+                    batch_size * obs_steps, camera_patches.shape[2], self.n_emb
+                )
+                attended_camera, attention_camera = self.cross_attention(
+                    query=query,
+                    key=self.image_norm(camera_patches),
+                    value=camera_patches,
+                    need_weights=self.capture_cross_attention,
+                    average_attn_weights=False,
+                )
+                attended_by_camera.append(attended_camera)
+                if self.capture_cross_attention:
+                    captured_by_camera[key] = attention_camera.detach()
+
+            attended = self.camera_fusion(
+                torch.cat(attended_by_camera, dim=-1)
+            )
+            if self.capture_cross_attention:
+                self.last_cross_attention_weights = captured_by_camera
+                self.last_cross_attention_weights_by_camera = captured_by_camera
+            else:
+                self.last_cross_attention_weights = None
+                self.last_cross_attention_weights_by_camera = None
         fused_force = flat_force + self.cross_dropout(attended)
         fused_force = fused_force + self.cross_ffn(self.cross_output_norm(fused_force))
         fused_force = fused_force.reshape(

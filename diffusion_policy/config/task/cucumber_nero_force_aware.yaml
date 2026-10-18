@@ -1,0 +1,122 @@
+name: cucumber_nero_force_aware
+
+# tau_ext determines the causal contact phase; the six-dimensional wrench is
+# the signal supplied to the force/image cross-attention.
+# future_tau_ext locates the first future contact.  If it appears after a free
+# prefix, that prefix is filled with the first contact wrench vector.
+wrench_key: future_wrench
+phase_wrench_key: tau_ext
+future_phase_wrench_key: future_tau_ext
+wrench_history_steps: &wrench_history_steps 8
+future_wrench_steps: &future_wrench_steps 8
+future_wrench_start_offset: 2   # 2 x 20 ms: first future sample is +40 ms
+future_wrench_stride: 2         # source wrench is 50 Hz, token grid is 25 Hz
+phase_wrench_steps: &phase_wrench_steps 8
+phase_wrench_stride: 1           # preserve the 50 Hz tau_ext history for gating
+free_threshold: 0.65
+contact_threshold: 1.5
+contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
+contact_history_reducer: max
+contact_norm: l1
+phase_source_key: observation.tau_ext
+input_gate_enabled: false
+relative_pose_actions: false
+action_reference_key: action_reference
+
+image_shape: &image_shape [3, 192, 256]
+shape_meta: &shape_meta
+  obs:
+    wrist:
+      shape: *image_shape
+      type: rgb
+    side:
+      shape: *image_shape
+      type: rgb
+    tau_ext:
+      shape: [*phase_wrench_steps, 7]
+      type: low_dim
+    future_wrench:
+      shape: [*future_wrench_steps, 6]
+      type: low_dim
+    future_tau_ext:
+      shape: [*future_wrench_steps, 7]
+      type: low_dim
+  action:
+    shape: [7]
+
+env_runner: null
+
+normalizer:
+  mode: gaussian
+  last_n_dims: 1
+
+dataset:
+  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  shape_meta: *shape_meta
+  dataset_path: ${dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: 0
+  n_obs_steps: ${n_obs_steps}
+  n_latency_steps: 0
+  seed: ${training.seed}
+  val_ratio: 0.1
+  window_sampling_strategy: timestamp
+  image_feature_map:
+    wrist: observation.images.wrist
+    side: observation.images.side
+  windowed_lowdim_feature_groups:
+    tau_ext:
+      source_key: observation.tau_ext
+      steps: ${task.phase_wrench_steps}
+      start_offset: -7
+      stride: ${task.phase_wrench_stride}
+    future_wrench:
+      source_key: observation.wrench
+      steps: ${task.future_wrench_steps}
+      start_offset: ${task.future_wrench_start_offset}
+      stride: ${task.future_wrench_stride}
+      # The camera timestamp is the anchor.  The source wrench is sampled at
+      # the nearest 50 Hz row, so these are +40 ... +320 ms in camera time.
+      anchor_timestamp_key: timing.camera_timestamp_ns
+      source_timestamp_key: timing.state_timestamp_ns
+      offsets_sec: [0.04, 0.08, 0.12, 0.16, 0.20, 0.24, 0.28, 0.32]
+    future_tau_ext:
+      source_key: observation.tau_ext
+      steps: ${task.future_wrench_steps}
+      start_offset: ${task.future_wrench_start_offset}
+      stride: ${task.future_wrench_stride}
+      anchor_timestamp_key: timing.camera_timestamp_ns
+      source_timestamp_key: timing.state_timestamp_ns
+      offsets_sec: [0.04, 0.08, 0.12, 0.16, 0.20, 0.24, 0.28, 0.32]
+  action_feature_fields:
+    - observation.ee_pose
+  action_layout: per_step
+  relative_pose_actions: ${task.relative_pose_actions}
+  timestamp_key: timestamp
+  timestamp_step_sec: 0.04
+  timestamp_tolerance_sec: null
+  local_files_only: true
+  video_backend: null
+  video_decode_device: auto
+  preload_images: true
+  load_result_add: ram
+  image_cache_dtype: uint8
+  image_cache_chunk_frames: 64
+  phase_resampling_enabled: ${oc.select:phase_resampling.enabled,false}
+  phase_source_key: ${task.phase_source_key}
+  contact_threshold: ${contact_threshold}
+  contact_force_dims: ${task.contact_force_dims}
+  contact_norm: ${contact_norm}
+  precontact_seconds: ${oc.select:phase_resampling.precontact_seconds,1.0}
+  image_randomer_config:
+    shared_across_sequence: true
+    resize: false
+    random_crop: false
+    rotation: false
+    color_jitter: true
+    color_jitter_params:
+      brightness: 0.1
+      contrast: 0.15
+      saturation: 0.1
+      hue: 0.03

@@ -61,7 +61,12 @@ class FakeDinoBackbone(nn.Module):
         )
 
 
-def make_obs_encoder(n_emb=16, temporal_encoder="gru", image_keys=None):
+def make_obs_encoder(
+    n_emb=16,
+    temporal_encoder="gru",
+    image_keys=None,
+    camera_attention_mode="joint",
+):
     return ForceAwareObsEncoder(
         pretrained_model_name_or_path="unused",
         n_emb=n_emb,
@@ -74,16 +79,18 @@ def make_obs_encoder(n_emb=16, temporal_encoder="gru", image_keys=None):
         dropout=0.0,
         freeze_backbone=True,
         image_keys=image_keys,
+        camera_attention_mode=camera_attention_mode,
         backbone=FakeDinoBackbone(hidden_size=12),
     )
 
 
-def make_normalizer():
+def make_normalizer(wrench_keys=("wrench_ext",)):
     normalizer = LinearNormalizer()
-    normalizer["wrench_ext"] = SingleFieldLinearNormalizer.create_fit(
-        torch.linspace(-20.0, 20.0, 600).reshape(100, 6),
-        last_n_dims=1,
-    )
+    for wrench_key in wrench_keys:
+        normalizer[wrench_key] = SingleFieldLinearNormalizer.create_fit(
+            torch.linspace(-20.0, 20.0, 600).reshape(100, 6),
+            last_n_dims=1,
+        )
     normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
         torch.linspace(-2.0, 2.0, 700).reshape(100, 7),
         last_n_dims=1,
@@ -95,6 +102,7 @@ def make_policy(
     mask_scope="full_context",
     relative_pose_actions=False,
     image_keys=("wrist",),
+    future_phase=False,
 ):
     encoder = make_obs_encoder(image_keys=image_keys)
     expert = ContextTransformerForDiffusion(
@@ -114,26 +122,44 @@ def make_policy(
         prediction_type="epsilon",
         clip_sample=True,
     )
+    obs_meta = {
+        **{
+            key: {"shape": [3, 16, 16], "type": "rgb"}
+            for key in image_keys
+        },
+        "wrench_ext": {"shape": [8, 6], "type": "low_dim"},
+    }
+    policy_kwargs = {"wrench_key": "wrench_ext"}
+    if future_phase:
+        obs_meta = {
+            **{
+                key: {"shape": [3, 16, 16], "type": "rgb"}
+                for key in image_keys
+            },
+            "tau_ext": {"shape": [8, 7], "type": "low_dim"},
+            "future_wrench": {"shape": [8, 6], "type": "low_dim"},
+            "future_tau_ext": {"shape": [8, 7], "type": "low_dim"},
+        }
+        policy_kwargs = {
+            "wrench_key": "future_wrench",
+            "phase_wrench_key": "tau_ext",
+            "future_phase_wrench_key": "future_tau_ext",
+            "free_threshold": 1.0,
+        }
+    policy_contact_threshold = 2.0 if future_phase else 5.0
     policy = ForceAwareDiffusionTransformerPolicy(
         shape_meta={
-            "obs": {
-                **{
-                    key: {"shape": [3, 16, 16], "type": "rgb"}
-                    for key in image_keys
-                },
-                "wrench_ext": {"shape": [8, 6], "type": "low_dim"},
-            },
+            "obs": obs_meta,
             "action": {"shape": [7]},
         },
         noise_scheduler=scheduler,
         horizon=9,
         n_action_steps=8,
         n_obs_steps=2,
-        wrench_key="wrench_ext",
         relative_pose_actions=relative_pose_actions,
         num_inference_steps=2,
         n_emb=16,
-        contact_threshold=5.0,
+        contact_threshold=policy_contact_threshold,
         image_mask_scope=mask_scope,
         mask_schedule={
             "schedule_type": "cosine",
@@ -144,8 +170,11 @@ def make_policy(
         },
         obs_encoder=encoder,
         action_expert=expert,
+        **policy_kwargs,
     )
-    policy.set_normalizer(make_normalizer())
+    policy.set_normalizer(
+        make_normalizer(("wrench_ext", "future_wrench") if future_phase else ("wrench_ext",))
+    )
     return policy
 
 
@@ -330,6 +359,33 @@ def test_force_encoder_groups_cameras_with_different_resolutions():
     assert context.shape == (1, 16, 16)
 
 
+def test_force_encoder_per_camera_attention_has_independent_softmaxes():
+    encoder = make_obs_encoder(
+        image_keys=("wrist", "side"),
+        camera_attention_mode="per_camera",
+    )
+    encoder.set_attention_capture(True)
+    context = encoder(
+        images={
+            "wrist": torch.rand(1, 2, 3, 16, 16),
+            "side": torch.rand(1, 2, 3, 16, 16),
+        },
+        wrench_history=torch.randn(1, 2, 8, 6),
+    )
+
+    assert context.shape == (1, 16, 16)
+    assert set(encoder.last_cross_attention_weights) == {"side", "wrist"}
+    for weights in encoder.last_cross_attention_weights.values():
+        assert weights.shape == (2, 4, 8, 6)
+        assert torch.allclose(
+            weights.sum(dim=-1),
+            torch.ones(2, 4, 8),
+            atol=1e-5,
+        )
+    context.sum().backward()
+    assert encoder.camera_fusion.weight.grad is not None
+
+
 def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():
     policy = make_policy(image_keys=("wrist", "side"))
     assert "input_gate.threshold" in policy.state_dict()
@@ -397,6 +453,30 @@ def test_policy_loss_masks_training_contact_and_backpropagates():
     assert all(
         parameter.grad is None for parameter in policy.obs_encoder.backbone.parameters()
     )
+
+
+def test_policy_masking_uses_future_contact_for_future_phase_windows():
+    policy = make_policy(future_phase=True)
+    policy.train()
+    batch = {
+        "obs": {
+            "wrist": torch.rand(2, 2, 3, 16, 16),
+            "tau_ext": torch.zeros(2, 2, 8, 7),
+            "future_wrench": torch.zeros(2, 2, 8, 6),
+            "future_tau_ext": torch.zeros(2, 2, 8, 7),
+        },
+        "action": torch.randn(2, 9, 7),
+    }
+    # Both observations in the first sample are currently free, but their
+    # future window reaches contact.  The second sample remains free.
+    batch["obs"]["future_tau_ext"][0, :, :, 0] = 3.0
+    loss = policy.compute_loss(batch, optimizer_step=0)
+
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    assert policy.last_curriculum_metrics["curriculum/contact_fraction"] == pytest.approx(0.0)
+    assert policy.last_curriculum_metrics["curriculum/future_contact_fraction"] == pytest.approx(0.5)
+    # full_context masks both observation images for only the first sample.
+    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == pytest.approx(0.5)
 
 
 def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
