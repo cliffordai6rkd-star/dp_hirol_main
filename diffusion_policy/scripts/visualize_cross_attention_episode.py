@@ -57,10 +57,14 @@ from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Render cross-attention heatmaps for one force-aware DP episode."
-    )
+def parse_args(
+    argv=None,
+    *,
+    description="Render cross-attention heatmaps for one force-aware DP episode.",
+    output_prefix="attention",
+    query_help="Average all force-history queries or use only the latest query token.",
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
     checkpoint_group = parser.add_mutually_exclusive_group(required=True)
     checkpoint_group.add_argument(
         "--checkpoint",
@@ -94,7 +98,10 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=pathlib.Path,
         default=None,
-        help="Output MP4 path. Defaults beside the checkpoint directory as attention_episode_<N>.mp4.",
+        help=(
+            "Output MP4 path. Defaults beside the checkpoint directory as "
+            f"{output_prefix}_episode_<N>.mp4."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -126,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         "--attention-query",
         choices=("all", "last"),
         default="all",
-        help="Average all force-history queries or use only the latest query token.",
+        help=query_help,
     )
     parser.add_argument(
         "--attention-normalization",
@@ -148,7 +155,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also save individual heatmap PNGs beside the MP4.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def choose_checkpoint(
@@ -205,7 +212,7 @@ def resolve_device(requested: Optional[str], cfg) -> torch.device:
     return device
 
 
-def instantiate_policy(payload, cfg, device: torch.device):
+def instantiate_policy(payload, cfg, device: torch.device, *, capture_attention=True):
     policy: ForceAwareDiffusionTransformerPolicy = hydra.utils.instantiate(cfg.policy)
     state_dicts = payload.get("state_dicts", {})
     state_key = "ema_model" if "ema_model" in state_dicts else "model"
@@ -218,7 +225,8 @@ def instantiate_policy(payload, cfg, device: torch.device):
         policy.set_optimizer_step(int(dill.loads(pickles["optimizer_step"])))
     policy.to(device)
     policy.eval()
-    policy.obs_encoder.set_attention_capture(True)
+    if capture_attention:
+        policy.obs_encoder.set_attention_capture(True)
     return policy
 
 
@@ -334,6 +342,9 @@ def overlay_attention(
         (image.shape[1], image.shape[0]),
         interpolation=cv2.INTER_CUBIC,
     )
+    # Cubic interpolation can overshoot [0, 1]; uint8 conversion would wrap
+    # those values and turn peaks into false low-attention colors (and vice versa).
+    attention = np.clip(attention, 0.0, 1.0)
     color = cv2.applyColorMap(np.uint8(attention * 255.0), cv2.COLORMAP_JET)
     color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
     blended = np.clip(
@@ -573,11 +584,23 @@ class FFmpegVideoWriter:
             )
 
 
-def run(args: argparse.Namespace) -> pathlib.Path:
+def run(
+    args: argparse.Namespace,
+    *,
+    capture_factory=None,
+    output_prefix="attention",
+) -> pathlib.Path:
     checkpoint_path = choose_checkpoint(args.checkpoint, args.checkpoint_dir)
     payload, cfg = load_checkpoint_payload(checkpoint_path)
     device = resolve_device(args.device, cfg)
-    policy = instantiate_policy(payload, cfg, device)
+    policy = instantiate_policy(
+        payload, cfg, device, capture_attention=capture_factory is None
+    )
+    capture_context = (
+        capture_factory(policy, query_mode=args.attention_query)
+        if capture_factory is not None
+        else contextlib.nullcontext()
+    )
     dataset = instantiate_episode_dataset(
         cfg,
         args.dataset_path,
@@ -594,7 +617,7 @@ def run(args: argparse.Namespace) -> pathlib.Path:
         args.output.expanduser().resolve()
         if args.output is not None
         else checkpoint_path.parent.parent.joinpath(
-            f"attention_episode_{args.episode}.mp4"
+            f"{output_prefix}_episode_{args.episode}.mp4"
         )
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,7 +659,9 @@ def run(args: argparse.Namespace) -> pathlib.Path:
 
     writer = None
     frame_count = 0
+    capture_stack = contextlib.ExitStack()
     try:
+        capture = capture_stack.enter_context(capture_context)
         records = []
         for anchor, sample_index in selected:
             sample = dataset[sample_index]
@@ -647,14 +672,17 @@ def run(args: argparse.Namespace) -> pathlib.Path:
             with torch.inference_mode(), autocast_context():
                 policy.predict_action(obs, generator=generator)
 
-            attention = attention_by_camera(
-                policy.obs_encoder.last_cross_attention_weights_by_camera
-                if policy.obs_encoder.last_cross_attention_weights_by_camera is not None
-                else policy.obs_encoder.last_cross_attention_weights,
-                policy,
-                obs_step=-1,
-                query_mode=args.attention_query,
-            )
+            if capture is not None:
+                attention = capture.attention_by_camera()
+            else:
+                attention = attention_by_camera(
+                    policy.obs_encoder.last_cross_attention_weights_by_camera
+                    if policy.obs_encoder.last_cross_attention_weights_by_camera is not None
+                    else policy.obs_encoder.last_cross_attention_weights,
+                    policy,
+                    obs_step=-1,
+                    query_mode=args.attention_query,
+                )
             camera_records = []
             tau = sample["obs"].get("tau_ext")
             tau_value = float(tau[-1].abs().sum()) if tau is not None else float("nan")
@@ -728,9 +756,12 @@ def run(args: argparse.Namespace) -> pathlib.Path:
                     frame_bgr,
                 )
     finally:
-        if writer is not None:
-            writer.close()
-        dataset.lerobot_dataset.close()
+        capture_stack.close()
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            dataset.lerobot_dataset.close()
 
     print(f"checkpoint: {checkpoint_path}")
     print(f"episode: {args.episode}, rendered frames: {frame_count + 1}")

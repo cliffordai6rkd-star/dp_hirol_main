@@ -25,7 +25,7 @@ class PatchBackbone(nn.Module):
         return SimpleNamespace(last_hidden_state=torch.cat([prefix, patches], dim=1))
 
 
-def make_policy(mode):
+def make_policy(mode, *, force_temporal_encoder="none", force_encoder_layers=0, inject_encoder=True):
     shape_meta = {"obs": {
         "wrist": {"type": "rgb", "shape": [3, 16, 24]},
         "side": {"type": "rgb", "shape": [3, 16, 24]},
@@ -36,7 +36,9 @@ def make_policy(mode):
     encoder = DinoTokenBaselineObsEncoder(
         "unused", {key: [3, 16, 24] for key in ("wrist", "side")},
         mode=mode, n_emb=16, n_head=4, dropout=0.0, backbone=PatchBackbone(),
-    )
+        force_temporal_encoder=force_temporal_encoder,
+        force_encoder_layers=force_encoder_layers,
+    ) if inject_encoder else None
     policy = DinoTokenBaselinePolicy(
         baseline_mode=mode, shape_meta=shape_meta,
         noise_scheduler=DDIMScheduler(num_train_timesteps=10, prediction_type="epsilon"),
@@ -44,7 +46,9 @@ def make_policy(mode):
         wrench_key="future_wrench", phase_wrench_key="tau_ext",
         future_phase_wrench_key="future_tau_ext", wrench_history_steps=8,
         obs_encoder=encoder, n_emb=16, n_head=4, n_layer=1, n_cond_layers=1,
-        p_drop_attn=0.0,
+        p_drop_attn=0.0, dino_model_name_or_path="unused",
+        force_temporal_encoder=force_temporal_encoder,
+        force_encoder_layers=force_encoder_layers,
         # Even a nonzero inherited curriculum must never mask baseline images.
         mask_schedule={"schedule_type": "constant", "start_probability": 1.0},
     )
@@ -95,9 +99,13 @@ def test_self_attention_uses_direct_normalized_force_and_changes_image_tokens():
     assert not hasattr(policy.obs_encoder, "cross_attention")
 
 
-@pytest.mark.parametrize("mode", ["dino", "self_attn"])
-def test_baseline_training_has_no_unused_parameters_and_checkpoint_restores(mode):
-    policy = make_policy(mode).train()
+@pytest.mark.parametrize("mode,temporal_encoder,layers", [
+    ("dino", "none", 0), ("self_attn", "none", 0),
+    ("self_attn", "gru", 1), ("self_attn", "gru", 3),
+])
+def test_baseline_training_has_no_unused_parameters_and_checkpoint_restores(mode, temporal_encoder, layers):
+    kwargs = dict(force_temporal_encoder=temporal_encoder, force_encoder_layers=layers)
+    policy = make_policy(mode, **kwargs).train()
     obs = observations()
     loss = policy.compute_loss({"obs": obs, "action": torch.randn(2, 9, 7)})
     assert torch.isfinite(loss)
@@ -108,12 +116,70 @@ def test_baseline_training_has_no_unused_parameters_and_checkpoint_restores(mode
     optimizer = policy.get_optimizer(learning_rate=1e-4)
     optimized = {id(p) for group in optimizer.param_groups for p in group["params"]}
     assert optimized == {id(p) for p in policy.parameters() if p.requires_grad}
-    restored = make_policy(mode).eval()
+    restored = make_policy(mode, **kwargs).eval()
     restored.load_state_dict(policy.state_dict(), strict=True)
     policy.eval()
     a = policy.predict_action(obs, generator=torch.Generator().manual_seed(2))
     b = restored.predict_action(obs, generator=torch.Generator().manual_seed(2))
     torch.testing.assert_close(a["action"], b["action"])
+
+
+def test_gru_keeps_all_tokens_and_resets_each_observation_sequence():
+    policy = make_policy("self_attn", force_temporal_encoder="gru", force_encoder_layers=3).eval()
+    encoder = policy.obs_encoder
+    obs = observations()
+    fusion_inputs = []
+    projection_inputs = []
+    gru_outputs = []
+    handles = [
+        encoder.fusion.register_forward_pre_hook(
+            lambda module, args: fusion_inputs.append(args[0].detach().clone())
+        ),
+        encoder.wrench_projection.register_forward_pre_hook(
+            lambda module, args: projection_inputs.append(args[0].detach().clone())
+        ),
+        encoder.force_encoder.register_forward_hook(
+            lambda module, args, output: gru_outputs.append(output[0].detach().clone())
+        ),
+    ]
+    try:
+        with torch.inference_mode():
+            policy._encode_context(obs, apply_curriculum_mask=True)
+            changed = dict(obs, future_wrench=obs["future_wrench"].clone())
+            changed["future_wrench"][0, 0, -1] += 10
+            policy._encode_context(changed, apply_curriculum_mask=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+    torch.testing.assert_close(
+        projection_inputs[0], policy.normalizer["future_wrench"].normalize(obs["future_wrench"])
+    )
+    assert encoder.force_encoder.num_layers == 3
+    assert gru_outputs[0].shape == (4, 8, 16)
+    first, changed = (value.reshape(2, 2, 20, 16) for value in fusion_inputs)
+    torch.testing.assert_close(first[:, :, 12:], gru_outputs[0].reshape(2, 2, 8, 16))
+    torch.testing.assert_close(first[:, :, :12], changed[:, :, :12])
+    torch.testing.assert_close(first[0, 0, 12:-1], changed[0, 0, 12:-1])
+    assert not torch.allclose(first[0, 0, -1], changed[0, 0, -1])
+    torch.testing.assert_close(first[0, 1], changed[0, 1])
+    torch.testing.assert_close(first[1], changed[1])
+
+
+@pytest.mark.parametrize("layers", [1, 3])
+def test_policy_passes_gru_configuration_into_its_encoder(monkeypatch, layers):
+    monkeypatch.setattr("transformers.AutoModel.from_pretrained", lambda *args, **kwargs: PatchBackbone())
+    policy = make_policy(
+        "self_attn", force_temporal_encoder="gru", force_encoder_layers=layers, inject_encoder=False
+    )
+    assert isinstance(policy.obs_encoder.force_encoder, nn.GRU)
+    assert policy.obs_encoder.force_encoder.num_layers == layers
+    assert policy._encode_context(observations(), apply_curriculum_mask=False).shape == (2, 40, 16)
+
+
+@pytest.mark.parametrize("layers", [0, -1])
+def test_gru_requires_positive_layer_count(layers):
+    with pytest.raises(ValueError, match="force_encoder_layers >= 1"):
+        make_policy("self_attn", force_temporal_encoder="gru", force_encoder_layers=layers)
 
 
 def test_baseline_configs_inherit_corrected_data_and_separate_run_names():
@@ -128,5 +194,6 @@ def test_baseline_configs_inherit_corrected_data_and_separate_run_names():
             assert config.policy.mask_schedule.start_probability == 0
             assert config.policy.mask_schedule.end_probability == 0
             assert OmegaConf.to_container(config.task.dataset) == OmegaConf.to_container(original.task.dataset)
-            assert config.training.num_optimizer_steps == original.training.num_optimizer_steps
+            assert config.training.num_optimizer_steps > 0
+            assert config.training.num_epochs is None
             assert config.horizon == original.horizon

@@ -66,6 +66,7 @@ def make_obs_encoder(
     temporal_encoder="gru",
     image_keys=None,
     camera_attention_mode="joint",
+    pre_cross_self_attn_layers=0,
 ):
     return ForceAwareObsEncoder(
         pretrained_model_name_or_path="unused",
@@ -80,6 +81,7 @@ def make_obs_encoder(
         freeze_backbone=True,
         image_keys=image_keys,
         camera_attention_mode=camera_attention_mode,
+        pre_cross_self_attn_layers=pre_cross_self_attn_layers,
         backbone=FakeDinoBackbone(hidden_size=12),
     )
 
@@ -103,8 +105,11 @@ def make_policy(
     relative_pose_actions=False,
     image_keys=("wrist",),
     future_phase=False,
+    pre_cross_self_attn_layers=0,
 ):
-    encoder = make_obs_encoder(image_keys=image_keys)
+    encoder = make_obs_encoder(
+        image_keys=image_keys, pre_cross_self_attn_layers=pre_cross_self_attn_layers
+    )
     expert = ContextTransformerForDiffusion(
         input_dim=7,
         output_dim=7,
@@ -384,6 +389,120 @@ def test_force_encoder_per_camera_attention_has_independent_softmaxes():
         )
     context.sum().backward()
     assert encoder.camera_fusion.weight.grad is not None
+
+
+@pytest.mark.parametrize("camera_mode", ["joint", "per_camera"])
+def test_pre_cross_self_attention_splits_updated_image_and_wrench_tokens(camera_mode):
+    encoder = make_obs_encoder(
+        image_keys=("wrist", "side"), camera_attention_mode=camera_mode,
+        pre_cross_self_attn_layers=1,
+    ).eval()
+    encoder.set_attention_capture(True)
+    seen = {}
+    cross_inputs = []
+
+    def remember_force(module, args, output):
+        seen["gru"] = output[0].detach().clone()
+
+    def remember_joint_input(module, args):
+        seen["input"] = args[0].detach().clone()
+
+    def remember_joint_output(module, args, output):
+        seen["output"] = output.detach().clone()
+
+    def remember_cross(module, args, kwargs):
+        cross_inputs.append({key:kwargs[key].detach().clone() for key in ("query", "key", "value")})
+
+    handles = [
+        encoder.force_encoder.register_forward_hook(remember_force),
+        encoder.pre_cross_self_attention.register_forward_pre_hook(remember_joint_input),
+        encoder.pre_cross_self_attention.register_forward_hook(remember_joint_output),
+        encoder.cross_attention.register_forward_pre_hook(remember_cross, with_kwargs=True),
+    ]
+    try:
+        context = encoder(
+            images={key: torch.rand(2, 2, 3, 16, 16) for key in ("side", "wrist")},
+            wrench_history=torch.randn(2, 2, 8, 6),
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+    # Independently for each batch/observation: side 0:6, wrist 6:12,
+    # wrench 12:20. The GRU runs before joint self-attention.
+    assert seen["input"].shape == (4, 20, 16)
+    torch.testing.assert_close(seen["input"][:, 12:], seen["gru"])
+    assert not torch.allclose(seen["output"], seen["input"])
+    expected_query = encoder.force_norm(seen["output"][:, 12:])
+    assert len(cross_inputs) == (1 if camera_mode == "joint" else 2)
+    for index, values in enumerate(cross_inputs):
+        image_slice = slice(0, 12) if camera_mode == "joint" else slice(index * 6, (index + 1) * 6)
+        expected_images = seen["output"][:, image_slice]
+        torch.testing.assert_close(values["query"], expected_query)
+        torch.testing.assert_close(values["key"], encoder.image_norm(expected_images))
+        torch.testing.assert_close(values["value"], expected_images)
+    assert context.shape == (2, 16, 16)
+    weights = encoder.last_cross_attention_weights
+    maps = [weights] if camera_mode == "joint" else list(weights.values())
+    for values in maps:
+        torch.testing.assert_close(values.sum(-1), torch.ones(4, 4, 8))
+    (context * torch.randn_like(context)).mean().backward()
+    assert all(p.grad is not None for p in encoder.pre_cross_self_attention.parameters())
+    assert encoder.force_encoder.weight_ih_l0.grad is not None
+
+
+@pytest.mark.parametrize("camera_mode", ["joint", "per_camera"])
+def test_pre_cross_self_attention_preserves_image_mask(camera_mode):
+    encoder = make_obs_encoder(
+        image_keys=("wrist", "side"), camera_attention_mode=camera_mode,
+        pre_cross_self_attn_layers=1,
+    ).eval()
+    wrench = torch.randn(1, 2, 8, 6)
+    with torch.inference_mode():
+        first = encoder(
+            images={key:torch.rand(1, 2, 3, 16, 16) for key in ("side", "wrist")},
+            wrench_history=wrench, image_token_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+        second = encoder(
+            images={key:torch.rand(1, 2, 3, 16, 16) for key in ("side", "wrist")},
+            wrench_history=wrench, image_token_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+def test_pre_cross_self_attention_trains_and_checkpoint_restores():
+    policy = make_policy(image_keys=("side", "wrist"), pre_cross_self_attn_layers=2)
+    batch = {
+        "obs": {
+            "side":torch.rand(2, 2, 3, 16, 16), "wrist":torch.rand(2, 2, 3, 16, 16),
+            "wrench_ext":torch.randn(2, 2, 8, 6),
+        },
+        "action":torch.randn(2, 9, 7),
+    }
+    loss = policy.compute_loss(batch)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert all(p.grad is not None for p in policy.parameters() if p.requires_grad)
+    restored = make_policy(image_keys=("side", "wrist"), pre_cross_self_attn_layers=2)
+    restored.load_state_dict(policy.state_dict(), strict=True)
+    policy.eval()
+    restored.eval()
+    with torch.inference_mode():
+        first = policy.predict_action(batch["obs"], generator=torch.Generator().manual_seed(42))
+        second = restored.predict_action(batch["obs"], generator=torch.Generator().manual_seed(42))
+    torch.testing.assert_close(first["action"], second["action"])
+    restored.apply_freeze_config({"freeze_modules": ["cross_fusion"]})
+    assert all(not p.requires_grad for p in restored.obs_encoder.pre_cross_self_attention.parameters())
+
+
+def test_zero_pre_cross_layers_has_no_new_checkpoint_parameters():
+    encoder = make_obs_encoder(image_keys=("side", "wrist"))
+    assert isinstance(encoder.pre_cross_self_attention, nn.Identity)
+    assert not any(key.startswith("pre_cross_self_attention.") for key in encoder.state_dict())
+
+
+def test_pre_cross_layer_count_cannot_be_negative():
+    with pytest.raises(ValueError, match="pre_cross_self_attn_layers must be non-negative"):
+        make_obs_encoder(pre_cross_self_attn_layers=-1)
 
 
 def test_multi_camera_policy_discovers_rgb_keys_from_shape_meta():

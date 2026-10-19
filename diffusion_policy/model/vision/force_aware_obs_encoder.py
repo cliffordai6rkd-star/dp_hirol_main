@@ -27,6 +27,7 @@ class ForceAwareObsEncoder(nn.Module):
         image_keys: Optional[Sequence[str]] = None,
         camera_attention_mode: str = "joint",
         backbone: Optional[nn.Module] = None,
+        pre_cross_self_attn_layers: int = 0,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -39,6 +40,8 @@ class ForceAwareObsEncoder(nn.Module):
             )
         if force_encoder_layers < 0:
             raise ValueError("force_encoder_layers must be non-negative")
+        if pre_cross_self_attn_layers < 0:
+            raise ValueError("pre_cross_self_attn_layers must be non-negative")
         if camera_attention_mode not in {"joint", "per_camera"}:
             raise ValueError(
                 "camera_attention_mode must be 'joint' or 'per_camera'"
@@ -52,6 +55,7 @@ class ForceAwareObsEncoder(nn.Module):
         self.force_temporal_encoder_type = force_temporal_encoder
         self.image_keys = tuple(sorted(str(key) for key in (image_keys or ())))
         self.camera_attention_mode = str(camera_attention_mode)
+        self.pre_cross_self_attn_layers = int(pre_cross_self_attn_layers)
         if len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must not contain duplicates")
 
@@ -128,6 +132,23 @@ class ForceAwareObsEncoder(nn.Module):
             )
         else:
             self.force_encoder = nn.Identity()
+
+        if self.pre_cross_self_attn_layers:
+            joint_layer = nn.TransformerEncoderLayer(
+                d_model=self.n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * self.n_emb,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.pre_cross_self_attention = nn.TransformerEncoder(
+                joint_layer, num_layers=self.pre_cross_self_attn_layers
+            )
+        else:
+            # No new checkpoint parameters when loading the original architecture.
+            self.pre_cross_self_attention = nn.Identity()
 
         self.force_norm = nn.LayerNorm(self.n_emb)
         self.image_norm = nn.LayerNorm(self.n_emb)
@@ -384,6 +405,27 @@ class ForceAwareObsEncoder(nn.Module):
             flat_force, _ = self.force_encoder(flat_force)
         else:
             flat_force = self.force_encoder(flat_force)
+
+        if self.pre_cross_self_attn_layers:
+            # Per observation: [all camera patches, all GRU wrench outputs].
+            # Self-attention changes features, preserving token order/length.
+            camera_patch_counts = [tokens.shape[2] for tokens in camera_patch_tokens]
+            image_token_count = sum(camera_patch_counts)
+            flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
+                batch_size * obs_steps, image_token_count, self.n_emb
+            )
+            mixed = self.pre_cross_self_attention(
+                torch.cat([flat_images, flat_force], dim=1)
+            )
+            mixed_images = mixed[:, :image_token_count]
+            flat_force = mixed[:, image_token_count:]
+            camera_patch_tokens = [
+                tokens.reshape(batch_size, obs_steps, count, self.n_emb)
+                for tokens, count in zip(
+                    mixed_images.split(camera_patch_counts, dim=1), camera_patch_counts
+                )
+            ]
+
         query = self.force_norm(flat_force)
         if self.camera_attention_mode == "joint":
             patch_image = torch.cat(camera_patch_tokens, dim=2)
@@ -406,8 +448,11 @@ class ForceAwareObsEncoder(nn.Module):
         else:
             attended_by_camera = []
             captured_by_camera = {}
-            for key in image_keys:
-                camera_patches = encoded_camera_patches[key]
+            for key, mixed_patches in zip(image_keys, camera_patch_tokens):
+                camera_patches = (
+                    mixed_patches if self.pre_cross_self_attn_layers
+                    else encoded_camera_patches[key]
+                )
                 camera_patches = camera_patches.reshape(
                     batch_size * obs_steps, camera_patches.shape[2], self.n_emb
                 )

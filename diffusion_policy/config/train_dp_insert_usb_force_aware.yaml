@@ -72,9 +72,11 @@ policy:
   freeze_modules: ${freeze_modules}
   force_temporal_encoder: gru
   force_encoder_layers: 1
-  # Run wrench-to-image attention independently for each camera, then fuse
-  # the resulting wrench tokens before conditioning the DiT.
-  camera_attention_mode: per_camera
+  # Joint image/wrench self-attention after GRU, then split tokens for Q and K/V.
+  pre_cross_self_attn_layers: 1  # Set 0 for GRU -> cross-attention directly.
+  # Concatenate all cameras' DINO patches as shared K/V. Wrench queries attend
+  # jointly across cameras, then the fused wrench tokens condition the DiT.
+  camera_attention_mode: joint
 
   n_emb: 256
   n_head: 4

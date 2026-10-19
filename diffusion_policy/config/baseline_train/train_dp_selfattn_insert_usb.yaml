@@ -5,14 +5,24 @@ defaults:
 
 name: train_dp_selfattn_insert_usb
 
-# Project and concatenate both cameras' patch tokens with raw future-wrench
-# tokens, then run joint self-attention. No GRU, contact gate or prefix fill.
+dataloader:
+  batch_size: 64
+
+val_dataloader:
+  batch_size: 64
+
+training:
+  num_optimizer_steps: 400000
+
+# Encode the future-wrench sequence with a GRU, concatenate all wrench/image
+# tokens, then run joint self-attention. No contact gate or prefix fill.
 policy:
   _target_: diffusion_policy.policy.dino_token_baseline_policy.DinoTokenBaselinePolicy
   baseline_mode: self_attn
-  baseline_self_attn_layers: 1
-  force_temporal_encoder: none
-  force_encoder_layers: 0
+  baseline_self_attn_layers: 2
+  force_temporal_encoder: gru
+  force_encoder_layers: 2  # GRU depth; independent of baseline_self_attn_layers.
+  pre_cross_self_attn_layers: 0  # This baseline has no cross-attention stage.
   camera_attention_mode: joint
   mask_schedule:
     schedule_type: constant

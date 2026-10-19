@@ -30,6 +30,8 @@ class DinoTokenBaselinePolicy(ForceAwareDiffusionTransformerPolicy):
                 dropout=kwargs.get("p_drop_attn", 0.1),
                 freeze_backbone=kwargs.get("freeze_dino_backbone", True),
                 local_files_only=kwargs.get("dino_local_files_only", True),
+                force_temporal_encoder=kwargs.get("force_temporal_encoder", "none"),
+                force_encoder_layers=kwargs.get("force_encoder_layers", 0),
             )
         if obs_encoder.mode != baseline_mode:
             raise ValueError("obs_encoder.mode must match baseline_mode")

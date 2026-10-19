@@ -120,6 +120,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         mask_schedule: Optional[dict] = None,
         obs_encoder: Optional[ForceAwareObsEncoder] = None,
         action_expert: Optional[nn.Module] = None,
+        pre_cross_self_attn_layers: int = 0,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -237,6 +238,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 local_files_only=dino_local_files_only,
                 image_keys=configured_image_keys,
                 camera_attention_mode=camera_attention_mode,
+                pre_cross_self_attn_layers=pre_cross_self_attn_layers,
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
@@ -327,6 +329,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         "cross_attention": ("obs_encoder.cross_attention",),
         # The complete image/wrench fusion block, including its residual MLP.
         "cross_fusion": (
+            "obs_encoder.pre_cross_self_attention",
             "obs_encoder.cross_attention",
             "obs_encoder.camera_fusion",
             "obs_encoder.cross_output_norm",

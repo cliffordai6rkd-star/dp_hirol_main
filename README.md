@@ -202,12 +202,36 @@ gru | lstm | transformer | none
 融合方向固定为：
 
 ```text
-Q = force history tokens
-K = DINOv3 patch tokens
-V = DINOv3 patch tokens
+Q = 更新后的 wrench token
+K = 更新后的 DINOv3 patch token
+V = 更新后的 DINOv3 patch token
 ```
 
-cross-attention 输出保留 force residual。视觉信息只能通过该融合路径进入 diffusion expert，不存在独立的 global image token 旁路。
+默认使用 `camera_attention_mode: joint`：side、wrist 分别经共享的 DINO
+提取 patch token。wrench 经投影、位置/模态编码和 GRU 后，与两个相机的图像
+token 拼接，先经过 `pre_cross_self_attn_layers: 1` 层联合 self-attention 编码块
+（含残差连接和 FFN）。此模块在每个观测内独立运行，保持 token 顺序和数量：
+
+```text
+[side patches, wrist patches, GRU wrench tokens]
+  → joint self-attention
+  → 按原始 token 边界拆分
+  → wrench 部分作为 Q，image 部分作为 K/V
+  → cross-attention → residual + FFN → DiT
+```
+
+拆分是按位置切片，不是丢弃 token 或截断梯度。两种模态在 self-attention 中
+已经交换信息，因此此时 wrench 位置的 token 已包含视觉信息，图像位置的 token
+也已包含 wrench 信息。cross-attention 在两个相机的全部 patch 上共同归一化。
+192×256、patch size 16 时，每个观测对应 192 + 192 = 384 个图像 K/V token。
+联合 self-attention 的输入长度为 384 + 8 = 392，cross-attention 后仍为 8 个 wrench token。
+层数可通过 `policy.pre_cross_self_attn_layers=2` 调整，设为 0 恢复
+GRU 直接进入 cross-attention 的原结构；增加该模块后需要重新训练。
+`per_camera` 模式仍可用于加载此前分别做注意力再融合的 checkpoint；该结构的
+checkpoint 含独立的 `camera_fusion` 参数，切换为 joint 后应重新训练。
+
+cross-attention 输出保留拆分后的 wrench residual。视觉信息经融合后的 wrench
+位置 token 进入 diffusion expert，不存在独立的 global image token 旁路。
 
 默认 `n_obs_steps=2`，所以 diffusion context 长度为：
 
@@ -297,16 +321,30 @@ anchor 是 frame_index 58（1.16 s）；后续真实的零力样本仍可训练�
 ### USB token baselines
 
 两个对照配置位于 `diffusion_policy/config/baseline_train/`，继承 USB 的数据筛选、
-训练/验证划分、阶段采样、ee_pose 动作目标、DiT、EMA 和 200,000 次 optimizer update。
+训练/验证划分、阶段采样、ee_pose 动作目标、DiT 和 EMA。
+纯图像默认训练 200,000 步；selfattn 配置训练 400,000 步，训练和验证 batch 均为 64。
 它们均关闭图像遮蔽课程：
 
 | 配置 | 输入与融合 |
 | --- | --- |
 | `train_dp_dinobase_insert_usb` | 双相机全部 DINO patch token 直接作为 DiT context，模型前向只读取图像 |
-| `train_dp_selfattn_insert_usb` | 图像 patch token 与直接线性投影的未来 wrench token 拼接，再做 joint self-attention |
+| `train_dp_selfattn_insert_usb` | 未来 wrench 经线性投影和 GRU 后，与图像 patch token 拼接，再做 joint self-attention |
 
 192×256 图像、双相机、两帧观测下，context 分别为 768 和 784 个 token。
-selfattn baseline 不使用 GRU、接触门控或接触前 wrench 填充。
+selfattn baseline 保留每个观测的全部 8 个 GRU 输出 token，再与图像拼接。
+GRU 在各个样本、各个观测的 wrench 序列内独立运行；不使用接触门控或接触前 wrench 填充。
+当前默认 1 层 GRU、2 层 joint self-attention，分别通过以下参数设置：
+
+```yaml
+policy:
+  force_temporal_encoder: gru
+  force_encoder_layers: 1
+  baseline_self_attn_layers: 2
+```
+
+例如命令行 `policy.force_encoder_layers=3` 改成 3 层 GRU。
+`policy.force_temporal_encoder=none policy.force_encoder_layers=0` 恢复直接线性投影，
+也用于加载没有 GRU 的旧 checkpoint。启用 GRU 或改变 GRU 层数后需要训练对应结构的模型。
 纯图像 baseline 保留数据侧的阶段采样以使用相同样本分布，但模型预测不依赖力数据。
 两个配置沿用 WandB、验证动作 MSE 和 output 下的 `val_loss.png`。
 
@@ -314,6 +352,37 @@ selfattn baseline 不使用 GRU、接触门控或接触前 wrench 填充。
 python train.py --config-name baseline_train/train_dp_dinobase_insert_usb
 python train.py --config-name baseline_train/train_dp_selfattn_insert_usb
 ```
+
+这两个 baseline 的注意力可视化脚本沿用 cross-attention 脚本的全部命令行参数。
+分别选择对应模型的 checkpoint：
+
+```bash
+python diffusion_policy/scripts/visualize_wrench_image_self_attn_episode.py \
+  --checkpoint /path/to/selfattn/checkpoints/model.ckpt \
+  --episode 0 --camera both --attention-normalization global --save-frames --overwrite
+
+python diffusion_policy/scripts/visualize_image_self_attn_episode.py \
+  --checkpoint /path/to/dinobase/checkpoints/model.ckpt \
+  --episode 0 --camera both --attention-normalization global --save-frames --overwrite
+```
+
+也可使用 `--checkpoint-dir` 自动选取训练步数最大的 checkpoint。
+默认分别输出到训练目录的 `wrench_image_self_attn_episode_0.mp4` 和
+`image_self_attn_episode_0.mp4`，PNG 保存到各自的 `_frames/` 目录。
+
+联合 self-attention 脚本提取最后一个融合层中，最新观测的 wrench 查询到
+同一观测各相机图像 patch 的权重；`--attention-query all` 平均所有 wrench
+查询和注意力头，`last` 只使用最后一个 wrench 查询并平均各个头。softmax
+原本覆盖全部相机、观测时刻和 wrench key，截取图像区域后不再重新归一化。
+
+纯图像 baseline 的 patch 直接送入 DiT，没有额外的图像融合 self-attention 层，
+所以图像脚本显示 DINOv3 最后一层真实的 patch-to-patch self-attention。
+`all` 平均全部空间 patch 查询和注意力头，`last` 使用最后一个空间 patch
+查询（不是 CLS）。展示时排除 CLS/register token，保留原始 softmax 权重。
+冻结 DINO 时，这张图主要反映预训练视觉主干的注意力，不代表 DiT 的动作归因。
+
+两种脚本均只展示最新观测，按原脚本的 episode 色阶、相机拼接和视频编码方式
+输出；各模型的 softmax 范围不同，热力图颜色不能直接作为跨模型的贡献强度比较。
 
 正在跑 USB 训练时，可在另一个终端排队运行，脚本会自动识别训练主进程并等待，
 然后按 dinobase → selfattn 顺序启动新的训练：

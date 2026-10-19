@@ -46,7 +46,9 @@ policy:
   wrench_history_steps: ${task.wrench_history_steps}
   force_temporal_encoder: gru
   force_encoder_layers: 1
-  camera_attention_mode: per_camera
+  pre_cross_self_attn_layers: 1  # Joint image/wrench self-attention before splitting Q/KV.
+  # One cross-attention over the concatenated DINO patches of all cameras.
+  camera_attention_mode: joint
 
   n_emb: 256
   n_head: 4

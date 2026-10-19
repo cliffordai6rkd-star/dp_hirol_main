@@ -24,6 +24,8 @@ class DinoTokenBaselineObsEncoder(nn.Module):
         freeze_backbone: bool = True,
         local_files_only: bool = True,
         backbone: Optional[nn.Module] = None,
+        force_temporal_encoder: str = "none",
+        force_encoder_layers: int = 0,
     ):
         super().__init__()
         if mode not in {"dino", "self_attn"}:
@@ -34,6 +36,12 @@ class DinoTokenBaselineObsEncoder(nn.Module):
             raise ValueError("invalid token embedding or history dimensions")
         if mode == "self_attn" and self_attn_layers < 1:
             raise ValueError("self_attn baseline requires at least one attention layer")
+        if force_temporal_encoder not in {"none", "gru"}:
+            raise ValueError("baseline force_temporal_encoder must be 'none' or 'gru'")
+        if force_encoder_layers < 0 or (
+            force_temporal_encoder == "gru" and force_encoder_layers < 1
+        ):
+            raise ValueError("GRU requires force_encoder_layers >= 1; use 'none' to disable it")
         if backbone is None:
             from transformers import AutoModel
 
@@ -47,6 +55,7 @@ class DinoTokenBaselineObsEncoder(nn.Module):
         self.max_obs_steps = int(max_obs_steps)
         self.wrench_history_steps = int(wrench_history_steps)
         self.wrench_dim = int(wrench_dim)
+        self.force_temporal_encoder_type = force_temporal_encoder
         self.image_keys = tuple(sorted(image_shapes))
         self.image_shapes = {key: tuple(image_shapes[key]) for key in self.image_keys}
         config = backbone.config
@@ -70,10 +79,20 @@ class DinoTokenBaselineObsEncoder(nn.Module):
         self.camera_embedding = nn.Parameter(torch.empty(1, 1, len(self.image_keys), 1, n_emb))
         self.image_modality = nn.Parameter(torch.empty(1, 1, 1, n_emb))
         if mode == "self_attn":
-            # Each wrench row is projected directly; no GRU or cross-attention.
             self.wrench_projection = nn.Linear(wrench_dim, n_emb)
             self.wrench_position = nn.Parameter(torch.empty(1, 1, wrench_history_steps, n_emb))
             self.force_modality = nn.Parameter(torch.empty(1, 1, 1, n_emb))
+            if force_temporal_encoder == "gru":
+                self.force_encoder = nn.GRU(
+                    input_size=n_emb,
+                    hidden_size=n_emb,
+                    num_layers=int(force_encoder_layers),
+                    dropout=dropout if force_encoder_layers > 1 else 0.0,
+                    batch_first=True,
+                )
+            else:
+                # Preserve the direct-projection architecture of old checkpoints.
+                self.force_encoder = nn.Identity()
             layer = nn.TransformerEncoderLayer(
                 d_model=n_emb, nhead=n_head, dim_feedforward=4 * n_emb,
                 dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
@@ -153,10 +172,18 @@ class DinoTokenBaselineObsEncoder(nn.Module):
             expected = (batch, steps, self.wrench_history_steps, self.wrench_dim)
             if wrench_history is None or tuple(wrench_history.shape) != expected:
                 raise ValueError(f"self_attn baseline requires wrench_history {expected}")
-            tokens.append(
+            force = (
                 self.wrench_projection(wrench_history) + self.wrench_position
                 + self.obs_position[:, :steps] + self.force_modality
             )
+            if self.force_temporal_encoder_type == "gru":
+                # Each observation's K wrench rows form an independent sequence.
+                # Keep every GRU output token, not only the final hidden state.
+                force, _ = self.force_encoder(
+                    force.reshape(batch * steps, self.wrench_history_steps, self.n_emb)
+                )
+                force = force.reshape(batch, steps, self.wrench_history_steps, self.n_emb)
+            tokens.append(force)
         context = torch.cat(tokens, dim=2).flatten(1, 2)
         # In self_attn mode Q, K and V all come from the complete concatenation.
         return self.context_norm(self.fusion(context))
