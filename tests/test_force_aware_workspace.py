@@ -101,6 +101,7 @@ class ForceAwareWorkspaceStepTest(unittest.TestCase):
                 "training": {
                     "max_train_steps": None,
                     "gradient_accumulate_every": 2,
+                    "log_every_optimizer_steps": 1,
                     "max_grad_norm": None,
                     "tqdm_interval_sec": 0.01,
                 }

@@ -318,6 +318,38 @@ anchor 是 frame_index 58（1.16 s）；后续真实的零力样本仍可训练�
 窗口，训练集和验证集采用相同规则。Normalizer 仅在有效训练窗口实际使用的
 数据行上拟合。由错误时间采样训练得到的权重需要重新训练。
 
+### USB self-cross-attention 的验证与 checkpoint 筛选
+
+`baseline_train/train_dp_self_crossattn_insert_usb` 每 20,000 个 optimizer step
+对完整验证集执行一次离线推理：使用验证样本的图像和 wrench 观测调用
+`predict_action()`，完成 diffusion 去噪，再将输出动作与示范动作比较。
+预测和目标按 `action_start_index` 对齐，仅比较实际输出的 8 步动作，
+不将前面的观测参考帧计入动作 MSE。相对位姿模式下，两者均在模型的相对动作表示中比较。
+
+```yaml
+training:
+  checkpoint_every_optimizer_steps: 20000
+  max_val_steps: null
+checkpoint:
+  topk:
+    monitor_key: val_action_mse_raw
+    mode: min
+    k: 5
+```
+
+`val_action_mse_raw` 是原始动作数值上的均方误差，是 checkpoint 筛选指标；
+`val_action_mse` 是归一化动作 MSE，`val_loss` 是 diffusion 去噪损失。
+验证优先使用 EMA 模型，固定采样随机种子，并关闭训练数据增强和课程遮蔽。
+这些指标会记录到 WandB 和 `logs.json.txt`，`val_loss.png` 按 optimizer step 更新。
+也会按 `training.val_every` 进行 epoch 验证；保存 checkpoint 前总会验证当前模型，
+同一个 optimizer step 的结果只计算一次。最后不足 20,000 步的保存点同样会验证。
+
+`checkpoints/` 保留动作 MSE 最低的 5 份模型，文件名包含训练步数与验证 MSE。
+`best.ckpt` 指向当前最佳模型，`latest.ckpt` 用于恢复最新训练状态。
+续训时恢复 Top-K 排名；较差候选更新 latest 时不会覆盖已保留的最佳模型。
+其他训练配置仍使用各自的 `checkpoint.topk` 设置。
+修改配置和训练代码会在下次启动训练时生效。
+
 ### USB token baselines
 
 两个对照配置位于 `diffusion_policy/config/baseline_train/`，继承 USB 的数据筛选、

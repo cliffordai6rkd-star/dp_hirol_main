@@ -1,0 +1,42 @@
+# @package _global_
+# python train.py --config-name baseline_train/train_dp_self_crossattn_insert_usb
+defaults:
+  - /train_dp_insert_usb_force_aware
+  - _self_
+
+name: train_dp_self_crossattn_insert_usb
+
+# DINO image tokens + GRU wrench tokens -> joint self-attention.
+# Split at the original token boundary: wrench -> Q, images -> K/V.
+# Cross-attention outputs the fused wrench tokens used to condition the DiT.
+policy:
+  _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
+  force_temporal_encoder: gru
+  force_encoder_layers: 1
+  pre_cross_self_attn_layers: 1
+  camera_attention_mode: joint
+
+dataloader:
+  batch_size: 64
+
+val_dataloader:
+  batch_size: 64
+
+training:
+  num_optimizer_steps: 300000
+  # Evaluate the current EMA policy before ranking each checkpoint candidate.
+  checkpoint_every_optimizer_steps: 20000
+  max_val_steps: null  # Use the complete held-out split for action rollout MSE.
+
+checkpoint:
+  topk:
+    # Compare the inferred action chunk with the aligned dataset actions in
+    # original action units. Smaller MSE is better; this is not diffusion loss.
+    monitor_key: val_action_mse_raw
+    mode: min
+    k: 5
+    format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse_raw:.6f}.ckpt
+  save_last_ckpt: true
+
+logging:
+  tags: [force-aware, dinov3, gru, self-attention, cross-attention, future-wrench, dual-camera, ee-pose]

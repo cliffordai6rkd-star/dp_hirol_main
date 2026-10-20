@@ -200,7 +200,7 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
 
 
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
-    include_keys = ("global_step", "optimizer_step", "epoch", "freeze_config")
+    include_keys = ("global_step", "optimizer_step", "epoch", "freeze_config", "topk_state")
 
     def __init__(
         self,
@@ -240,6 +240,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         self.global_step = 0
         self.optimizer_step = 0
         self.epoch = 0
+        self.topk_state = {}
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
         """Restore freeze settings before loading optimizer state.
@@ -423,11 +424,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 seed=int(cfg.training.seed),
             )
         if distributed.enabled:
-            val_sampler = DistributedSampler(
-                validation_dataset,
-                num_replicas=distributed.world_size,
-                rank=distributed.rank,
-                shuffle=False,
+            # Validation has one reduction after the loop, so ranks can have
+            # unequal lengths. Avoid padding/repeating validation samples.
+            val_sampler = range(
+                distributed.rank, len(validation_dataset), distributed.world_size
             )
             val_loader_cfg.pop("shuffle", None)
         train_dataloader = DataLoader(
@@ -532,10 +532,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             )
         topk_manager = None
         if self.is_main_process:
-            topk_manager = TopKCheckpointManager(
-                save_dir=os.path.join(self.output_dir, "checkpoints"),
-                **cfg.checkpoint.topk,
-            )
+            topk_manager = self._make_topk_manager(cfg)
 
         device = torch.device(cfg.training.device)
         amp_cfg = cfg.training.get("amp", {})
@@ -592,13 +589,13 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     json_logger=json_logger,
                     topk_manager=topk_manager,
                     target_optimizer_steps=num_optimizer_steps,
+                    val_dataloader=val_dataloader,
                 )
                 if sample_batch is None and self.is_main_process:
                     sample_batch = next(iter(train_dataloader))
 
                 policy = self.ema_model if self.ema_model is not None else self.model
                 policy.eval()
-                val_plot_path = None
                 if (
                     self.is_main_process
                     and env_runner is not None
@@ -607,22 +604,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     step_log.update(env_runner.run(policy))
 
                 if self.epoch % int(cfg.training.val_every) == 0:
-                    val_metrics = self._validate_metrics(
-                        policy,
-                        val_dataloader,
-                        device,
-                        cfg.training.max_val_steps,
-                        cfg=cfg,
-                        distributed=distributed,
+                    val_metrics = self._validate_and_log(
+                        cfg, val_dataloader, device, wandb_run, json_logger,
                     )
                     if val_metrics is not None:
                         step_log.update(val_metrics)
-                        if self.is_main_process:
-                            val_plot_path = self._update_validation_plot(
-                                epoch=self.epoch,
-                                optimizer_step=self.optimizer_step,
-                                metrics=val_metrics,
-                            )
 
                 if (
                     self.is_main_process
@@ -666,13 +652,6 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 )
                 if self.is_main_process:
                     wandb_run.log(step_log, step=self.global_step)
-                    if val_plot_path is not None:
-                        # Scalars above provide the normal WandB curves; also
-                        # upload the same artifact that is saved in output_dir.
-                        wandb_run.log(
-                            {"val_loss_plot": wandb.Image(str(val_plot_path))},
-                            step=self.global_step,
-                        )
                     json_logger.log(step_log)
                 self.epoch += 1
 
@@ -694,15 +673,22 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         and self.optimizer_step % checkpoint_interval != 0
                     )
                 should_checkpoint = should_checkpoint or should_save_final
-                if should_checkpoint and self.is_main_process:
-                    if use_optimizer_step_checkpoints:
-                        self._save_optimizer_step_checkpoint(
-                            cfg,
-                            topk_manager=topk_manager,
-                            metric_dict=last_log,
+                if should_checkpoint:
+                    if self._uses_validation_checkpoint(cfg):
+                        step_log.update(
+                            self._validate_and_log(
+                                cfg, val_dataloader, device, wandb_run, json_logger,
+                            )
                         )
-                    else:
-                        self._save_checkpoints(cfg, step_log, topk_manager)
+                    if self.is_main_process:
+                        if use_optimizer_step_checkpoints:
+                            self._save_optimizer_step_checkpoint(
+                                cfg,
+                                topk_manager=topk_manager,
+                                metric_dict=step_log,
+                            )
+                        else:
+                            self._save_checkpoints(cfg, step_log, topk_manager)
 
                 policy.train()
                 # DDP's gradient collectives already synchronize at the next
@@ -726,6 +712,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         topk_manager=None,
         target_optimizer_steps: Optional[int] = None,
         training_model=None,
+        val_dataloader=None,
     ) -> dict:
         self.model.train()
         if training_model is None:
@@ -856,17 +843,21 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             "training.checkpoint_every_optimizer_steps must be "
                             "positive or null"
                         )
-                    if (
-                        self.optimizer_step % checkpoint_interval == 0
-                        and self.is_main_process
-                    ):
+                    if self.optimizer_step % checkpoint_interval == 0:
                         if last_log["train_loss"] is None:
                             last_log["train_loss"] = float(group_loss_tensor.item())
-                        self._save_optimizer_step_checkpoint(
-                            cfg,
-                            topk_manager=topk_manager,
-                            metric_dict=last_log,
-                        )
+                        if self._uses_validation_checkpoint(cfg):
+                            last_log.update(
+                                self._validate_and_log(
+                                    cfg, val_dataloader, device, wandb_run, json_logger,
+                                )
+                            )
+                        if self.is_main_process:
+                            self._save_optimizer_step_checkpoint(
+                                cfg,
+                                topk_manager=topk_manager,
+                                metric_dict=last_log,
+                            )
 
         epoch_loss = (
             float((loss_sum / loss_count).item()) if loss_sum is not None else float("nan")
@@ -874,23 +865,88 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         last_log["train_loss"] = self._distributed_mean(epoch_loss, device)
         return last_log
 
-    def _save_checkpoints(self, cfg, step_log, topk_manager) -> None:
-        if cfg.checkpoint.save_last_ckpt:
-            self.save_checkpoint(use_thread=False)
-        if cfg.checkpoint.save_last_snapshot:
-            self.save_snapshot()
-        if topk_manager is None:
-            return
+    @staticmethod
+    def _uses_validation_checkpoint(cfg) -> bool:
+        monitor = OmegaConf.select(cfg, "checkpoint.topk.monitor_key")
+        return monitor is not None and str(monitor).startswith("val_")
 
-        metric_dict = {
-            key.replace("/", "_"): value for key, value in step_log.items()
+    def _make_topk_manager(self, cfg):
+        manager = TopKCheckpointManager(
+            save_dir=os.path.join(self.output_dir, "checkpoints"),
+            **cfg.checkpoint.topk,
+        )
+        state = getattr(self, "topk_state", {})
+        if all(state.get(key) == getattr(manager, key) for key in ("monitor_key", "mode", "format_str")):
+            candidates = [
+                (os.path.join(manager.save_dir, pathlib.Path(name).name), value)
+                for name, value in state.get("path_value_map", {}).items()
+                if math.isfinite(value)
+            ]
+            candidates = [(path, value) for path, value in candidates if os.path.isfile(path)]
+            if manager.monitor_key is None:
+                selected = candidates[-manager.k:] if manager.k else []
+            else:
+                candidates.sort(key=lambda item: item[1], reverse=manager.mode == "max")
+                selected = candidates[:manager.k]
+            manager.path_value_map = dict(selected)
+        return manager
+
+    def _topk_checkpoint_path(self, topk_manager, metrics):
+        if topk_manager is None:
+            return None
+        data = {key.replace("/", "_"): value for key, value in metrics.items()}
+        if topk_manager.monitor_key is not None:
+            value = data.get(topk_manager.monitor_key)
+            if value is None or not math.isfinite(float(value)):
+                return None
+        # A final/epoch checkpoint can coincide with a step checkpoint. Do not
+        # let a duplicate candidate evict a different Top-K entry.
+        candidate = os.path.join(topk_manager.save_dir, topk_manager.format_str.format(**data))
+        if candidate in topk_manager.path_value_map:
+            return None
+        path = topk_manager.get_ckpt_path(data)
+        self.topk_state = {
+            "monitor_key": topk_manager.monitor_key,
+            "mode": topk_manager.mode,
+            "format_str": topk_manager.format_str,
+            "path_value_map": {
+                pathlib.Path(name).name: value
+                for name, value in topk_manager.path_value_map.items()
+            },
         }
-        monitor_key = cfg.checkpoint.topk.monitor_key
-        if monitor_key is not None and str(monitor_key) not in metric_dict:
+        return path
+
+    def _update_best_checkpoint(self, topk_manager) -> None:
+        if topk_manager is None or topk_manager.monitor_key is None or not topk_manager.path_value_map:
             return
-        topk_path = topk_manager.get_ckpt_path(metric_dict)
+        choose = min if topk_manager.mode == "min" else max
+        best = choose(topk_manager.path_value_map, key=topk_manager.path_value_map.get)
+        directory = pathlib.Path(topk_manager.save_dir)
+        temporary_link = directory.joinpath(f".best-{os.getpid()}.tmp")
+        temporary_link.unlink(missing_ok=True)
+        temporary_link.symlink_to(pathlib.Path(best).name)
+        os.replace(temporary_link, directory.joinpath("best.ckpt"))
+
+    def _save_latest_checkpoint(self) -> None:
+        # latest may be a symlink to a Top-K file. Replace the directory entry
+        # instead of opening that symlink and overwriting the retained model.
+        latest = self.get_checkpoint_path()
+        temporary_path = latest.with_name(f".latest-{os.getpid()}.tmp.ckpt")
+        try:
+            self.save_checkpoint(path=temporary_path, use_thread=False)
+            os.replace(temporary_path, latest)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _save_checkpoints(self, cfg, step_log, topk_manager) -> None:
+        topk_path = self._topk_checkpoint_path(topk_manager, step_log)
         if topk_path is not None:
             self.save_checkpoint(path=topk_path, use_thread=False)
+        self._update_best_checkpoint(topk_manager)
+        if cfg.checkpoint.save_last_ckpt:
+            self._save_latest_checkpoint()
+        if cfg.checkpoint.save_last_snapshot:
+            self.save_snapshot()
 
     def _save_optimizer_step_checkpoint(
         self,
@@ -907,11 +963,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         # metric it keeps the best K according to the configured mode.
         checkpoint_path = None
         if topk_manager is not None:
-            data = {
-                key.replace("/", "_"): value
-                for key, value in (metric_dict or {}).items()
-            }
-            topk_path = topk_manager.get_ckpt_path(data)
+            topk_path = self._topk_checkpoint_path(topk_manager, metric_dict or {})
             if topk_path is not None:
                 checkpoint_path = pathlib.Path(topk_path)
 
@@ -933,12 +985,44 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         elif topk_manager is not None and cfg.checkpoint.save_last_ckpt:
             # If a metric-based Top-K manager rejects this checkpoint, still keep
             # a single latest checkpoint for reliable resume.
-            self.save_checkpoint(
-                path=self.get_checkpoint_path(),
-                use_thread=False,
-            )
+            self._save_latest_checkpoint()
+        self._update_best_checkpoint(topk_manager)
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
+
+    def _validate_and_log(self, cfg, dataloader, device, wandb_run, json_logger):
+        if getattr(self, "_last_validation_step", None) == self.optimizer_step:
+            return self._last_validation_metrics
+        if dataloader is None:
+            raise ValueError("Validation-based checkpoint selection requires a validation dataloader")
+        policy = self.ema_model if getattr(self, "ema_model", None) is not None else self.model
+        was_training = policy.training
+        policy.eval()
+        try:
+            # DataLoader iteration also consumes RNG state. Validation must
+            # not change the subsequent training noise/augmentation sequence.
+            devices = [device] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
+                metrics = self._validate_metrics(
+                    policy, dataloader, device, cfg.training.max_val_steps,
+                    cfg=cfg, distributed=getattr(self, "distributed", None),
+                )
+        finally:
+            policy.train(was_training)
+        if metrics is None:
+            if self._uses_validation_checkpoint(cfg):
+                raise ValueError("Validation-based checkpoint selection requires a non-empty validation split")
+            return None
+        self._last_validation_step = self.optimizer_step
+        self._last_validation_metrics = metrics
+        if self.is_main_process:
+            record = dict(metrics, epoch=self.epoch, global_step=self.global_step, optimizer_step=self.optimizer_step)
+            wandb_run.log(record, step=self.global_step)
+            json_logger.log(record)
+            plot_path = self._update_validation_plot(self.epoch, self.optimizer_step, metrics)
+            if plot_path is not None:
+                wandb_run.log({"val_loss_plot": wandb.Image(str(plot_path))}, step=self.global_step)
+        return metrics
 
     def _validate_metrics(
         self,
@@ -960,6 +1044,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             maximum = min(maximum, int(max_steps))
         distributed = distributed or DistributedContext()
         generator = None
+        loss_generator = torch.Generator(device=device)
+        loss_generator.manual_seed(int(cfg.training.seed) + distributed.rank + 1)
         if compute_action_mse:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(cfg.training.seed) + distributed.rank)
@@ -971,8 +1057,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     batch,
                     lambda value: value.to(device, non_blocking=True),
                 )
-                loss_sum += policy.compute_loss(batch).item()
-                loss_count += 1
+                batch_size = int(batch["action"].shape[0])
+                loss_sum += policy.compute_loss(batch, generator=loss_generator).item() * batch_size
+                loss_count += batch_size
 
                 if compute_action_mse:
                     # Run the complete image-conditioned diffusion sampler and
@@ -984,7 +1071,15 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         batch["obs"],
                         generator=generator,
                     )["model_action_pred"]
-                    target = batch["action"]
+                    # Align the same future chunk returned as `action`, omitting
+                    # context/latency steps. model_action_pred and the dataset
+                    # also agree when relative-pose training is enabled.
+                    start = policy.action_start_index
+                    end = start + policy.n_action_steps
+                    prediction = prediction[:, start:end].float()
+                    target = batch["action"][:, start:end].float()
+                    if prediction.shape != target.shape or target.shape[1] != policy.n_action_steps:
+                        raise ValueError("Validation action prediction and target chunks must have matching shapes")
                     normalized_prediction = policy.normalizer["action"].normalize(
                         prediction
                     )
@@ -1091,7 +1186,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             return None
 
         output_path = pathlib.Path(self.output_dir).joinpath("val_loss.png")
-        x = [item["epoch"] for item in history]
+        x = [item["optimizer_step"] for item in history]
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
         axes[0].plot(
             x,
@@ -1105,7 +1200,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             marker="o",
             label="normalized action MSE",
         )
-        axes[0].set_xlabel("epoch")
+        axes[0].set_xlabel("optimizer step")
         axes[0].set_ylabel("loss")
         axes[0].set_title("Validation losses")
         axes[0].grid(True, alpha=0.3)
@@ -1117,7 +1212,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             marker="o",
             color="tab:orange",
         )
-        axes[1].set_xlabel("epoch")
+        axes[1].set_xlabel("optimizer step")
         axes[1].set_ylabel("MSE in action units")
         axes[1].set_title("Raw validation action MSE")
         axes[1].grid(True, alpha=0.3)
