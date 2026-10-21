@@ -199,7 +199,7 @@ gru | lstm | transformer | none
 
 ### Cross Attention
 
-融合方向固定为：
+默认融合方向为（可配置）：
 
 ```text
 Q = 更新后的 wrench token
@@ -230,14 +230,45 @@ GRU 直接进入 cross-attention 的原结构；增加该模块后需要重新�
 `per_camera` 模式仍可用于加载此前分别做注意力再融合的 checkpoint；该结构的
 checkpoint 含独立的 `camera_fusion` 参数，切换为 joint 后应重新训练。
 
-cross-attention 输出保留拆分后的 wrench residual。视觉信息经融合后的 wrench
-位置 token 进入 diffusion expert，不存在独立的 global image token 旁路。
+通过以下参数独立配置三个阶段，所有 force-aware 训练配置均支持命令行覆盖：
 
-默认 `n_obs_steps=2`，所以 diffusion context 长度为：
-
-```text
-2 observations * 8 force tokens = 16 tokens
+```yaml
+policy:
+  force_temporal_encoder: gru  # gru | lstm | transformer | none
+  force_encoder_layers: 1
+  pre_cross_self_attn_layers: 1  # >= 0；0 跳过图像+wrench联合 SA
+  cross_attn_query: wrench      # wrench | image
+  cross_attn_layers: 1          # >= 0；0 跳过 CA
 ```
+
+`force_encoder_layers` 控制 wrench 时序编码深度，保留每个时刻的输出。
+联合 SA 在 `[所有相机图像 tokens, wrench tokens]` 上运行，随后按原位置拆分。
+多层 CA 逐层更新 Query 流，K/V 固定为前置编码器的输出，每层都有残差和 FFN。
+
+| 设置 | 送入 DiT 的条件 | 两相机、两帧、每相机 192 patches、8 wrench tokens 时的长度 |
+| --- | --- | --- |
+| CA >= 1，`cross_attn_query: wrench` | wrench + 从图像读取的信息 | 16 |
+| CA >= 1，`cross_attn_query: image` | 图像 + 从 wrench 读取的信息，保留视觉残差 | 768 |
+| CA = 0，SA >= 1 | 联合 SA 后的全部图像+wrench tokens | 784 |
+| CA = 0，SA = 0 | 独立编码的图像+wrench tokens 直接拼接 | 784 |
+
+CA 为 0 时 Query 方向不参与计算，也不会创建 CA 的可训练参数；DiT 的条件位置
+编码容量根据实际输出长度自动设置。原先的两层 SA baseline 还会跨观测时间做
+联合注意力，这里的前置 SA 在每个观测内独立运行，两者并非完全相同的结构。
+
+例如，跳过联合 SA，改为 Transformer 编码 wrench，再用图像作为 Query：
+
+```bash
+python train.py --config-name baseline_train/train_dp_self_crossattn_insert_usb \
+  policy.pre_cross_self_attn_layers=0 \
+  policy.cross_attn_query=image policy.cross_attn_layers=2 \
+  policy.force_temporal_encoder=transformer policy.force_encoder_layers=2
+```
+
+保留默认的一层 wrench-query CA 时，旧 checkpoint 的参数名和计算保持兼容；
+改变层数、方向或 backbone 后需要新建训练，不能把旧权重当作同构模型继续训练。
+旧 cross-attention 空间热力图只适用于 wrench Query；image Query 的权重在
+wrench 维度归一化，脚本会明确拒绝直接套用原热力图逻辑。
 
 ### Action Expert
 
@@ -433,6 +464,121 @@ bash scripts/train_usb_baselines_after_current.sh --wait-pid 12345 \
 避免 PID 复用；文件锁避免重复启动同一个队列。第一个 baseline 若失败，仍会尝试
 第二个并记录各自退出码。排队脚本不会向正在等待的原训练进程发送信号。
 
+### 通用 checkpoint 注意力可视化
+
+推荐使用统一入口 `visualize_attention_episode.py`。脚本从 checkpoint 中的
+config 重建网络，自动识别 Query 方向、力编码器、SA/CA 层数和多相机布局，
+默认读取 EMA 权重。原来的 `visualize_image_query_cross_attention_episode.py`
+命令仍可使用，提供同一套通用参数。
+
+```bash
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt \
+  --episode 0 --camera both --save-frames --overwrite
+```
+
+`--mode auto` 默认依次选择 Cross-Attention、融合 Self-Attention、DINO 主干
+Self-Attention。也可用 `--mode cross-attn`（或 `--ca`）、
+`--mode self-attn`（或 `--sa`）、`--mode dino` 指定目标。
+`--layer-index`（或 `--layer`）从 0 开始，`-1` 表示所选模式的最后一层。
+没有融合 SA 的 CA 模型指定 `self-attn` 时会报错，查看视觉主干应明确使用
+`dino`。纯 DINO baseline 的 `self-attn` 则作为 `dino` 的别名。
+
+```bash
+# 仅在 CPU 上读取结构和列出可用模式、层号；不需要 --episode，也不回放数据。
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint /path/to/checkpoints/model.ckpt --list-layers
+
+# 查看有融合 SA 的 checkpoint 的第一层。
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint /path/to/selfattn/checkpoints/model.ckpt \
+  --episode 0 --sa --layer 0 --camera both --overwrite
+```
+
+各模式均展示最新观测，保留原始 softmax 权重，不对截取的图像区域重新归一化：
+
+- 图像 Query / wrench K/V 的 CA：每格保留一个 wrench Key 的空间注意力列，
+  只平均 heads；8 个 wrench 状态排成 2×4 网格。另输出 `‖ΔV‖₂` 视频，
+  取 CA 输出投影之后、图像残差及 FFN 之前的更新幅度。
+- Wrench Query / 图像 K/V 的 CA：每格保留一个 wrench Query 到图像 patch
+  的权重行，只平均 heads；此方向不输出图像位置的更新幅度视频。
+- 图像与 wrench 联合 SA：提取 wrench Query 行、图像 Key 列的 `S_WI`
+  子矩阵，保留各 wrench 位置。旧 baseline 中跨观测的 softmax 范围保持不变。
+- 纯图像融合 SA 或 DINO SA：平均空间 patch Queries 和 heads，得到一组
+  图像 Key 热图；DINO 图中排除 CLS/register 行列，但保留原 softmax 分母。
+
+`--attention-query all` 默认保留全部 wrench 位置；`last` 仅保留最后一个。
+对于纯图像 SA，这两个值分别表示平均全部 patch Queries、仅取最后一个
+patch Query。LSTM/GRU 状态包含序列上下文，时间标签对应编码位置。
+这里只捕获指定的一层，不做跨层 rollout，也不表示最终动作的因果归因。
+
+默认按**本次选中的全部 episode 帧、全部模型相机和全部 wrench 面板**共同
+计算注意力的第 1–99 百分位，所有帧共用这个色标；仅展示一个相机时仍使用
+全部相机定标。`--attention-percentiles 1 99` 可修改分位范围，
+`--attention-normalization fixed` 可恢复 0–1。分位色标只拉伸显示颜色并截断
+极值，不改变保存的原始概率；色条显示实际概率范围。更新幅度另用整集统一的
+1–99 百分位。不同模式的 softmax 范围不同，颜色不能直接比较跨模型贡献。
+
+默认输出到训练目录，文件前缀包含实际模式、层号和 Query，例如
+`attention_episode_0_cross_attn_layer_0_image_query_attention.mp4`，同前缀的
+`_ca_update.mp4`（仅图像 Query CA）、`_raw.npz` 和 `_metadata.json`。
+`--save-frames` 将 PNG 保存到各视频对应的 `_frames/` 目录；`--output`
+可指定视频及数据文件共同的前缀。支持原有的 `--checkpoint-dir`、
+`--dataset-path`、`--video-backend`、`--fps`、`--video-codec`、`--stride`、
+`--max-frames`、`--alpha`、`--seed`、`--device` 和 `--overwrite`。
+
+### 最终动作对图像区域的敏感度
+
+`visualize_action_image_attribution_episode.py` 从最终执行的整段 `action`
+向输入 RGB 像素反传，包含 DINO、融合模块、DiT、完整串行去噪链和动作后处理。
+它从 checkpoint config 重建网络，支持当前 force-aware 和图像 baseline，
+无需指定 Query 方向或注意力层。
+
+```bash
+python diffusion_policy/scripts/visualize_action_image_attribution_episode.py \
+  --checkpoint data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt \
+  --episode 0 --camera both --save-frames --overwrite
+```
+
+令 `z` 为最终执行动作按 checkpoint 动作 normalizer 缩放后的所有坐标，
+`D` 为坐标数量，区域热图定义为：
+
+```text
+H(patch) = sqrt(mean_output(mean_pixel_in_patch(sum_RGB((dz/dpixel)^2))))
+```
+
+先对各输出坐标的梯度平方求和，避免对动作求平均后产生正负抵消；
+再在 DINO patch 对应的输入像素区域内取 RMS。保留模型的真实采样步数、
+clipping、四元数归一化及相对姿态还原。每帧重置相同采样 seed，其他观测
+保持常量；这里没有跨去噪步的注意力平均。
+
+默认计算精确 Jacobian：例如 8 步、7 维动作需要 56 次反传。
+可先加 `--max-frames 1` 检查结果。若需要加速，可显式添加
+`--gradient-probes 8`，用 8 个固定 Rademacher 随机投影估计同一完整链的
+Jacobian 能量；这属于近似计算，数值和元数据会注明。完整去噪计算图需要
+保留到反传，显存和耗时会高于原来的单层注意力脚本。
+
+CUDA GPU 可以再加 `--autocast bfloat16`。它只对可微前向启用 bfloat16，
+梯度累积仍使用 float32；当前 RTX GPU 上通常更快、更省显存，但数值会与
+默认 float32 略有差异。标准 KV cache 没有启用：动作 token 每个去噪步都在
+变化，条件 memory 还包含随 timestep 变化的时间 token，动作 self-attention
+也是非因果的，跨步缓存会改变原模型计算。
+
+一个 MP4 中按观测时间分行、相机分列，每张热图覆盖其对应的输入原图。
+`--observation last` 仅显示最新观测，原始数据仍保留全部观测时刻。
+全部选中帧、全部模型相机和观测时刻共用 1%–99% 色标，可通过
+`--percentiles 1 99` 修改。红色表示局部像素变化更容易影响最终执行动作，
+不表示注意力概率、正负贡献或因果重要性；饱和区域可能出现零梯度。
+色标仅影响显示，原始敏感度不重新归一化。
+
+输出默认位于训练目录：`action_image_attribution_episode_0.mp4`、
+`_raw.npz` 和 `_metadata.json`；`--save-frames` 另保存 PNG。
+NPZ 包含 `anchors`、最终 `action`、`scaled_action`，以及按 metadata
+相机顺序保存的 `camera_N_sensitivity[frame, observation, patch_row, patch_col]`。
+`--checkpoint-dir`、`--dataset-path`、`--video-backend`、`--fps`、
+`--video-codec`、`--stride`、`--max-frames`、`--alpha`、`--seed`、
+`--device`、`--output`、`--overwrite` 与现有脚本用法一致。
+
 ### FIRST 阶段重采样
 
 `train_dp_insert_usb_force_aware` 默认启用三阶段训练重采样：窗口内的
@@ -574,3 +720,24 @@ mkdir -p docker/artifacts
 docker save -o docker/artifacts/diffusion-policy-train.tar diffusion-policy:train
 
 tar --exclude='.git' -czf ../diffusion-policy-bundle.tar.gz .
+
+
+ATTN_CKPT="data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt"
+
+# 查看网络结构和可选层
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint "$ATTN_CKPT" --list-layers
+
+# 导出指定层
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint "$ATTN_CKPT" \
+  --episode 0 --camera both \
+  --mode cross-attn --layer 0 \
+  --attention-percentiles 1 99 \
+  --save-frames --overwrite
+参数	含义
+--mode auto	默认：优先 CA，其次融合 SA，最后 DINO
+--mode cross-attn 或 --ca	查看 CA
+--mode self-attn 或 --sa	查看融合模块的 SA
+--mode dino	查看 DINO 主干内部 SA
+--layer 0 / --layer -1	第一层 / 最后一层

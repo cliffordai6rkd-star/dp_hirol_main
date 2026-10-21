@@ -121,6 +121,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         obs_encoder: Optional[ForceAwareObsEncoder] = None,
         action_expert: Optional[nn.Module] = None,
         pre_cross_self_attn_layers: int = 0,
+        cross_attn_layers: int = 1,
+        cross_attn_query: str = "wrench",
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -239,6 +241,9 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 image_keys=configured_image_keys,
                 camera_attention_mode=camera_attention_mode,
                 pre_cross_self_attn_layers=pre_cross_self_attn_layers,
+                cross_attn_layers=cross_attn_layers,
+                cross_attn_query=cross_attn_query,
+                image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
@@ -331,6 +336,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         "cross_fusion": (
             "obs_encoder.pre_cross_self_attention",
             "obs_encoder.cross_attention",
+            "obs_encoder.extra_cross_attention_layers",
             "obs_encoder.camera_fusion",
             "obs_encoder.cross_output_norm",
             "obs_encoder.cross_ffn",
@@ -380,6 +386,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         prefixes = []
         for selector in selectors:
             prefixes.extend(self._expand_freeze_selector(selector))
+            if selector in {"cross_attn", "cross_attention"}:
+                prefixes.extend(
+                    f"obs_encoder.extra_cross_attention_layers.{index}.cross_attention"
+                    for index in range(len(getattr(self.obs_encoder, "extra_cross_attention_layers", ())))
+                )
         if "obs_encoder.backbone" in prefixes:
             self.obs_encoder.freeze_backbone = True
         unmatched = set(prefixes)

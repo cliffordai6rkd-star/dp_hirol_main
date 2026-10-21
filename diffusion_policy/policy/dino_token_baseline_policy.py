@@ -12,8 +12,8 @@ class DinoTokenBaselinePolicy(ForceAwareDiffusionTransformerPolicy):
     def __init__(
         self, baseline_mode="dino", baseline_self_attn_layers=1, obs_encoder=None, **kwargs
     ):
-        if baseline_mode not in {"dino", "self_attn"}:
-            raise ValueError("baseline_mode must be 'dino' or 'self_attn'")
+        if baseline_mode not in {"dino", "image_self_attn", "self_attn"}:
+            raise ValueError("baseline_mode must be 'dino', 'image_self_attn', or 'self_attn'")
         if obs_encoder is None:
             obs_meta = kwargs["shape_meta"]["obs"]
             wrench_key = kwargs.get("wrench_key", "wrench_ext")

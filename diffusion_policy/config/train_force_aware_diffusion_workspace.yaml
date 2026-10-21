@@ -44,9 +44,11 @@ policy:
   dino_local_files_only: true
   freeze_dino_backbone: true
   wrench_history_steps: ${task.wrench_history_steps}
-  force_temporal_encoder: gru
+  force_temporal_encoder: gru  # gru | lstm | transformer | none
   force_encoder_layers: 1
   pre_cross_self_attn_layers: 1  # Joint image/wrench self-attention before splitting Q/KV.
+  cross_attn_query: wrench  # wrench reads images; image reads wrench (with visual residual).
+  cross_attn_layers: 1  # 0 sends all image + wrench tokens to the DiT.
   # One cross-attention over the concatenated DINO patches of all cameras.
   camera_attention_mode: joint
 

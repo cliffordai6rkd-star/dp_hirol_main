@@ -6,14 +6,16 @@ defaults:
 
 name: train_dp_self_crossattn_insert_usb
 
-# DINO image tokens + GRU wrench tokens -> joint self-attention.
-# Split at the original token boundary: wrench -> Q, images -> K/V.
-# Cross-attention outputs the fused wrench tokens used to condition the DiT.
+# DINO + temporal wrench tokens -> optional joint SA -> optional cross-attention.
+# Positive cross layers return the selected query stream with residuals.
+# Zero cross layers return all image + wrench tokens to the DiT.
 policy:
   _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
-  force_temporal_encoder: gru
-  force_encoder_layers: 1
-  pre_cross_self_attn_layers: 1
+  force_temporal_encoder: gru  # gru | lstm | transformer | none
+  force_encoder_layers: 1  # Temporal backbone depth; recurrent encoders need >= 1.
+  pre_cross_self_attn_layers: 1  # 0 skips joint image/wrench self-attention.
+  cross_attn_query: wrench  # wrench: image K/V; image: wrench K/V.
+  cross_attn_layers: 1  # 0 skips cross-attention and keeps both token streams.
   camera_attention_mode: joint
 
 dataloader:

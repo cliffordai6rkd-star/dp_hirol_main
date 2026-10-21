@@ -68,8 +68,9 @@ def observations():
     }
 
 
-def test_visual_baseline_preserves_patches_and_never_reads_force():
-    policy = make_policy("dino").eval()
+@pytest.mark.parametrize("mode", ["dino", "image_self_attn"])
+def test_visual_baseline_preserves_patches_and_never_reads_force(mode):
+    policy = make_policy(mode).eval()
     obs = observations()
     first = policy._encode_context(obs, apply_curriculum_mask=True)
     only_images = {key: obs[key] for key in ("side", "wrist")}
@@ -101,7 +102,9 @@ def test_self_attention_uses_direct_normalized_force_and_changes_image_tokens():
 
 @pytest.mark.parametrize("mode,temporal_encoder,layers", [
     ("dino", "none", 0), ("self_attn", "none", 0),
+    ("image_self_attn", "none", 0),
     ("self_attn", "gru", 1), ("self_attn", "gru", 3),
+    ("self_attn", "lstm", 2), ("self_attn", "transformer", 2),
 ])
 def test_baseline_training_has_no_unused_parameters_and_checkpoint_restores(mode, temporal_encoder, layers):
     kwargs = dict(force_temporal_encoder=temporal_encoder, force_encoder_layers=layers)
@@ -122,6 +125,30 @@ def test_baseline_training_has_no_unused_parameters_and_checkpoint_restores(mode
     a = policy.predict_action(obs, generator=torch.Generator().manual_seed(2))
     b = restored.predict_action(obs, generator=torch.Generator().manual_seed(2))
     torch.testing.assert_close(a["action"], b["action"])
+
+
+def test_image_only_self_attention_runs_once_per_observation_across_cameras():
+    policy = make_policy("image_self_attn").eval()
+    encoder = policy.obs_encoder
+    assert len(encoder.fusion.layers) == 1
+    assert not hasattr(encoder, "force_encoder")
+    seen = []
+    hook = encoder.fusion.register_forward_pre_hook(
+        lambda module, args: seen.append(args[0].detach().clone())
+    )
+    obs = observations()
+    try:
+        first = policy._encode_context(obs, apply_curriculum_mask=False).reshape(2, 2, 12, 16)
+        changed = dict(obs, side=obs["side"].clone())
+        changed["side"][0, 0] += 0.5
+        second = policy._encode_context(changed, apply_curriculum_mask=False).reshape(2, 2, 12, 16)
+    finally:
+        hook.remove()
+    assert seen[0].shape == (4, 12, 16)  # B * To, side patches + wrist patches, D
+    # The wrist representation reads the changed side camera at the same time.
+    assert not torch.allclose(first[0, 0, 6:], second[0, 0, 6:])
+    torch.testing.assert_close(first[0, 1], second[0, 1])
+    torch.testing.assert_close(first[1], second[1])
 
 
 def test_gru_keeps_all_tokens_and_resets_each_observation_sequence():
@@ -166,12 +193,15 @@ def test_gru_keeps_all_tokens_and_resets_each_observation_sequence():
 
 
 @pytest.mark.parametrize("layers", [1, 3])
-def test_policy_passes_gru_configuration_into_its_encoder(monkeypatch, layers):
+@pytest.mark.parametrize("backbone,encoder_type", [
+    ("gru", nn.GRU), ("lstm", nn.LSTM), ("transformer", nn.TransformerEncoder),
+])
+def test_policy_passes_temporal_configuration_into_its_encoder(monkeypatch, layers, backbone, encoder_type):
     monkeypatch.setattr("transformers.AutoModel.from_pretrained", lambda *args, **kwargs: PatchBackbone())
     policy = make_policy(
-        "self_attn", force_temporal_encoder="gru", force_encoder_layers=layers, inject_encoder=False
+        "self_attn", force_temporal_encoder=backbone, force_encoder_layers=layers, inject_encoder=False
     )
-    assert isinstance(policy.obs_encoder.force_encoder, nn.GRU)
+    assert isinstance(policy.obs_encoder.force_encoder, encoder_type)
     assert policy.obs_encoder.force_encoder.num_layers == layers
     assert policy._encode_context(observations(), apply_curriculum_mask=False).shape == (2, 40, 16)
 

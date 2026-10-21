@@ -214,6 +214,14 @@ def resolve_device(requested: Optional[str], cfg) -> torch.device:
 
 def instantiate_policy(payload, cfg, device: torch.device, *, capture_attention=True):
     policy: ForceAwareDiffusionTransformerPolicy = hydra.utils.instantiate(cfg.policy)
+    if capture_attention:
+        if getattr(policy.obs_encoder, "cross_attn_layers", 1) == 0:
+            raise ValueError("This checkpoint has cross_attn_layers=0 and no cross-attention weights to visualize.")
+        if getattr(policy.obs_encoder, "cross_attn_query", "wrench") != "wrench":
+            raise ValueError(
+                "This visualization requires wrench queries and image K/V. "
+                "Image-query attention is normalized over wrench tokens and cannot use this spatial heatmap."
+            )
     state_dicts = payload.get("state_dicts", {})
     state_key = "ema_model" if "ema_model" in state_dicts else "model"
     if state_key not in state_dicts:

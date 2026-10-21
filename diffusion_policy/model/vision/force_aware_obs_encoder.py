@@ -6,6 +6,35 @@ import torch
 import torch.nn as nn
 
 
+class _CrossAttentionBlock(nn.Module):
+    """Parameters for one cross-attention + residual + FFN block."""
+
+    def __init__(self, n_emb, n_head, dropout, camera_count=0):
+        super().__init__()
+        self.force_norm = nn.LayerNorm(n_emb)
+        self.image_norm = nn.LayerNorm(n_emb)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=n_emb, num_heads=n_head, dropout=dropout, batch_first=True,
+        )
+        if camera_count > 1:
+            self.camera_fusion = nn.Linear(n_emb * camera_count, n_emb)
+            with torch.no_grad():
+                self.camera_fusion.weight.zero_()
+                for index in range(camera_count):
+                    self.camera_fusion.weight[:, index * n_emb:(index + 1) * n_emb].copy_(
+                        torch.eye(n_emb) / camera_count
+                    )
+                self.camera_fusion.bias.zero_()
+        else:
+            self.camera_fusion = nn.Identity()
+        self.cross_dropout = nn.Dropout(dropout)
+        self.cross_output_norm = nn.LayerNorm(n_emb)
+        self.cross_ffn = nn.Sequential(
+            nn.Linear(n_emb, 4 * n_emb), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(4 * n_emb, n_emb), nn.Dropout(dropout),
+        )
+
+
 class ForceAwareObsEncoder(nn.Module):
     """Fuse frozen DINOv3 patch tokens with high-rate wrench history tokens."""
 
@@ -28,6 +57,9 @@ class ForceAwareObsEncoder(nn.Module):
         camera_attention_mode: str = "joint",
         backbone: Optional[nn.Module] = None,
         pre_cross_self_attn_layers: int = 0,
+        cross_attn_layers: int = 1,
+        cross_attn_query: str = "wrench",
+        image_shapes: Optional[Mapping[str, Sequence[int]]] = None,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -42,6 +74,10 @@ class ForceAwareObsEncoder(nn.Module):
             raise ValueError("force_encoder_layers must be non-negative")
         if pre_cross_self_attn_layers < 0:
             raise ValueError("pre_cross_self_attn_layers must be non-negative")
+        if cross_attn_layers < 0:
+            raise ValueError("cross_attn_layers must be non-negative")
+        if cross_attn_query not in {"wrench", "image"}:
+            raise ValueError("cross_attn_query must be 'wrench' or 'image'")
         if camera_attention_mode not in {"joint", "per_camera"}:
             raise ValueError(
                 "camera_attention_mode must be 'joint' or 'per_camera'"
@@ -53,9 +89,18 @@ class ForceAwareObsEncoder(nn.Module):
         self.wrench_history_steps = int(wrench_history_steps)
         self.freeze_backbone = bool(freeze_backbone)
         self.force_temporal_encoder_type = force_temporal_encoder
-        self.image_keys = tuple(sorted(str(key) for key in (image_keys or ())))
+        self.image_keys = tuple(sorted(str(key) for key in (image_keys or image_shapes or ())))
         self.camera_attention_mode = str(camera_attention_mode)
         self.pre_cross_self_attn_layers = int(pre_cross_self_attn_layers)
+        self.cross_attn_layers = int(cross_attn_layers)
+        self.cross_attn_query = str(cross_attn_query)
+        self.image_shapes = {
+            str(key): tuple(shape) for key, shape in (image_shapes or {}).items()
+        }
+        if self.image_shapes and tuple(sorted(self.image_shapes)) != self.image_keys:
+            raise ValueError("image_shapes must match image_keys")
+        if (not self.cross_attn_layers or self.cross_attn_query == "image") and not self.image_shapes:
+            raise ValueError("image_shapes is required for image queries or zero cross-attention layers")
         if len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must not contain duplicates")
 
@@ -80,6 +125,20 @@ class ForceAwareObsEncoder(nn.Module):
         self.num_register_tokens = int(
             getattr(getattr(backbone, "config", None), "num_register_tokens", 0)
         )
+        self.patch_counts = {}
+        if self.image_shapes:
+            patch_size = getattr(backbone.config, "patch_size", None)
+            if patch_size is None:
+                raise ValueError("DINOv3 config must expose patch_size when image_shapes is provided")
+            patch_h, patch_w = (
+                (int(patch_size), int(patch_size))
+                if isinstance(patch_size, int) else map(int, patch_size)
+            )
+            for key, shape in self.image_shapes.items():
+                if (len(shape) != 3 or shape[0] != 3 or patch_h < 1 or patch_w < 1
+                        or shape[1] % patch_h or shape[2] % patch_w):
+                    raise ValueError(f"camera {key!r} shape must be RGB and divisible by DINO patch size")
+                self.patch_counts[key] = (shape[1] // patch_h) * (shape[2] // patch_w)
 
         self.image_projection = nn.Linear(int(hidden_size), self.n_emb)
         self.wrench_projection = nn.Linear(int(wrench_dim), self.n_emb)
@@ -150,42 +209,28 @@ class ForceAwareObsEncoder(nn.Module):
             # No new checkpoint parameters when loading the original architecture.
             self.pre_cross_self_attention = nn.Identity()
 
-        self.force_norm = nn.LayerNorm(self.n_emb)
-        self.image_norm = nn.LayerNorm(self.n_emb)
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=self.n_emb,
-            num_heads=n_head,
-            dropout=dropout,
-            batch_first=True,
+        camera_count = (
+            len(self.image_keys)
+            if self.camera_attention_mode == "per_camera" and self.cross_attn_query == "wrench"
+            else 0
         )
-        if self.camera_attention_mode == "per_camera" and len(self.image_keys) > 1:
-            # Each camera gets its own wrench-to-image attention distribution.
-            # Initialize fusion as an average so the new block starts with a
-            # well-scaled representation and can learn camera-specific weights.
-            self.camera_fusion = nn.Linear(
-                self.n_emb * len(self.image_keys), self.n_emb
-            )
-            with torch.no_grad():
-                self.camera_fusion.weight.zero_()
-                identity = torch.eye(self.n_emb)
-                for camera_index in range(len(self.image_keys)):
-                    start = camera_index * self.n_emb
-                    end = start + self.n_emb
-                    self.camera_fusion.weight[:, start:end].copy_(
-                        identity / len(self.image_keys)
-                    )
-                self.camera_fusion.bias.zero_()
+        # Keep the first block's original parameter names so legacy one-layer
+        # wrench-query checkpoints still load strictly and produce the same output.
+        block_names = (
+            "force_norm", "image_norm", "cross_attention", "camera_fusion",
+            "cross_dropout", "cross_output_norm", "cross_ffn",
+        )
+        if self.cross_attn_layers:
+            first_block = _CrossAttentionBlock(self.n_emb, n_head, dropout, camera_count)
+            for name in block_names:
+                setattr(self, name, getattr(first_block, name))
         else:
-            self.camera_fusion = nn.Identity()
-        self.cross_dropout = nn.Dropout(dropout)
-        self.cross_output_norm = nn.LayerNorm(self.n_emb)
-        self.cross_ffn = nn.Sequential(
-            nn.Linear(self.n_emb, 4 * self.n_emb),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * self.n_emb, self.n_emb),
-            nn.Dropout(dropout),
-        )
+            for name in block_names:
+                setattr(self, name, nn.Identity())
+        self.extra_cross_attention_layers = nn.ModuleList([
+            _CrossAttentionBlock(self.n_emb, n_head, dropout, camera_count)
+            for _ in range(max(0, self.cross_attn_layers - 1))
+        ])
         self.context_norm = nn.LayerNorm(self.n_emb)
         # Attention weights are disabled by default because returning them
         # allocates [batch, heads, force_tokens, image_patches] tensors.  The
@@ -193,6 +238,7 @@ class ForceAwareObsEncoder(nn.Module):
         self.capture_cross_attention = False
         self.last_cross_attention_weights = None
         self.last_cross_attention_weights_by_camera = None
+        self.last_cross_attention_weights_by_layer = []
 
         self.register_buffer(
             "image_mean",
@@ -220,6 +266,10 @@ class ForceAwareObsEncoder(nn.Module):
 
     @property
     def context_tokens_per_observation(self) -> int:
+        if not self.cross_attn_layers:
+            return sum(self.patch_counts.values()) + self.wrench_history_steps
+        if self.cross_attn_query == "image":
+            return sum(self.patch_counts.values())
         return self.wrench_history_steps
 
     def _set_backbone_frozen(self) -> None:
@@ -228,11 +278,49 @@ class ForceAwareObsEncoder(nn.Module):
             self.backbone.eval()
 
     def set_attention_capture(self, enabled: bool = True) -> None:
-        """Enable or disable storing the latest force-to-image attention."""
+        """Capture each cross-attention layer; legacy attributes expose the last."""
         self.capture_cross_attention = bool(enabled)
         if not self.capture_cross_attention:
             self.last_cross_attention_weights = None
             self.last_cross_attention_weights_by_camera = None
+            self.last_cross_attention_weights_by_layer = []
+
+    def _apply_cross_attention(self, block, query_tokens, memory_tokens, image_keys, patch_counts):
+        if self.cross_attn_query == "wrench":
+            query = block.force_norm(query_tokens)
+            memory_norm = block.image_norm
+        else:
+            query = block.image_norm(query_tokens)
+            memory_norm = block.force_norm
+        if self.camera_attention_mode == "joint":
+            attended, weights = block.cross_attention(
+                query=query, key=memory_norm(memory_tokens), value=memory_tokens,
+                need_weights=self.capture_cross_attention, average_attn_weights=False,
+            )
+        else:
+            # Wrench queries read each camera separately and fuse the results;
+            # image queries keep all camera positions and share the wrench K/V.
+            camera_tokens = memory_tokens if self.cross_attn_query == "wrench" else query
+            attended_by_camera, weights_by_camera = [], {}
+            for key, tokens in zip(image_keys, camera_tokens.split(patch_counts, dim=1)):
+                camera_query = query if self.cross_attn_query == "wrench" else tokens
+                camera_memory = tokens if self.cross_attn_query == "wrench" else memory_tokens
+                attended_camera, camera_weights = block.cross_attention(
+                    query=camera_query, key=memory_norm(camera_memory), value=camera_memory,
+                    need_weights=self.capture_cross_attention, average_attn_weights=False,
+                )
+                attended_by_camera.append(attended_camera)
+                if self.capture_cross_attention:
+                    weights_by_camera[key] = camera_weights
+            attended = (
+                block.camera_fusion(torch.cat(attended_by_camera, dim=-1))
+                if self.cross_attn_query == "wrench"
+                else torch.cat(attended_by_camera, dim=1)
+            )
+            weights = weights_by_camera
+        fused = query_tokens + block.cross_dropout(attended)
+        fused = fused + block.cross_ffn(block.cross_output_norm(fused))
+        return fused, weights
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -319,6 +407,8 @@ class ForceAwareObsEncoder(nn.Module):
                 raise ValueError(
                     f"image {key!r} must have 3 channels, got {camera_image.shape[2]}"
                 )
+            if key in self.image_shapes and tuple(camera_image.shape[2:]) != self.image_shapes[key]:
+                raise ValueError(f"image {key!r} must have shape {self.image_shapes[key]}")
 
         if wrench_history is None:
             raise ValueError("wrench_history is required")
@@ -375,6 +465,8 @@ class ForceAwareObsEncoder(nn.Module):
                 grouped_keys,
                 grouped_patches.split(flat_camera_batch, dim=0),
             ):
+                if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
+                    raise ValueError(f"DINO patch count does not match configured camera {key!r}")
                 encoded_camera_patches[key] = patch_image.reshape(
                     batch_size, obs_steps, patch_image.shape[1], self.n_emb
                 )
@@ -406,81 +498,53 @@ class ForceAwareObsEncoder(nn.Module):
         else:
             flat_force = self.force_encoder(flat_force)
 
+        camera_patch_counts = [tokens.shape[2] for tokens in camera_patch_tokens]
+        image_token_count = sum(camera_patch_counts)
+        flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
+            batch_size * obs_steps, image_token_count, self.n_emb
+        )
         if self.pre_cross_self_attn_layers:
-            # Per observation: [all camera patches, all GRU wrench outputs].
+            # Per observation: [all camera patches, all temporal wrench outputs].
             # Self-attention changes features, preserving token order/length.
-            camera_patch_counts = [tokens.shape[2] for tokens in camera_patch_tokens]
-            image_token_count = sum(camera_patch_counts)
-            flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
-                batch_size * obs_steps, image_token_count, self.n_emb
-            )
             mixed = self.pre_cross_self_attention(
                 torch.cat([flat_images, flat_force], dim=1)
             )
-            mixed_images = mixed[:, :image_token_count]
+            flat_images = mixed[:, :image_token_count]
             flat_force = mixed[:, image_token_count:]
-            camera_patch_tokens = [
-                tokens.reshape(batch_size, obs_steps, count, self.n_emb)
-                for tokens, count in zip(
-                    mixed_images.split(camera_patch_counts, dim=1), camera_patch_counts
-                )
-            ]
 
-        query = self.force_norm(flat_force)
-        if self.camera_attention_mode == "joint":
-            patch_image = torch.cat(camera_patch_tokens, dim=2)
-            patch_count = patch_image.shape[2]
-            flat_patches = patch_image.reshape(
-                batch_size * obs_steps, patch_count, self.n_emb
-            )
-            attended, attention_weights = self.cross_attention(
-                query=query,
-                key=self.image_norm(flat_patches),
-                value=flat_patches,
-                need_weights=self.capture_cross_attention,
-                average_attn_weights=False,
-            )
-            if self.capture_cross_attention:
-                self.last_cross_attention_weights = attention_weights.detach()
-            else:
-                self.last_cross_attention_weights = None
-            self.last_cross_attention_weights_by_camera = None
+        self.last_cross_attention_weights = None
+        self.last_cross_attention_weights_by_camera = None
+        self.last_cross_attention_weights_by_layer = []
+        if not self.cross_attn_layers:
+            # No cross-attention: retain both streams, including any preceding
+            # joint self-attention updates, rather than discarding the images.
+            context = torch.cat([flat_images, flat_force], dim=1)
         else:
-            attended_by_camera = []
-            captured_by_camera = {}
-            for key, mixed_patches in zip(image_keys, camera_patch_tokens):
-                camera_patches = (
-                    mixed_patches if self.pre_cross_self_attn_layers
-                    else encoded_camera_patches[key]
-                )
-                camera_patches = camera_patches.reshape(
-                    batch_size * obs_steps, camera_patches.shape[2], self.n_emb
-                )
-                attended_camera, attention_camera = self.cross_attention(
-                    query=query,
-                    key=self.image_norm(camera_patches),
-                    value=camera_patches,
-                    need_weights=self.capture_cross_attention,
-                    average_attn_weights=False,
-                )
-                attended_by_camera.append(attended_camera)
-                if self.capture_cross_attention:
-                    captured_by_camera[key] = attention_camera.detach()
-
-            attended = self.camera_fusion(
-                torch.cat(attended_by_camera, dim=-1)
-            )
-            if self.capture_cross_attention:
-                self.last_cross_attention_weights = captured_by_camera
-                self.last_cross_attention_weights_by_camera = captured_by_camera
+            if self.cross_attn_query == "wrench":
+                context, memory = flat_force, flat_images
+                if self.camera_attention_mode == "per_camera" and not self.pre_cross_self_attn_layers:
+                    # Preserve the original per-camera checkpoint's K/V path.
+                    memory = torch.cat(
+                        [encoded_camera_patches[key] for key in image_keys], dim=2
+                    ).reshape(batch_size * obs_steps, image_token_count, self.n_emb)
             else:
-                self.last_cross_attention_weights = None
-                self.last_cross_attention_weights_by_camera = None
-        fused_force = flat_force + self.cross_dropout(attended)
-        fused_force = fused_force + self.cross_ffn(self.cross_output_norm(fused_force))
-        fused_force = fused_force.reshape(
-            batch_size, obs_steps, history_steps, self.n_emb
-        )
+                context, memory = flat_images, flat_force
+            # Each layer updates the query stream; K/V remain the output of
+            # the temporal encoder and optional joint self-attention.
+            for block in (self, *self.extra_cross_attention_layers):
+                context, weights = self._apply_cross_attention(
+                    block, context, memory, image_keys, camera_patch_counts
+                )
+                if self.capture_cross_attention:
+                    detached = (
+                        {key: value.detach() for key, value in weights.items()}
+                        if isinstance(weights, dict) else weights.detach()
+                    )
+                    self.last_cross_attention_weights_by_layer.append(detached)
+            if self.capture_cross_attention:
+                self.last_cross_attention_weights = self.last_cross_attention_weights_by_layer[-1]
+                if self.camera_attention_mode == "per_camera":
+                    self.last_cross_attention_weights_by_camera = self.last_cross_attention_weights
 
-        context = fused_force.reshape(batch_size, -1, self.n_emb)
+        context = context.reshape(batch_size, -1, self.n_emb)
         return self.context_norm(context)

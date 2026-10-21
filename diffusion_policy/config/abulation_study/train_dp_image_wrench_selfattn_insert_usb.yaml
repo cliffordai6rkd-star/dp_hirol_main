@@ -1,0 +1,46 @@
+# @package _global_
+# Experiment 3: [DINO images, LSTM wrench] -> one joint SA -> all tokens to DiT.
+defaults:
+  - /baseline_train/train_dp_self_crossattn_insert_usb
+  - _self_
+
+name: train_dp_image_wrench_selfattn_insert_usb
+
+policy:
+  _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
+  # Match experiment 1's wrench encoder and contact preprocessing.
+  force_temporal_encoder: lstm
+  force_encoder_layers: 1
+  pre_cross_self_attn_layers: 1
+  cross_attn_query: image  # Ignored when cross_attn_layers=0.
+  cross_attn_layers: 0
+  camera_attention_mode: joint
+  mask_schedule:
+    schedule_type: constant
+    start_probability: 0.0
+    end_probability: 0.0
+
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64
+
+training:
+  resume: false
+  num_epochs: null
+  num_optimizer_steps: 200000
+  checkpoint_every_optimizer_steps: 20000
+  max_val_steps: null
+
+checkpoint:
+  topk:
+    monitor_key: val_action_mse_raw
+    mode: min
+    k: 2
+    format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse_raw:.6f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+logging:
+  group: insert_usb_abulation_study
+  tags: [ablation, dinov3, lstm, joint-self-attention, dual-camera]
