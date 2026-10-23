@@ -470,6 +470,7 @@ bash scripts/train_usb_baselines_after_current.sh --wait-pid 12345 \
 config 重建网络，自动识别 Query 方向、力编码器、SA/CA 层数和多相机布局，
 默认读取 EMA 权重。原来的 `visualize_image_query_cross_attention_episode.py`
 命令仍可使用，提供同一套通用参数。
+回放只运行观测编码与融合模块，不调用 DiT 或动作采样，也不计算输出梯度。
 
 ```bash
 python diffusion_policy/scripts/visualize_attention_episode.py \
@@ -527,6 +528,82 @@ patch Query。LSTM/GRU 状态包含序列上下文，时间标签对应编码位
 `--dataset-path`、`--video-backend`、`--fps`、`--video-codec`、`--stride`、
 `--max-frames`、`--alpha`、`--seed`、`--device` 和 `--overwrite`。
 
+如果只研究 Cross-Attention 概率，可使用：
+
+```bash
+python diffusion_policy/scripts/visualize_attention_episode.py \
+  --checkpoint data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt \
+  --episode 0 --camera both --mode cross-attn --layer 0 \
+  --attention-only --attention-normalization percentile \
+  --attention-percentiles 1 99 --save-frames --overwrite
+```
+
+`--attention-only` 仅导出注意力视频、原始概率和元数据，省去 CA-update L2
+视频。当前 checkpoint 是 image Query / wrench Key，每个面板对应一个
+wrench Key：`heatmap_m(i) = mean_head A[head, image_i, wrench_m]`。
+平均全部 wrench Key 会得到恒定的 `1 / K`，因此保留各 wrench 面板，
+不把它们相加或平均成一张“总体空间关注图”。Wrench Query 的 checkpoint
+则按其真实结构展示 `mean_head A[head, wrench_m, image_j]`。
+
+参考 [Visuo-Tactile Transformers for Manipulation 第 4.4 节](https://ar5iv.labs.arxiv.org/html/2210.00121#S4.SS4)：
+论文展示多头注意力平均后的热图，并在附录 6.3 展示视觉/触觉注意力占比。
+其式 (4) 来自图像和触觉联合 token 的注意力，包含四个模态子块；正文未明确
+热图对 Query 行的具体聚合方式，不能声称本脚本精确复现其全部处理。
+当前独立 CA 的 Key 仅有一种模态，也不能从它的概率直接恢复论文中的
+视觉/触觉占比。这些图描述融合层的跨模态读取关系，区别于下面的最终动作
+梯度敏感度。
+
+### 去噪链中的图像与 wrench 注意力路由
+
+`visualize_denoising_attention_episode.py` 对每个 observation window 回放完整的
+DiT 采样轨迹，并将各去噪步的注意力百分比取平均。一个视频帧对应 episode 的
+一个观测时刻，默认按数据集原始帧率连续播放：上方将动作 token 的注意力回溯到
+wrist/side 的 DINO patch，使用与 `wrench_image_self_attn_episode_50.mp4` 一致的
+JET 叠加配色；下方在同一百分比坐标系中绘制图像和 wrench 输入的路由占比
+曲线，竖线指向当前 episode 时刻。热力图与曲线的数值都以**每个去噪步
+路由到条件 token 的总量**为分母，先按步计算百分比，再跨去噪步取平均；所有选中的观测帧和相机
+共用一个热力图色标：先跨去噪步取平均，再对本段视频全部观测窗口、相机和
+观测时刻的 patch 百分比计算 p1/p99，分别映射为 JET 的最冷色和最热色；
+范围外的值截断显示。色条标注实际百分比上下限，整段视频固定使用这一范围。
+可通过 `--attention-percentiles 2 98` 或 `--attention-percentiles 10 90`
+修改分位范围，默认 `1 99`；画面和元数据均记录所选分位范围及实际百分比上下限。
+该显示拉伸不改变 NPZ 中的原始路由百分比或下方曲线数值。
+默认显示最新观测的两路图像，曲线统计全部观测时刻。
+
+直接可视化某一层的 SA/CA 权重，展示该层 Query 对 Key 的 softmax 读取分布；
+这里则从执行动作 chunk 的 token 出发，逐层回溯 DiT、条件编码器和观测融合层，
+展示动作读取条件信息时通向图像 patch 或 wrench 的注意力路由近似。
+每帧先分别计算各去噪步，再等权平均；视频横轴为 episode 时间，
+并未沿采样 scheduler 将这些路由传播为最终动作的因果贡献。
+
+```bash
+python diffusion_policy/scripts/visualize_denoising_attention_episode.py \
+  --checkpoint data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt \
+  --episode 50 --overwrite
+
+python diffusion_policy/scripts/visualize_denoising_attention_episode.py \
+  --checkpoint data/outputs/2026.10.19/13.24.35_train_dp_selfattn_insert_usb_insert_usb_force_aware/checkpoints/FRIST_optimizer_step=00280000-train_loss=0.017619.ckpt \
+  --episode 50 --overwrite
+
+python diffusion_policy/scripts/visualize_denoising_attention_episode.py \
+  --checkpoint data/outputs/2026.10.19/22.25.58_train_dp_self_crossattn_insert_usb_insert_usb_force_aware/checkpoints/FRIST_optimizer_step=00140000-train_loss=0.036929.ckpt \
+  --episode 50 --overwrite
+```
+
+视频、原始百分比 NPZ、元数据 JSON 和可选的 PNG 均保存在 checkpoint 所属
+训练目录的 `attention_visualize/` 下。视频文件名与画面标注融合结构：
+`cross`、`self` 或 `cross+self`。`--max-frames 1` 可先导出一个观测窗口；
+`--observation all` 显示两帧观测，`--action-index` 可只看某个动作位置。
+当前环境的默认数据视频解码使用 `pyav`，输出使用 H.264；`--fps` 可覆盖
+数据集原始播放帧率。
+
+该图是跨 DiT decoder、condition encoder 和观测融合层的残差注意力路由近似，
+不是最终动作的因果归因。特别是当前 `image` Query、一层 CA、无前置联合 SA
+的 checkpoint，残差路由按固定的 0.5/0.5 分给图像和 wrench，因此两条占比
+曲线保持 50%/50%；热力图仍可显示动作读取的图像位置如何随 episode 推进而变化，
+NPZ 中保留各去噪步的原始百分比。
+带图像+wrench 联合 SA 的 checkpoint 则能得到随步数变化的模态路由占比。
+
 ### 最终动作对图像区域的敏感度
 
 `visualize_action_image_attribution_episode.py` 从最终执行的整段 `action`
@@ -557,12 +634,6 @@ clipping、四元数归一化及相对姿态还原。每帧重置相同采样 se
 `--gradient-probes 8`，用 8 个固定 Rademacher 随机投影估计同一完整链的
 Jacobian 能量；这属于近似计算，数值和元数据会注明。完整去噪计算图需要
 保留到反传，显存和耗时会高于原来的单层注意力脚本。
-
-CUDA GPU 可以再加 `--autocast bfloat16`。它只对可微前向启用 bfloat16，
-梯度累积仍使用 float32；当前 RTX GPU 上通常更快、更省显存，但数值会与
-默认 float32 略有差异。标准 KV cache 没有启用：动作 token 每个去噪步都在
-变化，条件 memory 还包含随 timestep 变化的时间 token，动作 self-attention
-也是非因果的，跨步缓存会改变原模型计算。
 
 一个 MP4 中按观测时间分行、相机分列，每张热图覆盖其对应的输入原图。
 `--observation last` 仅显示最新观测，原始数据仍保留全部观测时刻。

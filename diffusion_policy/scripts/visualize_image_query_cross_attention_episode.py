@@ -8,6 +8,9 @@ all cameras and wrench positions. Raw probabilities are saved unchanged.
 Image-query CA also produces a projected CA-update L2 video. This filename
 remains an entry point for existing commands; visualize_attention_episode.py
 provides the same checkpoint-general CLI.
+
+Only observation encoding and fusion run; action diffusion is unnecessary for
+these attention maps. --attention-only suppresses the separate CA-update video.
 """
 
 from __future__ import annotations
@@ -84,6 +87,8 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
     parser.add_argument("--save-frames", action="store_true")
+    parser.add_argument("--attention-only", action="store_true",
+                        help="Export attention probabilities only, without the separate CA-update L2 video.")
     args = parser.parse_args(argv)
     if args.episode is None and not args.list_layers:
         parser.error("--episode is required unless --list-layers is used")
@@ -114,7 +119,7 @@ def output_paths(checkpoint_path, args, capture=None):
         "raw": prefix.with_name(prefix.name + "_raw.npz"),
         "metadata": prefix.with_name(prefix.name + "_metadata.json"),
     }
-    if capture is None or capture.has_updates:
+    if (capture is None or capture.has_updates) and not args.attention_only:
         paths["update"] = prefix.with_name(prefix.name + "_ca_update.mp4")
     return paths
 
@@ -331,6 +336,7 @@ def run(args):
     if args.list_layers:
         return description
     layer_index = capture.layer_index
+    export_updates = capture.has_updates and not args.attention_only
     camera_keys = common.display_camera_keys(policy, args.camera)
     if capture.query_source == "wrench" or capture.mode == "cross-attn":
         labels, offsets = wrench_token_labels(cfg, policy)
@@ -365,9 +371,9 @@ def run(args):
                     if device.type == "cuda" else contextlib.nullcontext()
                 )
                 with torch.inference_mode(), autocast:
-                    policy.predict_action(obs, generator=generator)
+                    policy._encode_context(obs, apply_curriculum_mask=False, generator=generator)
                 attention = capture.attention_by_camera()
-                updates = capture.update_by_camera() if capture.has_updates else {}
+                updates = capture.update_by_camera() if export_updates else {}
                 cameras = {}
                 for key in capture.image_keys:
                     image = sample["obs"][key][-1]
@@ -376,14 +382,14 @@ def run(args):
                         "grid": common.patch_grid(attention[key].shape[-1], *image.shape[-2:], policy.obs_encoder.backbone),
                         "attention": attention[key].numpy(),
                     }
-                    if capture.has_updates:
+                    if export_updates:
                         cameras[key]["update"] = updates[key].numpy()
                 records.append({"anchor": anchor, "cameras": cameras})
                 if frame_index == 0 or (frame_index + 1) % 50 == 0 or frame_index + 1 == len(selected):
                     print(f"Inference {frame_index + 1}/{len(selected)}", flush=True)
         attention_range = None if args.attention_normalization == "fixed" else args.attention_percentiles
         attention_bounds = ATTENTION_BOUNDS if attention_range is None else percentile_bounds(records, "attention", attention_range)
-        bounds = update_bounds(records) if capture.has_updates else None
+        bounds = update_bounds(records) if export_updates else None
         for index, record in enumerate(records):
             frames = {
                 "attention": render_attention(record, camera_keys, labels, episode=args.episode,
@@ -392,7 +398,7 @@ def run(args):
                                                query_source=capture.query_source,
                                                percentile_range=attention_range),
             }
-            if capture.has_updates:
+            if export_updates:
                 frames["update"] = render_update(record, camera_keys, bounds, episode=args.episode,
                                                 alpha=args.alpha, layer_index=layer_index)
             for key, frame in frames.items():
@@ -415,6 +421,8 @@ def run(args):
             "checkpoint": str(checkpoint), "episode": args.episode,
             "frames": len(records), "fps": fps, "video_codec": args.video_codec,
             "layer_index": layer_index, "observation": "latest",
+            "inference_scope": "observation_encoder_and_fusion_only",
+            "action_generation": False, "attention_only": args.attention_only,
             "all_camera_keys": list(capture.image_keys), "display_camera_keys": camera_keys,
             "camera_patch_grids": {key: list(camera["grid"]) for key, camera in records[0]["cameras"].items()},
             "camera_image_shapes": {key: list(camera["image"].shape) for key, camera in records[0]["cameras"].items()},
@@ -432,9 +440,9 @@ def run(args):
             "attention_percentiles": None if attention_range is None else list(attention_range),
             "attention_bounds_scope": "All captured cameras, wrench positions and selected episode frames.",
             "attention_definition": attention_definition(capture),
-            "update_definition": "L2 norm over channels of CA output after output projection, before image residual and FFN; evaluation mode." if capture.has_updates else None,
-            "update_bounds": None if bounds is None else list(bounds), "update_percentiles": [1, 99] if capture.has_updates else None,
-            "update_bounds_scope": "All captured cameras and selected episode frames." if capture.has_updates else None,
+            "update_definition": "L2 norm over channels of CA output after output projection, before image residual and FFN; evaluation mode." if export_updates else None,
+            "update_bounds": None if bounds is None else list(bounds), "update_percentiles": [1, 99] if export_updates else None,
+            "update_bounds_scope": "All captured cameras and selected episode frames." if export_updates else None,
             "preprocessing": "Checkpoint policy observation preprocessing and normalization are preserved.",
             "interpretation": "Single-layer attention and feature update diagnostics; neither is causal action importance. Encoded wrench states include temporal context.",
             "seed": args.seed, "stride": args.stride,

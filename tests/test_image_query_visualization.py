@@ -295,12 +295,40 @@ def test_inference_failure_closes_dataset_and_removes_capture_hooks(pipeline, mo
     def fail(*args, **kwargs):
         raise RuntimeError("inference failed")
 
-    monkeypatch.setattr(policy, "predict_action", fail)
+    monkeypatch.setattr(policy, "_encode_context", fail)
     with pytest.raises(RuntimeError, match="inference failed"):
         visual.run(args)
     assert dataset.closed and not Writer.instances
     assert not policy.obs_encoder._forward_pre_hooks
     assert not policy.obs_encoder.cross_attention._forward_hooks
+
+
+def test_attention_only_matches_original_probabilities_without_sampling_or_action_gradients(pipeline, monkeypatch):
+    args, policy, dataset, Writer = pipeline
+    # Establish an oracle from the former full-prediction path, then make any
+    # action generation fail. Fusion weights must remain identical without it.
+    obs = {key: value.unsqueeze(0) for key, value in dataset.sample["obs"].items()}
+    with torch.inference_mode(), visual.AttentionCapture(policy, mode="cross-attn") as capture:
+        policy.predict_action(obs, generator=torch.Generator().manual_seed(42))
+        expected = capture.attention_by_camera()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Attention export must not call the action policy or DiT")
+
+    monkeypatch.setattr(policy, "predict_action", fail)
+    monkeypatch.setattr(policy.model, "forward", fail)
+    args.attention_only = True
+    paths = visual.run(args)
+    assert dataset.closed and len(Writer.instances) == 1
+    assert "update" not in paths
+    metadata = json.loads(paths["metadata"].read_text())
+    assert metadata["inference_scope"] == "observation_encoder_and_fusion_only"
+    assert metadata["action_generation"] is False and metadata["attention_only"] is True
+    assert metadata["update_definition"] is None
+    with np.load(paths["raw"]) as data:
+        for index, key in enumerate(capture.image_keys):
+            np.testing.assert_allclose(data[f"camera_{index}_attention"][0], expected[key], atol=1e-7)
+            assert f"camera_{index}_update_l2" not in data
 
 
 def test_both_video_writers_close_even_when_an_encoder_fails(pipeline, monkeypatch):
