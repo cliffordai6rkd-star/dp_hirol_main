@@ -74,8 +74,9 @@ policy:
   force_encoder_layers: 1
   # Joint image/wrench self-attention after GRU, then split tokens for Q and K/V.
   pre_cross_self_attn_layers: 1  # Set 0 for GRU -> cross-attention directly.
-  cross_attn_query: wrench  # wrench reads images; image reads wrench (with visual residual).
+  cross_attn_query: wrench  # wrench reads images; image reads wrench.
   cross_attn_layers: 1  # 0 sends all image + wrench tokens to the DiT.
+  cross_attn_query_residual: true  # false uses CA output without adding query tokens.
   # Concatenate all cameras' DINO patches as shared K/V. Wrench queries attend
   # jointly across cameras, then the fused wrench tokens condition the DiT.
   camera_attention_mode: joint
@@ -95,6 +96,13 @@ policy:
   contact_norm: ${contact_norm}
   input_gate_enabled: false
   image_mask_scope: full_context
+  image_blur_schedule:
+    schedule_type: cosine
+    start_step: 0
+    end_step: 10000
+    start_sigma: 5.0
+    end_sigma: 0.0
+  # Retained for legacy token-mask checkpoints; RGB blur takes precedence.
   mask_schedule:
     schedule_type: cosine
     start_step: 0

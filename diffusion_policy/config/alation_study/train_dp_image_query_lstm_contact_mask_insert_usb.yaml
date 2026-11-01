@@ -1,0 +1,22 @@
+# @package _global_
+# Contact curriculum using the legacy learned image-token mask.
+defaults:
+  - /alation_study/train_dp_image_query_lstm_insert_usb
+  - _self_
+
+name: train_dp_image_query_lstm_contact_mask_insert_usb
+
+policy:
+  image_mask_scope: full_context
+  image_blur_schedule: null
+  mask_schedule:
+    schedule_type: piecewise
+    total_steps: ${training.num_optimizer_steps}
+    piecewise_fractions: [0.0, 0.25, 0.75, 1.0]
+    piecewise_probabilities: [1.0, 1.0, 0.0, 0.0]
+    piecewise_interpolation: linear
+
+logging:
+  group: insert_usb_contact_mask_curriculum
+  tags: [ablation, dinov3, image-query, lstm, cross-attention, dual-camera, contact-mask-curriculum, no-visual-residual]
+

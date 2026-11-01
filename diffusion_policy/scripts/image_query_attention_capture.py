@@ -2,7 +2,7 @@
 
 The returned attention maps keep the original softmax over wrench keys.  The
 update maps are channel-wise L2 norms of MultiheadAttention's projected output,
-before the encoder adds the image residual or applies its feed-forward block.
+before the encoder's optional query residual and feed-forward block.
 Both maps use the latest observation of a single episode sample.
 """
 

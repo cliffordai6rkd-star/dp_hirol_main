@@ -24,7 +24,7 @@ class PatchBackbone(nn.Module):
 
 
 def make_policy(mode="force", query="image", camera_mode="joint", self_layers=1,
-                cross_layers=2, steps=2, shapes=None, wrench=2):
+                cross_layers=2, steps=2, shapes=None, wrench=2, query_residual=True):
     torch.manual_seed(84)
     shapes = shapes or {"side": (3, 2, 2), "wrist": (3, 2, 4)}
     common = dict(
@@ -36,6 +36,7 @@ def make_policy(mode="force", query="image", camera_mode="joint", self_layers=1,
         encoder = ForceAwareObsEncoder(
             **common, pre_cross_self_attn_layers=self_layers,
             cross_attn_layers=cross_layers, cross_attn_query=query,
+            cross_attn_query_residual=query_residual,
             camera_attention_mode=camera_mode, force_temporal_encoder="lstm",
         )
     else:
@@ -95,16 +96,23 @@ def test_force_variants_conserve_mass(query, camera_mode, self_layers, cross_lay
 
 
 @pytest.mark.parametrize("query", ["image", "wrench"])
-def test_multiple_ca_layers_accumulate_fixed_memory(query):
+@pytest.mark.parametrize("query_residual", [True, False])
+def test_multiple_ca_layers_accumulate_fixed_memory(query, query_residual):
     policy, sample = make_policy(query=query, self_layers=0, steps=1,
-                                 shapes={"wrist": (3, 2, 4)})
+                                 shapes={"wrist": (3, 2, 4)}, query_residual=query_residual)
     prescribe_attention(policy.obs_encoder.cross_attention, [[[1, 0], [0, 1]]])
     prescribe_attention(policy.obs_encoder.extra_cross_attention_layers[0].cross_attention,
                         [[[0, 1], [1, 0]]])
     with FusionVisualAttentionTrace(policy) as trace:
         policy.obs_encoder(**sample)
         maps, diagnostics = trace.project(torch.tensor([1.0, 0.0]))
-    if query == "image":
+    if not query_residual:
+        expected = [[0.0, 0.0]] if query == "image" else [[0.0, 1.0]]
+        torch.testing.assert_close(maps["wrist"], torch.tensor(expected))
+        torch.testing.assert_close(diagnostics["wrench_mass"], torch.tensor(float(query == "image")))
+        assert trace.architecture["cross_attn_query_residual"] is False
+        assert any("query's influence" in value for value in diagnostics["assumptions"])
+    elif query == "image":
         torch.testing.assert_close(maps["wrist"], torch.tensor([[0.25, 0.0]]))
         torch.testing.assert_close(diagnostics["wrench_mass"], torch.tensor(0.75))
     else:
@@ -209,6 +217,32 @@ def test_no_attention_keeps_identity_and_nonvisual_mass():
     torch.testing.assert_close(maps["side"], torch.tensor([[0.0]]))
     torch.testing.assert_close(maps["wrist"], torch.tensor([[1.0, 2.0]]))
     torch.testing.assert_close(diagnostics["wrench_mass"], torch.tensor(7.0))
+
+
+@pytest.mark.parametrize("mode,query,camera_mode", [
+    ("force", "image", "joint"), ("force", "image", "per_camera"),
+    ("force", "wrench", "joint"), ("dino", "image", "joint"),
+    ("image_self_attn", "image", "joint"), ("self_attn", "image", "joint"),
+])
+@pytest.mark.parametrize("query_residual", [True, False])
+def test_batched_fusion_matches_independent_samples(mode, query, camera_mode, query_residual):
+    policy, sample = make_policy(mode=mode, query=query, camera_mode=camera_mode,
+                                 query_residual=query_residual)
+    images = {key: torch.cat([value, value * 0.4 + 0.2]) for key, value in sample["images"].items()}
+    wrench = torch.cat([sample["wrench_history"], -sample["wrench_history"]])
+    with torch.no_grad(), FusionVisualAttentionTrace(policy, batched=True) as trace:
+        policy.obs_encoder(images=images, wrench_history=wrench)
+        relevance = torch.rand(3, 2, trace.context_tokens)
+        actual, diagnostics = trace.project(relevance)
+    for index in range(2):
+        with torch.no_grad(), FusionVisualAttentionTrace(policy) as trace:
+            policy.obs_encoder(images={key: value[index:index + 1] for key, value in images.items()},
+                               wrench_history=wrench[index:index + 1])
+            expected, single_diagnostics = trace.project(relevance[:, index])
+        for key in images:
+            torch.testing.assert_close(actual[key][:, index], expected[key], atol=2e-6, rtol=2e-5)
+        for key in ("input_mass", "visual_mass", "wrench_mass"):
+            torch.testing.assert_close(diagnostics[key][:, index], single_diagnostics[key], atol=2e-6, rtol=2e-5)
 
 
 @pytest.mark.parametrize("bad", [torch.ones(3), torch.full((6,), -1.0), torch.full((6,), float("nan"))])

@@ -1,0 +1,55 @@
+defaults:
+  - sim_force_aware_dp_train
+  - override task@task: libero_open_top_drawer_put_bowl_20hz_force_aware
+  - _self_
+
+name: sim_force_aware_dp_train_20hz_lstm2
+dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
+
+policy:
+  # Two LSTM layers, one image-query cross-attention layer, and the original DiT.
+  force_encoder_layers: 2
+  # Use the percentage-based learned token mask from the base sim config.
+  image_blur_schedule: null
+  mask_schedule:
+    schedule_type: piecewise
+    total_steps: ${training.num_optimizer_steps}
+    piecewise_fractions: [0.0, 0.25, 0.75, 1.0]
+    piecewise_probabilities: [1.0, 1.0, 0.0, 0.0]
+    piecewise_interpolation: linear
+
+dataloader:
+  batch_size: 32
+
+val_dataloader:
+  batch_size: 32
+
+task:
+  dataset:
+    val_ratio: 0.0
+
+optimizer:
+  learning_rate: 1.0e-4
+
+training:
+  resume: false
+  num_epochs: null
+  num_optimizer_steps: 100000
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  # No held-out split: validation stays disabled throughout this 100k-step run.
+  validation_start_optimizer_step: 100001
+  checkpoint_every_optimizer_steps: 20000
+  max_val_steps: null
+
+checkpoint:
+  topk:
+    # Without validation, retain the latest three periodic checkpoints.
+    monitor_key: null
+    k: 3
+    format_str: optimizer_step={optimizer_step:08d}.ckpt
+
+logging:
+  resume: false
+  group: libero_20hz_lstm2
+  tags: [libero, 20hz, force-aware, future-wrench, dinov3, image-query, lstm2]

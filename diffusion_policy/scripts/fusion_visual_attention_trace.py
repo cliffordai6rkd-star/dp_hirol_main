@@ -1,8 +1,10 @@
 """Trace condition-token attention back to the fusion input's DINO patches.
 
 This is residual-aware attention rollout, not a gradient or causal attribution.
-Heads are averaged; SA uses RowNormalize(I + A), and each CA block assigns
-half of its relevance to its query residual and half to its attention memory.
+Heads are averaged; SA uses RowNormalize(I + A). CA splits relevance equally
+between a query residual and memory when the residual exists; otherwise all
+relevance follows the value path. Query-dependent attention weights are not
+attributed by this approximation.
 Position-wise projections, layer norms and FFNs preserve token positions in
 this approximation. DINO's internal mixing and the force temporal encoder are
 outside the trace: visual maps stop at DINO output patches, and unresolved
@@ -27,6 +29,8 @@ class FusionVisualAttentionTrace:
     each camera map has shape ``[..., n_obs_steps, camera_patch_count]``.
     No spatial renormalization is applied: maps plus unresolved wrench mass
     conserve input relevance. Use an eval-mode encoder and one policy sample.
+    With ``batched=True``, relevance is ``[..., B, S]`` and maps retain the
+    batch axis and encoder device instead of transferring attention to CPU.
 
     Legacy per-camera wrench-query fusion uses a learned channel projection.
     Its cross-camera relevance split cannot be recovered from attention alone;
@@ -34,10 +38,12 @@ class FusionVisualAttentionTrace:
     ``camera_fusion_approximation='equal'`` to use equal camera weights.
     """
 
-    def __init__(self, policy, *, camera_fusion_approximation="error"):
+    def __init__(self, policy, *, camera_fusion_approximation="error", batched=False):
         if camera_fusion_approximation not in {"error", "equal"}:
             raise ValueError("camera_fusion_approximation must be 'error' or 'equal'")
         self.encoder = policy.obs_encoder
+        self.batched = bool(batched)
+        self._forward_signature = inspect.signature(self.encoder.forward)
         self.observation_steps = int(policy.n_obs_steps)
         if self.observation_steps < 1:
             raise ValueError("n_obs_steps must be positive")
@@ -54,6 +60,7 @@ class FusionVisualAttentionTrace:
             self._is_force or self.baseline_mode == "self_attn"
         ) else 0
         self.cross_query = getattr(self.encoder, "cross_attn_query", None)
+        self.cross_query_residual = getattr(self.encoder, "cross_attn_query_residual", True)
         self.camera_mode = getattr(self.encoder, "camera_attention_mode", "joint")
         fusion = self.encoder.pre_cross_self_attention if self._is_force else self.encoder.fusion
         self.self_attention = [layer.self_attn for layer in getattr(fusion, "layers", ())]
@@ -71,7 +78,10 @@ class FusionVisualAttentionTrace:
         self.context_tokens = self.observation_steps * per_step
         self.assumptions = [
             "Attention heads are averaged; SA uses RowNormalize(I+A).",
-            "Each CA block splits relevance equally between query residual and attention memory.",
+            ("Each CA block splits relevance equally between query residual and attention memory."
+             if self.cross_query_residual else
+             "CA has no query residual: relevance follows value paths only; "
+             "the query's influence on attention weights is not attributed."),
             "Tokenwise projections, normalization and FFNs do not change token routing in this approximation.",
             "The spatial boundary is DINO output patches, not raw input pixels or DINO internal attention.",
             "Remaining force-encoder token relevance is reported as nonvisual wrench mass.",
@@ -95,6 +105,7 @@ class FusionVisualAttentionTrace:
             "encoder": type(self.encoder).__name__,
             "baseline_mode": self.baseline_mode,
             "cross_attn_query": self.cross_query,
+            "cross_attn_query_residual": self.cross_query_residual,
             "camera_attention_mode": self.camera_mode,
             "fusion_self_attn_layers": len(self.self_attention),
             "cross_attn_layers": len(self.cross_attention),
@@ -136,6 +147,9 @@ class FusionVisualAttentionTrace:
         self._self_weights = [[] for _ in self.self_attention]
         self._cross_weights = [[] for _ in self.cross_attention]
         self._complete = False
+        self._batch_size = None
+        self._device = torch.device("cpu")
+        self._weights_valid = None
 
     def __enter__(self):
         if self.active:
@@ -166,17 +180,24 @@ class FusionVisualAttentionTrace:
 
     def _reset(self, module, args, kwargs):
         self._clear()
-        bound = inspect.signature(module.forward).bind_partial(*args, **kwargs).arguments
+        bound = self._forward_signature.bind_partial(*args, **kwargs).arguments
         images = bound.get("images")
         if images is None:
             image = bound.get("image")
             if image is None or len(self.image_keys) != 1:
                 raise ValueError("Fusion rollout requires configured image observations")
             images = {self.image_keys[0]: image}
+        first = images[self.image_keys[0]]
+        if first.ndim != 5 or first.shape[0] < 1:
+            raise ValueError("Fusion rollout requires [B,n_obs_steps,C,H,W] images")
+        self._batch_size = first.shape[0]
+        self._device = first.device if self.batched else torch.device("cpu")
         for key in self.image_keys:
             image = images[key]
-            if image.ndim != 5 or tuple(image.shape[:2]) != (1, self.observation_steps):
+            if not self.batched and (image.ndim != 5 or image.shape[0] != 1):
                 raise ValueError("Fusion rollout requires one sample with n_obs_steps images")
+            if image.ndim != 5 or tuple(image.shape[:2]) != (self._batch_size, self.observation_steps):
+                raise ValueError("Fusion rollout requires matching batches with n_obs_steps images")
 
     def _capture_hook(self, kind, index):
         def capture(module, args, output):
@@ -185,16 +206,25 @@ class FusionVisualAttentionTrace:
             weights = output[1]
             if weights is None or weights.ndim != 4:
                 raise RuntimeError("Expected fusion attention [batch, heads, queries, keys]")
-            if not torch.isfinite(weights).all() or (weights < 0).any():
+            valid = torch.isfinite(weights).all() & (weights >= 0).all()
+            if self.batched:
+                self._weights_valid = valid if self._weights_valid is None else self._weights_valid & valid
+            elif not valid:
                 raise RuntimeError("Fusion attention contains invalid probabilities")
             store = self._self_weights if kind == "self" else self._cross_weights
-            store[index].append(weights.detach().float().mean(1).cpu().clone())
+            weights = weights.detach().float().mean(1).to(self._device)
+            if self.batched:
+                steps = 1 if self.baseline_mode == "self_attn" else self.observation_steps
+                if weights.shape[0] != self._batch_size * steps:
+                    raise RuntimeError("Fusion attention batch does not match observations")
+                weights = weights.reshape(self._batch_size, steps, *weights.shape[-2:])
+            store[index].append(weights)
         return capture
 
     def _finish(self, module, args, output):
         if output is None:
             return
-        if output.ndim != 3 or tuple(output.shape[:2]) != (1, self.context_tokens):
+        if output.ndim != 3 or tuple(output.shape[:2]) != (self._batch_size, self.context_tokens):
             raise RuntimeError("Unexpected fusion output token layout")
         for calls in self._self_weights:
             if len(calls) != 1:
@@ -208,22 +238,23 @@ class FusionVisualAttentionTrace:
     @staticmethod
     def _backward_self(relevance, weights):
         count = weights.shape[-1]
-        if weights.shape[-2] != count or relevance.shape[-2:] != (weights.shape[0], count):
+        if weights.shape[-2] != count or relevance.shape[-(weights.ndim - 1):] != weights.shape[:-1]:
             raise RuntimeError("Self-attention and relevance token layouts do not match")
-        transition = weights + torch.eye(count, dtype=weights.dtype).unsqueeze(0)
+        transition = weights + torch.eye(count, dtype=weights.dtype, device=weights.device)
         transition = transition / transition.sum(-1, keepdim=True)
-        return torch.einsum("...ti,tij->...tj", relevance, transition)
+        return torch.einsum("...ti,...tij->...tj", relevance, transition)
 
     def _cross_matrix(self, calls):
         if self.camera_mode == "joint":
             matrix = calls[0]
         elif self.cross_query == "image":
-            matrix = torch.cat(calls, dim=1)
+            matrix = torch.cat(calls, dim=-2)
         else:
-            matrix = torch.cat(calls, dim=2) / len(calls)
+            matrix = torch.cat(calls, dim=-1) / len(calls)
         expected = ((self.image_token_count, self.wrench_count) if self.cross_query == "image"
                     else (self.wrench_count, self.image_token_count))
-        if matrix.shape != (self.observation_steps, *expected):
+        prefix = (self._batch_size, self.observation_steps) if self.batched else (self.observation_steps,)
+        if matrix.shape != (*prefix, *expected):
             raise RuntimeError("Unexpected cross-attention token layout")
         return matrix
 
@@ -231,9 +262,13 @@ class FusionVisualAttentionTrace:
         """Propagate ``[..., context_tokens]`` row weights to camera patches."""
         if not self._complete:
             raise RuntimeError("No complete fusion forward pass was captured")
-        relevance = torch.as_tensor(context_relevance).detach().to(device="cpu", dtype=torch.float32)
+        relevance = torch.as_tensor(context_relevance).detach().to(device=self._device, dtype=torch.float32)
         if relevance.ndim < 1 or relevance.shape[-1] != self.context_tokens:
             raise ValueError(f"context_relevance must end in {self.context_tokens} condition tokens")
+        if self.batched and (relevance.ndim < 2 or relevance.shape[-2] != self._batch_size):
+            raise ValueError("context_relevance batch does not match captured observations")
+        if self._weights_valid is not None and not self._weights_valid:
+            raise RuntimeError("Fusion attention contains invalid probabilities")
         if not torch.isfinite(relevance).all() or (relevance < 0).any():
             raise ValueError("context_relevance must contain finite nonnegative values")
         leading = relevance.shape[:-1]
@@ -244,10 +279,13 @@ class FusionVisualAttentionTrace:
             memory_count = wrench if self.cross_query == "image" else patches
             query = relevance.reshape(*leading, steps, query_count)
             memory = relevance.new_zeros(*leading, steps, memory_count)
+            query_share = 0.5 if self.cross_query_residual else 0.0
             for calls in reversed(self._cross_weights):
                 matrix = self._cross_matrix(calls)
-                memory = memory + 0.5 * torch.einsum("...tq,tqk->...tk", query, matrix)
-                query = query * 0.5
+                memory = memory + (1.0 - query_share) * torch.einsum(
+                    "...btq,btqk->...btk" if self.batched else "...tq,tqk->...tk", query, matrix,
+                )
+                query = query * query_share
             image, force = (query, memory) if self.cross_query == "image" else (memory, query)
             joint = torch.cat((image, force), dim=-1)
         else:

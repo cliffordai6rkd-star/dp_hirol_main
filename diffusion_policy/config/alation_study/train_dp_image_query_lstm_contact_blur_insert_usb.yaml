@@ -1,0 +1,33 @@
+# @package _global_
+# Image Q reads LSTM wrench K/V, without a visual query residual.
+defaults:
+  - /alation_study/train_dp_image_query_lstm_insert_usb
+  - _self_
+
+name: train_dp_image_query_lstm_contact_blur_insert_usb
+
+policy:
+  image_mask_scope: full_context
+  # Blur RGB before DINO for future-contact samples, with no token masking.
+  image_blur_schedule:
+    schedule_type: piecewise
+    start_sigma: 5.0
+    end_sigma: 0.0
+    piecewise_steps: [0, 50000, 150000, 200000]
+    piecewise_sigmas: [5.0, 5.0, 0.0, 0.0]
+    piecewise_interpolation: linear
+
+val_dataloader:
+  # Avoid forking a validation worker after CUDA/pinned-memory training.
+  num_workers: 0
+  persistent_workers: false
+  prefetch_factor: null
+
+training:
+  resume: false
+  num_optimizer_steps: 200000
+  validation_start_optimizer_step: 150000
+
+logging:
+  group: insert_usb_contact_blur_curriculum
+  tags: [ablation, dinov3, image-query, lstm, cross-attention, dual-camera, contact-blur-curriculum, no-visual-residual]

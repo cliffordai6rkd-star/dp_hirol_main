@@ -7,7 +7,7 @@ import torch.nn as nn
 
 
 class _CrossAttentionBlock(nn.Module):
-    """Parameters for one cross-attention + residual + FFN block."""
+    """Parameters for cross-attention, an optional query residual and an FFN."""
 
     def __init__(self, n_emb, n_head, dropout, camera_count=0):
         super().__init__()
@@ -60,6 +60,7 @@ class ForceAwareObsEncoder(nn.Module):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         image_shapes: Optional[Mapping[str, Sequence[int]]] = None,
+        cross_attn_query_residual: bool = True,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -94,6 +95,8 @@ class ForceAwareObsEncoder(nn.Module):
         self.pre_cross_self_attn_layers = int(pre_cross_self_attn_layers)
         self.cross_attn_layers = int(cross_attn_layers)
         self.cross_attn_query = str(cross_attn_query)
+        # Old checkpoint configs omit this option and retain their query skip.
+        self.cross_attn_query_residual = bool(cross_attn_query_residual)
         self.image_shapes = {
             str(key): tuple(shape) for key, shape in (image_shapes or {}).items()
         }
@@ -318,7 +321,9 @@ class ForceAwareObsEncoder(nn.Module):
                 else torch.cat(attended_by_camera, dim=1)
             )
             weights = weights_by_camera
-        fused = query_tokens + block.cross_dropout(attended)
+        fused = block.cross_dropout(attended)
+        if self.cross_attn_query_residual:
+            fused = query_tokens + fused
         fused = fused + block.cross_ffn(block.cross_output_norm(fused))
         return fused, weights
 
@@ -328,13 +333,13 @@ class ForceAwareObsEncoder(nn.Module):
             self.backbone.eval()
         return self
 
-    def _encode_dino(self, image: torch.Tensor):
+    def _encode_dino(self, image: torch.Tensor, *, input_grad: bool = False):
         image = (image - self.image_mean.to(image)) / self.image_std.to(image)
         backbone_kwargs = {"pixel_values": image}
         if self._interpolate_dino_positions:
             # Nero records 192x256 images instead of DINOv3's square pretraining crop.
             backbone_kwargs["interpolate_pos_encoding"] = True
-        if self.freeze_backbone:
+        if self.freeze_backbone and not input_grad:
             with torch.no_grad():
                 outputs = self.backbone(**backbone_kwargs)
         else:
@@ -348,6 +353,67 @@ class ForceAwareObsEncoder(nn.Module):
                 f"DINOv3 returned {tokens.shape[1]} tokens; cannot remove CLS/register tokens"
             )
         return tokens[:, 0], tokens[:, patch_start:]
+
+    def _encode_image_streams(self, images, image_keys, batch_size, obs_steps,
+                              image_token_mask=None, *, input_grad=False):
+        """Shared visual path, before wrench encoding or attention fusion."""
+        camera_groups = {}
+        for key in image_keys:
+            camera_image = images[key]
+            signature = (tuple(camera_image.shape[2:]), camera_image.dtype, camera_image.device)
+            camera_groups.setdefault(signature, []).append(key)
+
+        encoded_camera_patches = {}
+        flat_camera_batch = batch_size * obs_steps
+        for grouped_keys in camera_groups.values():
+            flat_images = torch.cat([
+                images[key].reshape(-1, *images[key].shape[2:]) for key in grouped_keys
+            ], dim=0)
+            _, grouped_patches = self._encode_dino(flat_images, input_grad=input_grad)
+            grouped_patches = self.image_projection(grouped_patches)
+            for key, patch_image in zip(grouped_keys, grouped_patches.split(flat_camera_batch)):
+                if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
+                    raise ValueError(f"DINO patch count does not match configured camera {key!r}")
+                encoded_camera_patches[key] = patch_image.reshape(
+                    batch_size, obs_steps, patch_image.shape[1], self.n_emb
+                )
+
+        camera_patch_tokens = []
+        for camera_index, key in enumerate(image_keys):
+            patch_image = (encoded_camera_patches[key] + self.obs_position[:, :obs_steps]
+                           + self.image_modality)
+            if self.camera_embedding is not None:
+                patch_image = patch_image + self.camera_embedding[:, :, camera_index]
+            if image_token_mask is not None:
+                patch_image = torch.where(
+                    image_token_mask[:, :, None, None],
+                    self.image_mask_token.reshape(1, 1, 1, self.n_emb), patch_image,
+                )
+            camera_patch_tokens.append(patch_image)
+        return encoded_camera_patches, camera_patch_tokens
+
+    def encode_image_context(self, images, *, input_grad=False):
+        """Encode images using the existing visual weights, embeddings and output norm.
+
+        This path never runs the wrench encoder or fusion attention. Frozen
+        backbone weights can still propagate gradients to rendered RGB inputs.
+        """
+        keys = self.image_keys or tuple(sorted(images))
+        if set(images) != set(keys):
+            raise KeyError("Image context requires the encoder's configured cameras")
+        batch_size, obs_steps = images[keys[0]].shape[:2]
+        if not 0 < obs_steps <= self.max_obs_steps:
+            raise ValueError("Image context observation count exceeds encoder positions")
+        for key in keys:
+            value = images[key]
+            if value.ndim != 5 or value.shape[:2] != (batch_size, obs_steps) or value.shape[2] != 3:
+                raise ValueError("Image context requires matching [B, To, 3, H, W] inputs")
+            if key in self.image_shapes and tuple(value.shape[2:]) != self.image_shapes[key]:
+                raise ValueError(f"image {key!r} must have shape {self.image_shapes[key]}")
+        _, tokens = self._encode_image_streams(
+            images, keys, batch_size, obs_steps, input_grad=input_grad,
+        )
+        return self.context_norm(torch.cat(tokens, dim=2).flatten(1, 2))
 
     def forward(
         self,
@@ -437,53 +503,9 @@ class ForceAwareObsEncoder(nn.Module):
                 f"got {tuple(image_token_mask.shape)}"
             )
 
-        # Match native DP's shared-RGB-model path: cameras with the same tensor
-        # shape are concatenated along the batch axis and encoded in one call.
-        camera_groups = {}
-        for key in image_keys:
-            camera_image = images[key]
-            signature = (
-                tuple(camera_image.shape[2:]),
-                camera_image.dtype,
-                camera_image.device,
-            )
-            camera_groups.setdefault(signature, []).append(key)
-
-        encoded_camera_patches = {}
-        flat_camera_batch = batch_size * obs_steps
-        for grouped_keys in camera_groups.values():
-            flat_images = torch.cat(
-                [
-                    images[key].reshape(-1, *images[key].shape[2:])
-                    for key in grouped_keys
-                ],
-                dim=0,
-            )
-            _, grouped_patches = self._encode_dino(flat_images)
-            grouped_patches = self.image_projection(grouped_patches)
-            for key, patch_image in zip(
-                grouped_keys,
-                grouped_patches.split(flat_camera_batch, dim=0),
-            ):
-                if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
-                    raise ValueError(f"DINO patch count does not match configured camera {key!r}")
-                encoded_camera_patches[key] = patch_image.reshape(
-                    batch_size, obs_steps, patch_image.shape[1], self.n_emb
-                )
-
-        camera_patch_tokens = []
-        for camera_index, key in enumerate(image_keys):
-            patch_image = encoded_camera_patches[key]
-            patch_image = patch_image + obs_position + self.image_modality
-            if self.camera_embedding is not None:
-                patch_image = (
-                    patch_image + self.camera_embedding[:, :, camera_index]
-                )
-            if image_token_mask is not None:
-                mask = image_token_mask[:, :, None, None]
-                mask_token = self.image_mask_token.reshape(1, 1, 1, self.n_emb)
-                patch_image = torch.where(mask, mask_token, patch_image)
-            camera_patch_tokens.append(patch_image)
+        encoded_camera_patches, camera_patch_tokens = self._encode_image_streams(
+            images, image_keys, batch_size, obs_steps, image_token_mask,
+        )
 
         force = self.wrench_projection(wrench_history)
         force = (

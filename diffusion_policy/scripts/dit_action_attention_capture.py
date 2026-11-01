@@ -25,10 +25,12 @@ class DitActionAttentionCapture:
     ``action_index`` overrides this with one absolute horizon index. The
     ``denoising_step`` selector chooses one sampling call, defaulting to the
     final call. Use :meth:`step_context_relevance` to inspect every call.
+    ``batched=True`` retains the batch axis and keeps rollout tensors on the
+    model device, returning ``[denoising_calls, batch, context_tokens]``.
     """
 
     def __init__(self, policy, layer_index=-1, action_query="executed",
-                 action_index=None, denoising_step="last"):
+                 action_index=None, denoising_step="last", *, batched=False):
         self.policy = policy
         self.model = getattr(policy, "model", None)
         if not isinstance(self.model, ContextTransformerForDiffusion):
@@ -53,6 +55,8 @@ class DitActionAttentionCapture:
         if action_query not in {"executed", "all", "first", "last"}:
             raise ValueError("action_query must be executed, all, first or last")
         self.action_query = action_query
+        self.batched = bool(batched)
+        self._forward_signature = inspect.signature(self.model.forward)
         self.action_index = None if action_index is None else self._integer(action_index, "action_index")
         if isinstance(denoising_step, str) and denoising_step in {"first", "last"}:
             self.denoising_step = denoising_step
@@ -139,28 +143,31 @@ class DitActionAttentionCapture:
     def _begin_step(self, module, args, kwargs):
         if self._current is not None:
             raise RuntimeError("Previous DiT forward did not finish")
-        inputs = inspect.signature(module.forward).bind(*args, **kwargs).arguments
+        inputs = self._forward_signature.bind(*args, **kwargs).arguments
         sample, context, timestep = (inputs[key] for key in ("sample", "context", "timestep"))
-        if sample.ndim != 3 or context.ndim != 3 or sample.shape[0] != 1 or context.shape[0] != 1:
+        if (sample.ndim != 3 or context.ndim != 3 or sample.shape[0] < 1
+                or sample.shape[0] != context.shape[0]):
+            raise ValueError("DiT rollout requires matching [B,H,D] actions and [B,S,D] context")
+        if not self.batched and sample.shape[0] != 1:
             raise ValueError("DiT episode visualization requires one sample with [1,H,D] actions and [1,S,D] context")
         if context.shape[1] < 1:
             raise ValueError("DiT rollout requires nonempty context")
         if torch.is_tensor(timestep):
             if timestep.numel() != 1:
                 raise ValueError("DiT visualization requires one diffusion timestep")
-            timestep = timestep.detach().item()
-        self._current = {"horizon": sample.shape[1], "context_count": context.shape[1],
+            timestep = timestep.detach() if self.batched else timestep.detach().item()
+        self._current = {"batch": sample.shape[0], "horizon": sample.shape[1], "context_count": context.shape[1],
                          "timestep": timestep, "condition": {}, "self": {}, "cross": {}}
 
     def _record(self, kind, index, output):
         if self._current is None:
             raise RuntimeError("Attention captured outside a DiT forward")
         weights = output[1]
-        if weights is None or weights.ndim != 4 or weights.shape[0] != 1:
-            raise RuntimeError("Unexpected DiT attention shape; expected [1,heads,queries,keys]")
+        if weights is None or weights.ndim != 4 or weights.shape[0] != self._current["batch"]:
+            raise RuntimeError("Unexpected DiT attention shape; expected [B,heads,queries,keys]")
         if index in self._current[kind]:
             raise RuntimeError("Unexpected repeated DiT attention layer")
-        self._current[kind][index] = weights.detach().float().mean(dim=1)[0]
+        self._current[kind][index] = weights.detach().float().mean(dim=1)
 
     def _action_indices(self, horizon):
         if self.action_index is not None:
@@ -179,9 +186,9 @@ class DitActionAttentionCapture:
 
     @staticmethod
     def _residual_attention(weights):
-        if weights.shape[0] != weights.shape[1]:
+        if weights.shape[-2] != weights.shape[-1]:
             raise RuntimeError("Self-attention matrix must be square")
-        residual = weights + torch.eye(weights.shape[0], device=weights.device, dtype=weights.dtype)
+        residual = weights + torch.eye(weights.shape[-1], device=weights.device, dtype=weights.dtype)
         return residual / residual.sum(dim=-1, keepdim=True)
 
     @torch.no_grad()
@@ -193,25 +200,26 @@ class DitActionAttentionCapture:
                 or len(current["self"]) != self.layer_index + 1
                 or len(current["cross"]) != self.layer_index + 1):
             raise RuntimeError("Incomplete DiT attention forward pass")
-        horizon, memory_count = current["horizon"], current["context_count"] + 1
+        batch, horizon, memory_count = current["batch"], current["horizon"], current["context_count"] + 1
         reference = current["cross"][0]
-        query = reference.new_zeros(horizon)
+        query = reference.new_zeros(batch, horizon)
         indices = self._action_indices(horizon)
-        query[indices] = 1.0 / len(indices)
-        memory = reference.new_zeros(memory_count)
+        query[:, indices] = 1.0 / len(indices)
+        memory = reference.new_zeros(batch, memory_count)
         for index in range(self.layer_index, -1, -1):
             cross, self_attention = current["cross"][index], current["self"][index]
-            if cross.shape != (horizon, memory_count) or self_attention.shape != (horizon, horizon):
+            if cross.shape != (batch, horizon, memory_count) or self_attention.shape != (batch, horizon, horizon):
                 raise RuntimeError("DiT attention token counts do not match actions/context")
-            memory += 0.5 * (query @ cross)
-            query = (0.5 * query) @ self._residual_attention(self_attention)
+            memory += 0.5 * torch.bmm(query.unsqueeze(1), cross).squeeze(1)
+            query = torch.bmm((0.5 * query).unsqueeze(1), self._residual_attention(self_attention)).squeeze(1)
         for index in range(len(self.condition_layers) - 1, -1, -1):
             condition = current["condition"][index]
-            if condition.shape != (memory_count, memory_count):
+            if condition.shape != (batch, memory_count, memory_count):
                 raise RuntimeError("Condition attention token count does not match context")
-            memory = memory @ self._residual_attention(condition)
-        self._steps.append({"context": memory[1:].cpu(), "time_mass": float(memory[0]),
-                            "input_action_mass": float(query.sum()),
+            memory = torch.bmm(memory.unsqueeze(1), self._residual_attention(condition)).squeeze(1)
+        self._steps.append({"context": memory[:, 1:] if self.batched else memory[0, 1:].cpu(),
+                            "time_mass": memory[:, 0] if self.batched else float(memory[0, 0]),
+                            "input_action_mass": query.sum(-1) if self.batched else float(query.sum()),
                             "timestep": current["timestep"], "action_indices": indices})
         self._current = None
 
@@ -243,8 +251,10 @@ class DitActionAttentionCapture:
         selected = self._selected_steps()
         index = selected[0]
         contexts = self.step_context_relevance()
-        time_mass = [step["time_mass"] for step in self._steps]
-        action_mass = [step["input_action_mass"] for step in self._steps]
+        time_mass = [step["time_mass"].tolist() if self.batched else step["time_mass"] for step in self._steps]
+        action_mass = [step["input_action_mass"].tolist() if self.batched else step["input_action_mass"] for step in self._steps]
+        timesteps = [step["timestep"].item() if torch.is_tensor(step["timestep"]) else step["timestep"]
+                     for step in self._steps]
         return {
             "method": "equal_residual_attention_rollout",
             "interpretation": "Separate per-denoiser-call attention paths; no scheduler propagation or final-action attribution.",
@@ -256,12 +266,12 @@ class DitActionAttentionCapture:
             "selected_action_indices": self._steps[0]["action_indices"],
             "denoising_step": self.denoising_step,
             "selected_denoising_indices": selected,
-            "timesteps": [step["timestep"] for step in self._steps],
-            "selected_denoising_timesteps": [self._steps[index]["timestep"] for index in selected],
+            "timesteps": timesteps,
+            "selected_denoising_timesteps": [timesteps[index] for index in selected],
             "per_step_time_mass": time_mass,
             "per_step_input_action_mass": action_mass,
-            "per_step_context_mass": contexts.sum(dim=1).tolist(),
+            "per_step_context_mass": contexts.sum(dim=-1).tolist(),
             "time_mass": time_mass[index],
             "input_action_mass": action_mass[index],
-            "context_mass": float(contexts[index].sum()),
+            "context_mass": contexts[index].sum(-1).tolist(),
         }

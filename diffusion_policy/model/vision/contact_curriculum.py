@@ -4,6 +4,7 @@ from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ContactDetector(nn.Module):
@@ -75,12 +76,14 @@ class ContactDetector(nn.Module):
 
 
 class HysteresisContactDetector(nn.Module):
-    """Causal two-threshold contact state detector.
+    """Causal contact state detector with optional consecutive-frame debounce.
 
     The detector enters contact above ``contact_threshold`` and leaves it only
-    below ``free_threshold``.  Values at either boundary and in between retain
-    the previous state.  Input is ``[B, To, K, D]`` and the returned state is
-    ``[B, To]`` so the latch is preserved across the observation sequence.
+    below ``free_threshold``.  ``enter_frames`` and ``exit_frames`` require
+    that many consecutive samples before changing state.  Input is
+    ``[B, To, K, D]`` and the returned state is ``[B, To]``.  With debounce
+    enabled, the K wrench samples are scanned in temporal order and the state
+    is carried from one observation window to the next.
     """
 
     def __init__(
@@ -90,12 +93,14 @@ class HysteresisContactDetector(nn.Module):
         force_dims: Sequence[int] = (0, 1, 2),
         history_reducer: str = "max",
         norm: str = "l1",
+        enter_frames: int = 1,
+        exit_frames: int = 1,
     ) -> None:
         super().__init__()
         if free_threshold < 0 or contact_threshold < 0:
             raise ValueError("contact thresholds must be non-negative")
-        if free_threshold >= contact_threshold:
-            raise ValueError("free_threshold must be smaller than contact_threshold")
+        if free_threshold > contact_threshold:
+            raise ValueError("free_threshold must not exceed contact_threshold")
         if not force_dims:
             raise ValueError("force_dims cannot be empty")
         if history_reducer not in {"last", "max", "mean"}:
@@ -105,11 +110,15 @@ class HysteresisContactDetector(nn.Module):
             )
         if norm not in {"l1", "l2", "sum"}:
             raise ValueError("norm must be one of 'l1', 'l2', or 'sum'")
+        if int(enter_frames) < 1 or int(exit_frames) < 1:
+            raise ValueError("enter_frames and exit_frames must be positive")
         self.register_buffer("free_threshold", torch.tensor(float(free_threshold)))
         self.register_buffer("contact_threshold", torch.tensor(float(contact_threshold)))
         self.force_dims = tuple(int(dim) for dim in force_dims)
         self.history_reducer = history_reducer
         self.norm = "l1" if norm == "sum" else norm
+        self.enter_frames = int(enter_frames)
+        self.exit_frames = int(exit_frames)
 
     def _reduced_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
         if raw_wrench.ndim != 4:
@@ -134,20 +143,61 @@ class HysteresisContactDetector(nn.Module):
         return magnitude.mean(dim=-1)
 
     def forward(self, raw_wrench: torch.Tensor) -> torch.Tensor:
-        magnitude = self._reduced_magnitude(raw_wrench)
-        batch_size, obs_steps = magnitude.shape
+        if self.enter_frames == 1 and self.exit_frames == 1:
+            magnitude = self._reduced_magnitude(raw_wrench)
+            batch_size, obs_steps = magnitude.shape
+            result = torch.zeros_like(magnitude, dtype=torch.bool)
+            contact_threshold = self.contact_threshold.to(magnitude)
+            free_threshold = self.free_threshold.to(magnitude)
+            if obs_steps == 0:
+                return result
+            result[:, 0] = magnitude[:, 0] > contact_threshold
+            for index in range(1, obs_steps):
+                result[:, index] = torch.where(
+                    result[:, index - 1],
+                    magnitude[:, index] >= free_threshold,
+                    magnitude[:, index] > contact_threshold,
+                )
+            return result
+
+        # Consecutive-frame debounce must inspect every wrench token.  Flatten
+        # [To, K] while retaining the state at the end of each observation.
+        magnitude = self._per_token_magnitude(raw_wrench)
+        states = self._scan_tokens(magnitude.reshape(magnitude.shape[0], -1))
+        return states.reshape_as(magnitude)[..., -1]
+
+    def _scan_tokens(
+        self, magnitude: torch.Tensor, initial_state: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Scan ``[B, N]`` magnitudes and return the latched state per token."""
+        if magnitude.ndim != 2:
+            raise ValueError(f"magnitude must have shape [B, N], got {tuple(magnitude.shape)}")
+        batch_size, token_count = magnitude.shape
+        state = (
+            torch.zeros((batch_size,), dtype=torch.bool, device=magnitude.device)
+            if initial_state is None
+            else initial_state.to(device=magnitude.device, dtype=torch.bool).reshape(batch_size)
+        )
         result = torch.zeros_like(magnitude, dtype=torch.bool)
+        above_count = torch.zeros((batch_size,), dtype=torch.int64, device=magnitude.device)
+        below_count = torch.zeros((batch_size,), dtype=torch.int64, device=magnitude.device)
         contact_threshold = self.contact_threshold.to(magnitude)
         free_threshold = self.free_threshold.to(magnitude)
-        if obs_steps == 0:
-            return result
-        result[:, 0] = magnitude[:, 0] > contact_threshold
-        for index in range(1, obs_steps):
-            result[:, index] = torch.where(
-                result[:, index - 1],
-                magnitude[:, index] >= free_threshold,
-                magnitude[:, index] > contact_threshold,
-            )
+        for index in range(token_count):
+            value = magnitude[:, index]
+            above = value > contact_threshold
+            below = value < free_threshold
+            above_count = torch.where(above, above_count + 1, torch.zeros_like(above_count))
+            below_count = torch.where(below, below_count + 1, torch.zeros_like(below_count))
+            enter = (~state) & (above_count >= self.enter_frames)
+            leave = state & (below_count >= self.exit_frames)
+            state = torch.where(enter, torch.ones_like(state), state)
+            state = torch.where(leave, torch.zeros_like(state), state)
+            # A transition consumes the streak that caused it.  This prevents
+            # a stale counter from immediately triggering the opposite edge.
+            above_count = torch.where(enter, torch.zeros_like(above_count), above_count)
+            below_count = torch.where(leave, torch.zeros_like(below_count), below_count)
+            result[:, index] = state
         return result
 
     def rollout_future(
@@ -167,18 +217,28 @@ class HysteresisContactDetector(nn.Module):
             raise ValueError(
                 "initial_state must have shape [B, To] matching the future wrench"
             )
-        contact_threshold = self.contact_threshold.to(magnitude)
-        free_threshold = self.free_threshold.to(magnitude)
-        result = torch.zeros_like(magnitude, dtype=torch.bool)
-        state = initial_state.to(device=magnitude.device, dtype=torch.bool)
-        for index in range(magnitude.shape[-1]):
-            state = torch.where(
-                state,
-                magnitude[..., index] >= free_threshold,
-                magnitude[..., index] > contact_threshold,
-            )
-            result[..., index] = state
-        return result
+        if self.enter_frames == 1 and self.exit_frames == 1:
+            contact_threshold = self.contact_threshold.to(magnitude)
+            free_threshold = self.free_threshold.to(magnitude)
+            result = torch.zeros_like(magnitude, dtype=torch.bool)
+            state = initial_state.to(device=magnitude.device, dtype=torch.bool)
+            for index in range(magnitude.shape[-1]):
+                state = torch.where(
+                    state,
+                    magnitude[..., index] >= free_threshold,
+                    magnitude[..., index] > contact_threshold,
+                )
+                result[..., index] = state
+            return result
+
+        # Each future observation has its own initial state, then scans its K
+        # future wrench samples in order.
+        states = []
+        for obs_index in range(magnitude.shape[1]):
+            states.append(self._scan_tokens(
+                magnitude[:, obs_index], initial_state=initial_state[:, obs_index]
+            ))
+        return torch.stack(states, dim=1)
 
     def _per_token_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
         if raw_wrench.ndim != 4:
@@ -252,6 +312,8 @@ class MaskProbabilityScheduler(nn.Module):
         piecewise_steps: Optional[Sequence[int]] = None,
         piecewise_probabilities: Optional[Sequence[float]] = None,
         piecewise_interpolation: str = "linear",
+        total_steps: Optional[int] = None,
+        piecewise_fractions: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         supported = {"constant", "linear", "cosine", "exponential", "piecewise"}
@@ -277,6 +339,31 @@ class MaskProbabilityScheduler(nn.Module):
         self.exponential_rate = float(exponential_rate)
         self.piecewise_interpolation = piecewise_interpolation
 
+        if piecewise_fractions is not None:
+            if piecewise_steps:
+                raise ValueError(
+                    "provide either piecewise_steps or piecewise_fractions, not both"
+                )
+            if total_steps is None or int(total_steps) < 1:
+                raise ValueError(
+                    "piecewise_fractions requires a positive total_steps"
+                )
+            fractions = tuple(float(value) for value in piecewise_fractions)
+            if (
+                len(fractions) < 1
+                or any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions)
+                or tuple(sorted(fractions)) != fractions
+            ):
+                raise ValueError(
+                    "piecewise_fractions must be sorted finite values in [0, 1]"
+                )
+            piecewise_steps = tuple(
+                int(round(value * int(total_steps))) for value in fractions
+            )
+            if tuple(sorted(set(piecewise_steps))) != piecewise_steps:
+                raise ValueError(
+                    "piecewise_fractions must map to distinct optimizer steps"
+                )
         self.piecewise_steps = tuple(int(step) for step in (piecewise_steps or ()))
         self.piecewise_probabilities = tuple(
             float(value) for value in (piecewise_probabilities or ())
@@ -335,6 +422,64 @@ class MaskProbabilityScheduler(nn.Module):
 
     def forward(self, optimizer_step: int) -> float:
         return self.probability(optimizer_step)
+
+
+class BlurSigmaScheduler(MaskProbabilityScheduler):
+    """Schedule Gaussian standard deviation in input-image pixels."""
+
+    def __init__(
+        self,
+        start_sigma: float = 5.0,
+        end_sigma: float = 0.0,
+        piecewise_sigmas: Optional[Sequence[float]] = None,
+        **kwargs,
+    ) -> None:
+        sigmas = [float(start_sigma), float(end_sigma)]
+        points = [float(value) for value in (piecewise_sigmas or ())]
+        if any(not math.isfinite(value) or value < 0 for value in (*sigmas, *points)):
+            raise ValueError("blur sigmas must be finite and non-negative")
+        self.sigma_scale = max(*sigmas, *points, 1.0)
+        super().__init__(
+            start_probability=sigmas[0] / self.sigma_scale,
+            end_probability=sigmas[1] / self.sigma_scale,
+            piecewise_probabilities=[value / self.sigma_scale for value in points],
+            **kwargs,
+        )
+
+    def sigma(self, optimizer_step: int) -> float:
+        return self.probability(optimizer_step) * self.sigma_scale
+
+    def forward(self, optimizer_step: int) -> float:
+        return self.sigma(optimizer_step)
+
+
+def gaussian_blur_images(images: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur on [..., C, H, W], with an exact identity at zero.
+
+    Kernels span three standard deviations, limited by reflect-padding bounds.
+    Filtering runs in float32 even inside the policy's AMP context.
+    """
+    if not math.isfinite(sigma) or sigma < 0:
+        raise ValueError("blur sigma must be finite and non-negative")
+    if sigma == 0:
+        return images
+    channels, height, width = images.shape[-3:]
+    with torch.autocast(device_type=images.device.type, enabled=False):
+        result = images.reshape(-1, channels, height, width).float()
+        for axis, size in ((-1, width), (-2, height)):
+            radius = min(math.ceil(3 * sigma), size - 1)
+            if radius == 0:
+                continue
+            positions = torch.arange(-radius, radius + 1, device=images.device, dtype=torch.float32)
+            kernel = torch.exp(-0.5 * (positions / sigma).square())
+            kernel = kernel / kernel.sum()
+            if axis == -1:
+                padding, shape = (radius, radius, 0, 0), (1, 1, 1, -1)
+            else:
+                padding, shape = (0, 0, radius, radius), (1, 1, -1, 1)
+            weight = kernel.reshape(shape).expand(channels, -1, -1, -1)
+            result = F.conv2d(F.pad(result, padding, mode="reflect"), weight, groups=channels)
+    return result.reshape_as(images).to(images.dtype)
 
 
 class ContactAwareImageMasker(nn.Module):

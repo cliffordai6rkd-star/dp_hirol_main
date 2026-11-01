@@ -47,8 +47,9 @@ policy:
   force_temporal_encoder: gru  # gru | lstm | transformer | none
   force_encoder_layers: 1
   pre_cross_self_attn_layers: 1  # Joint image/wrench self-attention before splitting Q/KV.
-  cross_attn_query: wrench  # wrench reads images; image reads wrench (with visual residual).
+  cross_attn_query: wrench  # wrench reads images; image reads wrench.
   cross_attn_layers: 1  # 0 sends all image + wrench tokens to the DiT.
+  cross_attn_query_residual: true  # false uses CA output without adding query tokens.
   # One cross-attention over the concatenated DINO patches of all cameras.
   camera_attention_mode: joint
 
@@ -70,6 +71,13 @@ policy:
 
   # Ablation choices: current_observation or full_context.
   image_mask_scope: full_context
+  image_blur_schedule:
+    schedule_type: cosine
+    start_step: 0
+    end_step: 30000
+    start_sigma: 5.0
+    end_sigma: 0.0
+  # Retained for legacy token-mask checkpoints; RGB blur takes precedence.
   mask_schedule:
     # Choices: constant, linear, cosine, exponential, piecewise.
     schedule_type: cosine
@@ -141,6 +149,8 @@ training:
   checkpoint_every: 10
   # Set to null to retain the legacy epoch-based checkpoint_every behavior.
   checkpoint_every_optimizer_steps: 5000
+  # Skip validation and validation-based Top-K/best selection before this update.
+  validation_start_optimizer_step: 0
   val_every: 5
   sample_every: 10
   max_train_steps: null

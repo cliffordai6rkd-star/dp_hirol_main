@@ -78,7 +78,10 @@ def open_or_build_image_result_cache(
     cache_path = _resolve_cache_path(load_result_add, dataset_path, metadata)
     lock_path = cache_path + ".lock"
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    _register_cache_cleanup(cache_path, logger=logger)
+    # Shared caches must survive individual ranks exiting, including when a
+    # different RAM-backed mount is selected with DP_SHARED_IMAGE_CACHE_DIR.
+    if not use_shared_ram_result_cache(load_result_add):
+        _register_cache_cleanup(cache_path, logger=logger)
 
     with FileLock(lock_path):
         if _is_valid_cache(cache_path, metadata):
@@ -98,6 +101,11 @@ def open_or_build_image_result_cache(
 
     root = zarr.open(cache_path, mode="r")
     return {key: root[key] for key in metadata["rgb_keys"]}, cache_path
+
+
+def image_result_cache_is_valid(load_result_add, dataset_path, metadata):
+    """Allow later DDP ranks to reuse a complete RAM cache even when RAM is now full."""
+    return _is_valid_cache(_resolve_cache_path(load_result_add, dataset_path, metadata), metadata)
 
 
 def build_in_memory_image_result_cache(

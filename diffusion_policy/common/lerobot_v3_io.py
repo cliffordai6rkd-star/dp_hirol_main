@@ -50,13 +50,6 @@ def _feature_spec_for_lerobot(features: Mapping[str, Mapping], use_videos: bool)
     return converted
 
 
-def _scalar_value(value):
-    array = np.asarray(value)
-    if array.size != 1:
-        raise ValueError(f"Expected scalar-compatible value, got shape {array.shape}.")
-    return array.reshape(-1)[0].item()
-
-
 class LeRobotV3Writer:
     """Small project wrapper around official lerobot.datasets.LeRobotDataset.create."""
 
@@ -116,7 +109,10 @@ class LeRobotV3Writer:
                 # does not pull in OpenCV's conflicting image libraries.
                 value = np.ascontiguousarray(np.asarray(value)[..., ::-1])
             elif tuple(spec.get("shape", ())) == (1,):
-                value = _scalar_value(value)
+                # LeRobot validates fixed-shape numeric features before
+                # writing. Accept Python/NumPy scalars from callers while
+                # presenting the required one-element array to the validator.
+                value = np.asarray(value, dtype=np.dtype(spec["dtype"])).reshape(1)
             lerobot_frame[key] = value
 
         if "next.done" in self.features and "next.done" not in lerobot_frame:
@@ -205,7 +201,16 @@ class LeRobotV3Dataset:
         episodes = getattr(self.dataset.meta, "episodes", None)
         if episodes is None:
             return []
-        return ["" if episode.get("task") is None else str(episode.get("task")) for episode in episodes]
+        tasks = []
+        for episode in episodes:
+            # LeRobot v3 stores episode tasks under ``tasks`` as a list.  A
+            # few older local metadata files used the singular ``task`` key;
+            # accept both so callers see the actual task name either way.
+            value = episode.get("tasks", episode.get("task"))
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else ""
+            tasks.append("" if value is None else str(value))
+        return tasks
 
     def get_column(self, name: str) -> List:
         hf_dataset = self.dataset.hf_dataset

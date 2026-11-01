@@ -8,6 +8,7 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
+from diffusion_policy.workspace import train_force_aware_diffusion_workspace as workspace_module
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
     TrainForceAwareDiffusionWorkspace,
 )
@@ -158,8 +159,101 @@ def test_validation_checkpoint_refuses_empty_split_and_restores_training_mode(tm
     assert workspace.model.training
 
 
-def test_step_checkpoint_gets_fresh_validation_before_ranking(tmp_path):
+@pytest.mark.parametrize("failure_at", ["scalar", "image_creation", "image_upload"])
+def test_wandb_failure_preserves_validation_checkpoint_and_training(tmp_path, monkeypatch, failure_at):
     workspace = make_workspace(tmp_path)
+    plot_path = tmp_path / "val_loss.png"
+    workspace._update_validation_plot = Mock(return_value=plot_path)
+
+    def create_image(path):
+        assert Path(path) == plot_path
+        if failure_at == "image_creation":
+            raise workspace_module.wandb.errors.CommError("403 Forbidden")
+        return object()
+
+    monkeypatch.setattr(workspace_module.wandb, "Image", create_image)
+
+    class FailingRemoteLogger(_Logger):
+        def log(self, record, **kwargs):
+            super().log(record, **kwargs)
+            if failure_at == "scalar" or "val_loss_plot" in record:
+                raise workspace_module.wandb.errors.CommError("403 Forbidden")
+
+    remote_logger, local_logger = FailingRemoteLogger(), _Logger()
+    metrics = workspace._validate_and_log(
+        workspace.cfg, make_batches(), torch.device("cpu"), remote_logger, local_logger,
+    )
+    assert metrics["val_loss"] == pytest.approx(3.0)
+    assert local_logger.records[-1]["val_loss"] == metrics["val_loss"]
+    workspace._update_validation_plot.assert_called_once()
+    assert workspace.model.training
+
+    # BaseWorkspace serializes objects exposing state_dict; do not include a
+    # unittest Mock, whose dynamic attributes also match that interface.
+    del workspace._update_validation_plot
+    manager = workspace._make_topk_manager(workspace.cfg)
+    workspace._save_optimizer_step_checkpoint(
+        workspace.cfg, manager, dict(metrics, optimizer_step=workspace.optimizer_step),
+    )
+    assert (tmp_path / "checkpoints/latest.ckpt").is_file()
+    assert (tmp_path / "checkpoints/best.ckpt").is_file()
+
+    # The same W&B failure must not prevent the next real optimizer update.
+    remote_calls = len(remote_logger.records)
+    workspace.cfg.training.checkpoint_every_optimizer_steps = None
+    scheduler = torch.optim.lr_scheduler.LambdaLR(workspace.optimizer, lambda _: 1.0)
+    workspace._train_epoch(
+        cfg=workspace.cfg, dataloader=make_batches(), device=torch.device("cpu"),
+        lr_scheduler=scheduler, ema=None, wandb_run=remote_logger, json_logger=local_logger,
+        target_optimizer_steps=1,
+    )
+    assert workspace.optimizer_step == 1
+    assert local_logger.records[-1]["optimizer_step"] == 1
+    assert len(remote_logger.records) == remote_calls
+
+
+def test_disabled_wandb_skips_media_creation_and_keeps_local_plot(tmp_path, monkeypatch):
+    workspace = make_workspace(tmp_path)
+    workspace._update_validation_plot = Mock(return_value=tmp_path / "val_loss.png")
+    image = Mock(side_effect=AssertionError("Disabled W&B must not construct media"))
+    monkeypatch.setattr(workspace_module.wandb, "Image", image)
+    local_logger = _Logger()
+    workspace._validate_and_log(
+        workspace.cfg, make_batches(), torch.device("cpu"),
+        workspace_module._NullLogger(), local_logger,
+    )
+    assert local_logger.records[-1]["val_loss"] == pytest.approx(3.0)
+    workspace._update_validation_plot.assert_called_once()
+    image.assert_not_called()
+
+
+def test_validation_start_skips_loader_and_logging_until_exact_boundary(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.cfg.training.validation_start_optimizer_step = 4
+    workspace._update_validation_plot = Mock(return_value=None)
+    wandb_logger, json_logger = _Logger(), _Logger()
+    workspace.optimizer_step = 3
+    rng_before = torch.get_rng_state().clone()
+    assert workspace._validate_and_log(
+        workspace.cfg, None, torch.device("cpu"), wandb_logger, json_logger,
+    ) == {}
+    assert not workspace.model.prediction_calls
+    assert not json_logger.records and not wandb_logger.records
+    assert not hasattr(workspace, "_last_validation_step")
+    torch.testing.assert_close(torch.get_rng_state(), rng_before)
+
+    workspace.optimizer_step = 4
+    metrics = workspace._validate_and_log(
+        workspace.cfg, make_batches(), torch.device("cpu"), wandb_logger, json_logger,
+    )
+    assert "val_action_mse_raw" in metrics
+    assert len(workspace.model.prediction_calls) == 2
+
+
+@pytest.mark.parametrize("validation_start, expected_steps", [(0, [2, 4]), (4, [4])])
+def test_step_checkpoint_gets_fresh_validation_before_ranking(tmp_path, validation_start, expected_steps):
+    workspace = make_workspace(tmp_path)
+    workspace.cfg.training.validation_start_optimizer_step = validation_start
     seen_steps = []
 
     def validate(*args):
@@ -174,10 +268,70 @@ def test_step_checkpoint_gets_fresh_validation_before_ranking(tmp_path):
         lr_scheduler=scheduler, ema=None, wandb_run=_Logger(), json_logger=_Logger(),
         target_optimizer_steps=5, val_dataloader=make_batches(),
     )
-    assert seen_steps == [2, 4]
+    assert seen_steps == expected_steps
     saved = workspace._save_optimizer_step_checkpoint.call_args_list
-    assert [call.kwargs["metric_dict"]["val_action_mse_raw"] for call in saved] == [2.0, 4.0]
+    assert [call.kwargs["metric_dict"].get("val_action_mse_raw") for call in saved] == [
+        2.0 if validation_start <= 2 else None, 4.0,
+    ]
     assert workspace.model.training
+
+
+@pytest.mark.parametrize("checkpoint_mode", ["step", "epoch"])
+def test_early_checkpoint_only_updates_latest_even_if_given_validation_score(tmp_path, checkpoint_mode):
+    workspace = make_workspace(tmp_path)
+    workspace.cfg.training.validation_start_optimizer_step = 4
+    manager = workspace._make_topk_manager(workspace.cfg)
+
+    def save(step, mse):
+        workspace.optimizer_step = workspace.global_step = step
+        metrics = {"optimizer_step": step, "val_action_mse_raw": mse}
+        if checkpoint_mode == "step":
+            workspace._save_optimizer_step_checkpoint(workspace.cfg, manager, metrics)
+        else:
+            workspace._save_checkpoints(workspace.cfg, metrics, manager)
+
+    save(2, 0.001)  # A smaller early score must never enter the ranking.
+    directory = tmp_path / "checkpoints"
+    assert not manager.path_value_map
+    assert not (directory / "best.ckpt").exists()
+    assert not list(directory.glob("optimizer_step=*.ckpt"))
+    assert dill.loads(load_payload(directory / "latest.ckpt")["pickles"]["optimizer_step"]) == 2
+
+    save(4, 0.5)
+    assert list(manager.path_value_map.values()) == [0.5]
+    assert "00000004" in (directory / "best.ckpt").resolve().name
+    assert workspace.topk_state["validation_start_optimizer_step"] == 4
+
+
+def test_changed_validation_start_discards_old_ranking_on_resume_without_deleting_weights(tmp_path):
+    workspace = make_workspace(tmp_path)
+    manager = workspace._make_topk_manager(workspace.cfg)
+    workspace.optimizer_step = workspace.global_step = 2
+    workspace._save_optimizer_step_checkpoint(
+        workspace.cfg, manager, {"optimizer_step": 2, "val_action_mse_raw": 0.001},
+    )
+    directory = tmp_path / "checkpoints"
+    early = (directory / "best.ckpt").resolve()
+    resumed = make_workspace(tmp_path)
+    resumed.load_payload(load_payload(directory / "latest.ckpt"))
+    # This is also the shape of checkpoints saved before the new setting existed.
+    resumed.topk_state.pop("validation_start_optimizer_step")
+    resumed.cfg.training.validation_start_optimizer_step = 4
+    manager = resumed._make_topk_manager(resumed.cfg)
+    assert not manager.path_value_map
+    assert not resumed.topk_state["path_value_map"]
+    assert not (directory / "best.ckpt").is_symlink()
+    assert early.is_file() and (directory / "latest.ckpt").is_file()
+
+    resumed.optimizer_step = 4
+    resumed._save_optimizer_step_checkpoint(
+        resumed.cfg, manager, {"optimizer_step": 4, "val_action_mse_raw": 0.5},
+    )
+    assert "00000004" in (directory / "best.ckpt").resolve().name
+    restored = make_workspace(tmp_path)
+    restored.cfg.training.validation_start_optimizer_step = 4
+    restored.load_payload(load_payload(directory / "latest.ckpt"))
+    assert restored._make_topk_manager(restored.cfg).path_value_map == manager.path_value_map
 
 
 def test_topk_uses_rollout_mse_and_latest_does_not_overwrite_best(tmp_path):
@@ -250,3 +404,61 @@ def test_self_cross_config_ranks_raw_inference_mse_on_full_validation_split():
     assert cfg.training.max_val_steps is None
     assert cfg.training.checkpoint_every_optimizer_steps == 20000
     assert original.checkpoint.topk.monitor_key == "train_loss"
+
+
+@pytest.mark.parametrize("name", [
+    "train_dp_image_query_lstm_contact_blur_insert_usb",
+    "train_dp_image_wrench_selfattn_contact_blur_insert_usb",
+])
+def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
+    from diffusion_policy.model.vision.contact_curriculum import BlurSigmaScheduler
+
+    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
+    with initialize_config_dir(config_dir=str(root), version_base=None):
+        cfg = compose(config_name="alation_study/" + name)
+        baseline = compose(config_name="alation_study/train_dp_image_query_lstm_insert_usb")
+    start = cfg.training.validation_start_optimizer_step
+    assert start == int(0.75 * cfg.training.num_optimizer_steps) == 150000
+    assert baseline.training.validation_start_optimizer_step == 0
+    scheduler = BlurSigmaScheduler(**cfg.policy.image_blur_schedule)
+    assert scheduler.sigma(start - 1) > 0
+    assert scheduler.sigma(start) == 0
+    assert cfg.val_dataloader.num_workers == 0
+    assert cfg.val_dataloader.persistent_workers is False
+    assert cfg.val_dataloader.prefetch_factor is None
+    assert scheduler.sigma(50_000) == 5
+    assert scheduler.sigma(100_000) == 2.5
+    assert cfg.policy.mask_schedule.start_probability == 0
+    assert cfg.policy.force_temporal_encoder == "lstm"
+    if "image_query" in name:
+        assert cfg.policy.pre_cross_self_attn_layers == 0
+        assert cfg.policy.cross_attn_layers == 1
+        assert cfg.policy.cross_attn_query_residual is False
+    else:
+        assert cfg.policy.pre_cross_self_attn_layers == 1
+        assert cfg.policy.cross_attn_layers == 0
+
+
+@pytest.mark.parametrize("name,sa_layers,ca_layers", [
+    ("train_dp_image_query_lstm_contact_mask_insert_usb", 0, 1),
+    ("train_dp_image_wrench_selfattn_contact_mask_insert_usb", 1, 0),
+])
+def test_contact_mask_configs_restore_legacy_token_mask(name, sa_layers, ca_layers):
+    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
+    with initialize_config_dir(config_dir=str(root), version_base=None):
+        cfg = compose(config_name="alation_study/" + name)
+    assert cfg.policy.image_blur_schedule is None
+    assert cfg.policy.image_mask_scope == "full_context"
+    assert cfg.policy.mask_schedule.schedule_type == "piecewise"
+    assert cfg.policy.mask_schedule.total_steps == cfg.training.num_optimizer_steps
+    assert list(cfg.policy.mask_schedule.piecewise_fractions) == [0.0, 0.25, 0.75, 1.0]
+    assert list(cfg.policy.mask_schedule.piecewise_probabilities) == [1.0, 1.0, 0.0, 0.0]
+    assert cfg.policy.pre_cross_self_attn_layers == sa_layers
+    assert cfg.policy.cross_attn_layers == ca_layers
+
+
+def test_negative_validation_start_is_rejected(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.cfg.training.validation_start_optimizer_step = -1
+    with pytest.raises(ValueError, match="validation_start_optimizer_step"):
+        workspace._validation_enabled(workspace.cfg)

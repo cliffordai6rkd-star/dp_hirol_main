@@ -95,6 +95,7 @@ class AttentionCapture:
             "baseline_mode": self.baseline_mode,
             "force_encoder": getattr(self.encoder, "force_temporal_encoder_type", None),
             "cross_attn_query": getattr(self.encoder, "cross_attn_query", None),
+            "cross_attn_query_residual": getattr(self.encoder, "cross_attn_query_residual", True),
             "force_encoder_layers": force_layers,
             "pre_cross_self_attn_layers": len(fusion_layers) if self._is_force else 0,
             "cross_attn_layers": cross_count,

@@ -14,6 +14,7 @@ policy:
   force_encoder_layers: 0
   pre_cross_self_attn_layers: 0  # Image-only context has no cross-attention stage.
   camera_attention_mode: joint
+  image_blur_schedule: null
   mask_schedule:
     schedule_type: constant
     start_probability: 0.0

@@ -17,6 +17,7 @@ policy:
   pre_cross_self_attn_layers: 0
   cross_attn_layers: 0
   camera_attention_mode: joint
+  image_blur_schedule: null
   mask_schedule:
     schedule_type: constant
     start_probability: 0.0

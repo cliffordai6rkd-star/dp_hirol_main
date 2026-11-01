@@ -1,0 +1,14 @@
+# @package _global_
+# [DINO images, LSTM wrench] -> one joint SA -> all tokens to DiT.
+defaults:
+  - /alation_study/train_dp_image_query_lstm_contact_blur_insert_usb
+  - _self_
+
+name: train_dp_image_wrench_selfattn_contact_blur_insert_usb
+
+policy:
+  pre_cross_self_attn_layers: 1
+  cross_attn_layers: 0
+
+logging:
+  tags: [ablation, dinov3, lstm, joint-self-attention, dual-camera, contact-blur-curriculum]

@@ -16,6 +16,7 @@ import os
 import pathlib
 import random
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Optional
 
 import hydra
@@ -73,6 +74,9 @@ class _NullLogger(contextlib.AbstractContextManager):
         return False
 
     def log(self, value, **kwargs) -> None:
+        pass
+
+    def finish(self) -> None:
         pass
 
 
@@ -136,9 +140,13 @@ def initialize_distributed(training_cfg) -> DistributedContext:
             f"{torch.cuda.device_count()}"
         )
     torch.cuda.set_device(local_rank)
+    group_options = {}
+    if distributed_cfg.get("timeout_seconds") is not None:
+        group_options["timeout"] = timedelta(seconds=int(distributed_cfg["timeout_seconds"]))
     dist.init_process_group(
         backend=str(distributed_cfg.get("backend", "nccl")),
         init_method="env://",
+        **group_options,
     )
     print(
         f"[DDP] rank={rank}/{world_size} local_rank={local_rank} "
@@ -296,6 +304,24 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return float((tensor / distributed.world_size).item())
 
+    def _log_wandb(self, wandb_run, record, *, step: int) -> None:
+        """Keep remote logging failures out of training and checkpoint saving.
+
+        A callable defers media construction, which can itself contact W&B.
+        Stop attempting remote logs after the first error; local JSON logging
+        and plots continue independently.
+        """
+        if isinstance(wandb_run, _NullLogger) or getattr(self, "_wandb_failed", False):
+            return
+        try:
+            wandb_run.log(record() if callable(record) else record, step=step)
+        except Exception as exc:
+            self._wandb_failed = True
+            log.warning(
+                "W&B logging failed; continuing with local logs and checkpoints: %s",
+                exc,
+            )
+
     def run(self) -> None:
         cfg = copy.deepcopy(self.cfg)
         distributed = self.distributed
@@ -319,6 +345,19 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         latest_checkpoint = self.get_checkpoint_path()
         if cfg.training.resume and latest_checkpoint.is_file():
             self.load_checkpoint(path=latest_checkpoint)
+            if self.is_main_process:
+                log.info(
+                    "Resumed %s at optimizer_step=%d, epoch=%d",
+                    latest_checkpoint, self.optimizer_step, self.epoch,
+                )
+
+        validation_start = self._validation_start_optimizer_step(cfg)
+        if self.is_main_process and self.optimizer_step < validation_start:
+            log.info(
+                "Validation and validation-based Top-K/best selection start at "
+                "optimizer_step=%d; earlier checkpoints only update latest.ckpt",
+                validation_start,
+            )
 
         # The dataset may construct a CUDA TorchCodec decoder during
         # instantiation.  Select the configured device first so single-GPU
@@ -511,15 +550,21 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             if not isinstance(env_runner, BaseImageRunner):
                 raise TypeError("cfg.task.env_runner must instantiate BaseImageRunner")
 
-        if self.is_main_process:
-            wandb_run = wandb.init(
-                dir=str(self.output_dir),
-                config=OmegaConf.to_container(cfg, resolve=True),
-                **cfg.logging,
-            )
-            self.update_wandb_output_dir()
-        else:
-            wandb_run = _NullLogger()
+        wandb_run = _NullLogger()
+        if self.is_main_process and cfg.logging.get("mode", "online") != "disabled":
+            try:
+                wandb_run = wandb.init(
+                    dir=str(self.output_dir),
+                    config=OmegaConf.to_container(cfg, resolve=True),
+                    **cfg.logging,
+                )
+                self.update_wandb_output_dir()
+            except Exception as exc:
+                self._wandb_failed = True
+                log.warning(
+                    "W&B initialization failed; continuing with local logs and checkpoints: %s",
+                    exc,
+                )
         checkpoint_every_optimizer_steps = cfg.training.get(
             "checkpoint_every_optimizer_steps"
         )
@@ -596,14 +641,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
                 policy = self.ema_model if self.ema_model is not None else self.model
                 policy.eval()
+                validation_enabled = self._validation_enabled(cfg)
                 if (
                     self.is_main_process
+                    and validation_enabled
                     and env_runner is not None
                     and self.epoch % int(cfg.training.rollout_every) == 0
                 ):
                     step_log.update(env_runner.run(policy))
 
-                if self.epoch % int(cfg.training.val_every) == 0:
+                if validation_enabled and self.epoch % int(cfg.training.val_every) == 0:
                     val_metrics = self._validate_and_log(
                         cfg, val_dataloader, device, wandb_run, json_logger,
                     )
@@ -612,6 +659,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
                 if (
                     self.is_main_process
+                    and validation_enabled
                     and run_rank0_eval
                     and self.epoch % int(cfg.training.sample_every) == 0
                 ):
@@ -651,8 +699,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     optimizer_step=self.optimizer_step,
                 )
                 if self.is_main_process:
-                    wandb_run.log(step_log, step=self.global_step)
                     json_logger.log(step_log)
+                    self._log_wandb(wandb_run, step_log, step=self.global_step)
                 self.epoch += 1
 
                 checkpoint_every_optimizer_steps = cfg.training.get(
@@ -674,7 +722,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     )
                 should_checkpoint = should_checkpoint or should_save_final
                 if should_checkpoint:
-                    if self._uses_validation_checkpoint(cfg):
+                    if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
                         step_log.update(
                             self._validate_and_log(
                                 cfg, val_dataloader, device, wandb_run, json_logger,
@@ -698,7 +746,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if self._saving_thread is not None:
             self._saving_thread.join()
         if self.is_main_process:
-            wandb_run.finish()
+            try:
+                wandb_run.finish()
+            except Exception as exc:
+                log.warning("W&B shutdown failed after training completed: %s", exc)
 
     def _train_epoch(
         self,
@@ -831,8 +882,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     **self.model.last_curriculum_metrics,
                 }
                 if self.is_main_process and should_log:
-                    wandb_run.log(last_log, step=self.global_step)
                     json_logger.log(last_log)
+                    self._log_wandb(wandb_run, last_log, step=self.global_step)
                 checkpoint_every_optimizer_steps = cfg.training.get(
                     "checkpoint_every_optimizer_steps"
                 )
@@ -846,7 +897,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     if self.optimizer_step % checkpoint_interval == 0:
                         if last_log["train_loss"] is None:
                             last_log["train_loss"] = float(group_loss_tensor.item())
-                        if self._uses_validation_checkpoint(cfg):
+                        if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
                             last_log.update(
                                 self._validate_and_log(
                                     cfg, val_dataloader, device, wandb_run, json_logger,
@@ -870,13 +921,47 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         monitor = OmegaConf.select(cfg, "checkpoint.topk.monitor_key")
         return monitor is not None and str(monitor).startswith("val_")
 
+    @staticmethod
+    def _validation_start_optimizer_step(cfg) -> int:
+        step = int(OmegaConf.select(cfg, "training.validation_start_optimizer_step", default=0))
+        if step < 0:
+            raise ValueError("training.validation_start_optimizer_step must be non-negative")
+        return step
+
+    def _validation_enabled(self, cfg) -> bool:
+        return self.optimizer_step >= self._validation_start_optimizer_step(cfg)
+
+    def _store_topk_state(self, manager, cfg) -> None:
+        self.topk_state = {
+            "monitor_key": manager.monitor_key,
+            "mode": manager.mode,
+            "format_str": manager.format_str,
+            "validation_start_optimizer_step": (
+                self._validation_start_optimizer_step(cfg)
+                if self._uses_validation_checkpoint(cfg) else 0
+            ),
+            "path_value_map": {
+                pathlib.Path(name).name: value
+                for name, value in manager.path_value_map.items()
+            },
+        }
+
     def _make_topk_manager(self, cfg):
         manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, "checkpoints"),
             **cfg.checkpoint.topk,
         )
         state = getattr(self, "topk_state", {})
-        if all(state.get(key) == getattr(manager, key) for key in ("monitor_key", "mode", "format_str")):
+        validation_start = (
+            self._validation_start_optimizer_step(cfg)
+            if self._uses_validation_checkpoint(cfg) else 0
+        )
+        same_validation_window = state.get("validation_start_optimizer_step", 0) == validation_start
+        if state and not same_validation_window:
+            log.info("Validation start changed; resetting the saved Top-K ranking")
+        if same_validation_window and all(
+            state.get(key) == getattr(manager, key) for key in ("monitor_key", "mode", "format_str")
+        ):
             candidates = [
                 (os.path.join(manager.save_dir, pathlib.Path(name).name), value)
                 for name, value in state.get("path_value_map", {}).items()
@@ -889,11 +974,17 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 candidates.sort(key=lambda item: item[1], reverse=manager.mode == "max")
                 selected = candidates[:manager.k]
             manager.path_value_map = dict(selected)
+        self._store_topk_state(manager, cfg)
+        self._update_best_checkpoint(manager)
         return manager
 
-    def _topk_checkpoint_path(self, topk_manager, metrics):
+    def _topk_checkpoint_path(self, topk_manager, metrics, cfg):
         if topk_manager is None:
             return None
+        if self._uses_validation_checkpoint(cfg):
+            start = self._validation_start_optimizer_step(cfg)
+            if self.optimizer_step < start or int(metrics.get("optimizer_step", self.optimizer_step)) < start:
+                return None
         data = {key.replace("/", "_"): value for key, value in metrics.items()}
         if topk_manager.monitor_key is not None:
             value = data.get(topk_manager.monitor_key)
@@ -905,23 +996,22 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if candidate in topk_manager.path_value_map:
             return None
         path = topk_manager.get_ckpt_path(data)
-        self.topk_state = {
-            "monitor_key": topk_manager.monitor_key,
-            "mode": topk_manager.mode,
-            "format_str": topk_manager.format_str,
-            "path_value_map": {
-                pathlib.Path(name).name: value
-                for name, value in topk_manager.path_value_map.items()
-            },
-        }
+        self._store_topk_state(topk_manager, cfg)
         return path
 
     def _update_best_checkpoint(self, topk_manager) -> None:
-        if topk_manager is None or topk_manager.monitor_key is None or not topk_manager.path_value_map:
+        if topk_manager is None or topk_manager.monitor_key is None:
+            return
+        directory = pathlib.Path(topk_manager.save_dir)
+        if not topk_manager.path_value_map:
+            # An updated validation window can invalidate a restored ranking.
+            # Remove its alias while retaining the original checkpoint files.
+            best_link = directory.joinpath("best.ckpt")
+            if best_link.is_symlink():
+                best_link.unlink()
             return
         choose = min if topk_manager.mode == "min" else max
         best = choose(topk_manager.path_value_map, key=topk_manager.path_value_map.get)
-        directory = pathlib.Path(topk_manager.save_dir)
         temporary_link = directory.joinpath(f".best-{os.getpid()}.tmp")
         temporary_link.unlink(missing_ok=True)
         temporary_link.symlink_to(pathlib.Path(best).name)
@@ -939,7 +1029,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             temporary_path.unlink(missing_ok=True)
 
     def _save_checkpoints(self, cfg, step_log, topk_manager) -> None:
-        topk_path = self._topk_checkpoint_path(topk_manager, step_log)
+        topk_path = self._topk_checkpoint_path(topk_manager, step_log, cfg)
         if topk_path is not None:
             self.save_checkpoint(path=topk_path, use_thread=False)
         self._update_best_checkpoint(topk_manager)
@@ -963,7 +1053,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         # metric it keeps the best K according to the configured mode.
         checkpoint_path = None
         if topk_manager is not None:
-            topk_path = self._topk_checkpoint_path(topk_manager, metric_dict or {})
+            topk_path = self._topk_checkpoint_path(topk_manager, metric_dict or {}, cfg)
             if topk_path is not None:
                 checkpoint_path = pathlib.Path(topk_path)
 
@@ -991,6 +1081,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             self.save_snapshot(tag=step_tag)
 
     def _validate_and_log(self, cfg, dataloader, device, wandb_run, json_logger):
+        if not self._validation_enabled(cfg):
+            return {}
         if getattr(self, "_last_validation_step", None) == self.optimizer_step:
             return self._last_validation_metrics
         if dataloader is None:
@@ -1017,11 +1109,15 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         self._last_validation_metrics = metrics
         if self.is_main_process:
             record = dict(metrics, epoch=self.epoch, global_step=self.global_step, optimizer_step=self.optimizer_step)
-            wandb_run.log(record, step=self.global_step)
             json_logger.log(record)
+            self._log_wandb(wandb_run, record, step=self.global_step)
             plot_path = self._update_validation_plot(self.epoch, self.optimizer_step, metrics)
             if plot_path is not None:
-                wandb_run.log({"val_loss_plot": wandb.Image(str(plot_path))}, step=self.global_step)
+                self._log_wandb(
+                    wandb_run,
+                    lambda: {"val_loss_plot": wandb.Image(str(plot_path))},
+                    step=self.global_step,
+                )
         return metrics
 
     def _validate_metrics(

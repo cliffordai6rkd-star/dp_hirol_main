@@ -298,7 +298,7 @@ def render_attention(
 def render_update(record, camera_keys, bounds, *, episode, alpha, layer_index):
     image = _camera_row(record, camera_keys, alpha=alpha, bounds=bounds)
     image = _banner(image, f"CA update L2 | layer index {layer_index} | ep={episode} frame={record['anchor']}")
-    image = _banner(image, "After output projection; before image residual and FFN")
+    image = _banner(image, "After output projection; before optional query residual and FFN")
     return _colorbar(image, bounds, "||Delta V||_2: shared episode p1-p99 scale")
 
 
@@ -440,7 +440,7 @@ def run(args):
             "attention_percentiles": None if attention_range is None else list(attention_range),
             "attention_bounds_scope": "All captured cameras, wrench positions and selected episode frames.",
             "attention_definition": attention_definition(capture),
-            "update_definition": "L2 norm over channels of CA output after output projection, before image residual and FFN; evaluation mode." if export_updates else None,
+            "update_definition": "L2 norm over channels of CA output after output projection, before optional query residual and FFN; evaluation mode." if export_updates else None,
             "update_bounds": None if bounds is None else list(bounds), "update_percentiles": [1, 99] if export_updates else None,
             "update_bounds_scope": "All captured cameras and selected episode frames." if export_updates else None,
             "preprocessing": "Checkpoint policy observation preprocessing and normalization are preserved.",

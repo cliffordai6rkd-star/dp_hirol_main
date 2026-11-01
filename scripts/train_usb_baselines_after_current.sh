@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wait for the existing USB training, then run the two token baselines in order.
+# Wait for existing USB training, then run configured experiments in order.
 set -Eeuo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,31 +10,34 @@ poll_seconds=30
 log_dir=""
 dry_run=false
 train_overrides=()
+selected_configs=()
 
 usage() {
     cat <<'EOF'
 Usage: bash scripts/train_usb_baselines_after_current.sh [options] [-- Hydra overrides...]
-  --wait-pid PID        Wait for this process (default: detect the USB training parent).
+  --wait-pid PID        Wait for this process (default: detect the repository training parent).
   --python PATH         Python interpreter (default: PYTHON_BIN or python).
   --poll-seconds N      Check interval (default: 30 seconds).
   --log-dir PATH        Queue status and per-training console logs.
+  --config NAME         Config to train; repeat for a sequence (default: two token baselines).
   --dry-run             Show the selected process and commands without training.
   -h, --help            Show this help.
 
-Both jobs inherit train_dp_insert_usb_force_aware settings, use fresh runs,
-and execute sequentially. Each job has its own Hydra output and WandB name.
+Jobs use fresh runs and execute sequentially. Each job has its own Hydra
+output and WandB name. Config names include their directory, e.g. alation_study/NAME.
 EOF
 }
 
 while (($#)); do
     case "$1" in
-        --wait-pid|--python|--poll-seconds|--log-dir)
+        --wait-pid|--python|--poll-seconds|--log-dir|--config)
             (($# >= 2)) || { usage >&2; exit 2; }
             case "$1" in
                 --wait-pid) wait_pid="$2" ;;
                 --python) python_bin="$2" ;;
                 --poll-seconds) poll_seconds="$2" ;;
                 --log-dir) log_dir="$2" ;;
+                --config) selected_configs+=("$2") ;;
             esac
             shift 2 ;;
         --dry-run) dry_run=true; shift ;;
@@ -62,13 +65,7 @@ for entry in Path('/proc').iterdir():
         args = (entry / 'cmdline').read_bytes().decode().split('\0')
         if not any(Path(arg).name == 'train.py' for arg in args):
             continue
-        target = 'train_dp_insert_usb_force_aware'
-        selected = any(
-            arg == '--config-name=' + target
-            or (arg == '--config-name' and i + 1 < len(args) and args[i + 1] == target)
-            for i, arg in enumerate(args)
-        )
-        if not selected or (entry / 'cwd').resolve() != root:
+        if (entry / 'cwd').resolve() != root:
             continue
         stat = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
         if stat[0] not in {'Z', 'X'}:
@@ -77,7 +74,7 @@ for entry in Path('/proc').iterdir():
         continue
 parents = [pid for pid, ppid in matches.items() if ppid not in matches]
 if len(parents) > 1:
-    sys.exit('Multiple USB training parents found; specify --wait-pid explicitly.')
+    sys.exit('Multiple training parents found in this repository; specify --wait-pid explicitly.')
 print(parents[0] if parents else 0)
 PY
 )"
@@ -112,11 +109,14 @@ except (OSError, IndexError):
 PY
 }
 wait_identity="$(process_identity "$wait_pid")"
-configs=(train_dp_dinobase_insert_usb train_dp_selfattn_insert_usb)
+configs=(baseline_train/train_dp_dinobase_insert_usb baseline_train/train_dp_selfattn_insert_usb)
+if ((${#selected_configs[@]})); then
+    configs=("${selected_configs[@]}")
+fi
 if "$dry_run"; then
     printf 'Wait PID: %s; process start ticks: %s\n' "$wait_pid" "$wait_identity"
     for config in "${configs[@]}"; do
-        printf '%q ' "$python_bin" -u train.py --config-name "baseline_train/$config" training.resume=false "${train_overrides[@]}"
+        printf '%q ' "$python_bin" -u train.py --config-name "$config" training.resume=false "${train_overrides[@]}"
         printf '\n'
     done
     exit 0
@@ -124,7 +124,7 @@ fi
 
 mkdir -p data/outputs/baseline_queue
 exec 9>data/outputs/baseline_queue/usb_baselines.lock
-flock -n 9 || { echo 'A USB baseline queue is already running.' >&2; exit 1; }
+flock -n 9 || { echo 'A USB training queue is already running.' >&2; exit 1; }
 if [[ -z "$log_dir" ]]; then
     log_dir="data/outputs/baseline_queue/$(date +%Y%m%d_%H%M%S)_$$"
 fi
@@ -152,13 +152,13 @@ printf 'waiting pid=%s start_ticks=%s\n' "$wait_pid" "$wait_identity" > "$log_di
 while [[ "$wait_identity" != exited && "$(process_identity "$wait_pid")" == "$wait_identity" ]]; do
     sleep "$poll_seconds"
 done
-log 'Existing training has exited; starting the baseline sequence.'
+log 'Existing training has exited; starting the experiment sequence.'
 
 queue_status=0
 for config in "${configs[@]}"; do
-    run_log="$log_dir/$config.log"
+    run_log="$log_dir/${config##*/}.log"
     log "Starting $config; console log: $run_log"
-    "$python_bin" -u train.py --config-name "baseline_train/$config" \
+    "$python_bin" -u train.py --config-name "$config" \
         training.resume=false "${train_overrides[@]}" > "$run_log" 2>&1 &
     child_pid=$!
     printf '%s\n' "$child_pid" > "$log_dir/active_train.pid"
@@ -179,5 +179,5 @@ if ((queue_status == 0)); then
 else
     printf 'completed_with_errors\n' > "$log_dir/status.txt"
 fi
-log "Baseline sequence finished; exit summary: $log_dir/exit_codes.tsv"
+log "Experiment sequence finished; exit summary: $log_dir/exit_codes.tsv"
 exit "$queue_status"

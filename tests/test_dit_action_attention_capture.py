@@ -178,3 +178,23 @@ def test_unsupported_model_rejected():
     policy.model = nn.Identity()
     with pytest.raises(ValueError, match="ContextTransformerForDiffusion"):
         DitActionAttentionCapture(policy)
+
+
+@pytest.mark.parametrize("condition_layers", [0, 2])
+def test_batched_rollout_matches_independent_samples(condition_layers):
+    policy = make_policy(condition_layers=condition_layers)
+    values = torch.randn(3, 2, 4)
+    expected = []
+    with torch.no_grad():
+        for sample in values.split(1):
+            with DitActionAttentionCapture(policy) as capture:
+                policy.predict_action(sample)
+                expected.append(capture.step_context_relevance())
+        with DitActionAttentionCapture(policy, batched=True) as capture:
+            policy.predict_action(values)
+            actual = capture.step_context_relevance()
+            metadata = capture.diagnostics()
+    assert actual.shape == (3, 3, 2)
+    torch.testing.assert_close(actual, torch.stack(expected, dim=1), atol=1e-6, rtol=1e-5)
+    mass = sum(torch.tensor(metadata[key]) for key in ("time_mass", "input_action_mass", "context_mass"))
+    torch.testing.assert_close(mass, torch.ones(3), atol=1e-6, rtol=0)

@@ -25,6 +25,7 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.dataset.image_result_cache import (
     build_cache_metadata,
     build_in_memory_image_result_cache,
+    image_result_cache_is_valid,
     open_or_build_image_result_cache,
     read_image_result,
     use_disk_result_cache,
@@ -160,6 +161,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         phase_sampling_weights: Optional[Mapping[str, float]] = None,
         phase_source_key: str = "observation.tau_ext",
         contact_threshold: Optional[float] = None,
+        contact_enter_frames: int = 1,
+        contact_exit_frames: int = 1,
         contact_force_dims: Sequence[int] = (0, 1, 2),
         contact_norm: str = "l1",
         precontact_seconds: float = 1.0,
@@ -217,6 +220,10 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         self.contact_threshold = (
             None if contact_threshold is None else float(contact_threshold)
         )
+        self.contact_enter_frames = int(contact_enter_frames)
+        self.contact_exit_frames = int(contact_exit_frames)
+        if self.contact_enter_frames < 1 or self.contact_exit_frames < 1:
+            raise ValueError("contact_enter_frames and contact_exit_frames must be positive")
         self.contact_force_dims = tuple(int(dim) for dim in contact_force_dims)
         self.contact_norm = "l1" if contact_norm == "sum" else str(contact_norm)
         self.precontact_seconds = float(precontact_seconds)
@@ -336,7 +343,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                     timestamps = self._load_column(key, dtype=np.float64).reshape(-1)
                     if timestamps.shape[0] != self.dataset_length or not np.isfinite(timestamps).all():
                         raise ValueError(f"timestamp column {key!r} must contain one finite timestamp per row")
-                    self._window_anchor_timestamps[key] = self._timestamp_seconds(timestamps)
+                    self._window_anchor_timestamps[key] = self._timestamp_seconds(timestamps, key=key)
 
         self.lowdim_data = {}
         self.windowed_lowdim_data = {}
@@ -420,6 +427,15 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             memory_reserve_gb=memory_reserve_gb,
         )
         estimated_preload_bytes = self._estimate_image_preload_bytes()
+        image_cache_metadata = build_cache_metadata(
+            source_type="hirol_lerobot_v3",
+            dataset_path=dataset_path,
+            dataset_length=self.dataset_length,
+            rgb_keys=self.rgb_keys,
+            image_shapes={key: tuple(self.shape_meta["obs"][key]["shape"]) for key in self.rgb_keys},
+            extra={"image_feature_map": self.image_feature_map},
+            dtype=self.image_cache_dtype.name,
+        )
         # Keep the decoded cache compact (uint8 by default) and do not let an
         # undersized host enter swap.  SSD caches remain reusable by later runs.
         if preload_images and not load_result_on_disk and memory_limit_gb is None:
@@ -448,7 +464,8 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             shared_ram_free_bytes = shutil.disk_usage(shared_cache_dir).free
             reserve_bytes = int(float(memory_reserve_gb) * (1024 ** 3))
             required_bytes = estimated_preload_bytes + reserve_bytes
-            if shared_ram_free_bytes < required_bytes:
+            cache_exists = image_result_cache_is_valid(load_result_add, dataset_path, image_cache_metadata)
+            if not cache_exists and shared_ram_free_bytes < required_bytes:
                 fallback_location = os.environ.get(
                     "DP_SHARED_IMAGE_CACHE_FALLBACK", "ssd"
                 )
@@ -481,17 +498,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 key: tuple(self.shape_meta["obs"][key]["shape"])
                 for key in self.rgb_keys
             }
-            metadata = build_cache_metadata(
-                source_type="hirol_lerobot_v3",
-                dataset_path=dataset_path,
-                dataset_length=self.dataset_length,
-                rgb_keys=self.rgb_keys,
-                image_shapes=image_shapes,
-                extra={
-                    "image_feature_map": self.image_feature_map,
-                },
-                dtype=self.image_cache_dtype.name,
-            )
+            metadata = image_cache_metadata
 
             self._video_decoder = self._make_video_decoder()
 
@@ -676,6 +683,10 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                     raise ValueError("windowed lowdim source timestamps must increase within each episode")
                 # Preserve subsecond offsets by subtracting one common origin.
                 origin = local_source_times[0]
+                # Adding a decimal offset can place an exact endpoint a few
+                # floating-point units past the final sample. Account for the
+                # clock's precision without admitting a missing future frame.
+                boundary_epsilon = max(1e-9, 4 * abs(np.spacing(origin)))
                 local_source_times = local_source_times - origin
                 local_anchor_times = local_anchor_times - origin
                 # Catch relative/epoch clock mismatches before nearest-neighbor
@@ -694,9 +705,9 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 indices = local_indices + start
                 # History can be edge-padded; future targets must exist in
                 # the source episode rather than reuse the final force row.
-                valid = (targets <= local_source_times[-1]).all(axis=1)
+                valid = (targets <= local_source_times[-1] + boundary_epsilon).all(axis=1)
                 if np.any(offsets_sec > 0):
-                    valid &= (targets >= local_source_times[0]).all(axis=1)
+                    valid &= (targets >= local_source_times[0] - boundary_epsilon).all(axis=1)
             else:
                 anchors = np.arange(start, end + 1, dtype=np.int64)[:, None]
                 requested_indices = anchors + offsets[None, :]
@@ -710,8 +721,12 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         return result
 
     @staticmethod
-    def _timestamp_seconds(values: np.ndarray) -> np.ndarray:
+    def _timestamp_seconds(values: np.ndarray, *, key: Optional[str] = None) -> np.ndarray:
         values = np.asarray(values, dtype=np.float64)
+        # Simulation clocks often start at zero. Relative nanoseconds are far
+        # below epoch timestamps, so magnitude alone cannot identify their unit.
+        if key and key.endswith("_ns"):
+            return values * 1.0e-9
         finite = values[np.isfinite(values)]
         if finite.size and np.nanmedian(np.abs(finite)) > 1.0e12:
             return values * 1.0e-9
@@ -755,6 +770,36 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             return np.abs(force).sum(axis=-1)
         return np.linalg.vector_norm(force, ord=2, axis=-1)
 
+    def _debounced_contact(self, magnitude: np.ndarray) -> np.ndarray:
+        """Return contact states after consecutive-frame enter/exit debounce.
+
+        ``magnitude`` may be ``[N, K]`` windows or ``[N]`` episode samples.
+        The state starts free independently for each row/window.
+        """
+        values = np.asarray(magnitude, dtype=np.float32)
+        if values.ndim == 1:
+            values = values[:, None]
+        if values.ndim != 2:
+            raise ValueError(f"magnitude must have shape [N, K], got {values.shape}")
+        states = np.zeros_like(values, dtype=bool)
+        state = np.zeros((values.shape[0],), dtype=bool)
+        above_count = np.zeros_like(state, dtype=np.int64)
+        below_count = np.zeros_like(state, dtype=np.int64)
+        threshold = float(self.contact_threshold)
+        for index in range(values.shape[1]):
+            above = values[:, index] > threshold
+            below = values[:, index] < threshold
+            above_count = np.where(above, above_count + 1, 0)
+            below_count = np.where(below, below_count + 1, 0)
+            enter = (~state) & (above_count >= self.contact_enter_frames)
+            leave = state & (below_count >= self.contact_exit_frames)
+            state = np.where(enter, True, state)
+            state = np.where(leave, False, state)
+            above_count = np.where(enter, 0, above_count)
+            below_count = np.where(leave, 0, below_count)
+            states[:, index] = state
+        return states
+
     def _build_phase_labels(self, indices: np.ndarray) -> np.ndarray:
         """Return 0=free, 1=pre-contact, 2=contact for each sample window.
 
@@ -773,18 +818,29 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
             return np.zeros((0,), dtype=np.int8)
 
         window_contact = np.zeros((self.dataset_length,), dtype=bool)
-        for key in ("tau_ext", "future_tau_ext"):
-            values = self.windowed_lowdim_data.get(key)
-            if values is None:
-                continue
-            window_contact |= np.asarray(
-                self._phase_magnitude(values) > self.contact_threshold
-            ).any(axis=1)
+        # Use every materialized low-dimensional observation window.  This
+        # keeps phase sampling usable for both the legacy tau_ext datasets and
+        # the simulated wrench-only dataset, whose keys are wrench/future_wrench.
+        for values in self.windowed_lowdim_data.values():
+            magnitudes = self._phase_magnitude(values)
+            if self.contact_enter_frames == 1 and self.contact_exit_frames == 1:
+                window_contact |= np.asarray(magnitudes > self.contact_threshold).any(axis=1)
+            else:
+                window_contact |= self._debounced_contact(magnitudes).any(axis=1)
 
         source = self._phase_source_data
         if source is None:
             source = self._load_column(self.phase_source_key, dtype=np.float32)
-        frame_contact = self._phase_magnitude(source) > self.contact_threshold
+        frame_magnitude = self._phase_magnitude(source)
+        if self.contact_enter_frames == 1 and self.contact_exit_frames == 1:
+            frame_contact = frame_magnitude > self.contact_threshold
+        else:
+            frame_contact = np.zeros_like(frame_magnitude, dtype=bool)
+            for episode_range in self.episode_ranges:
+                start, stop = int(episode_range.start), int(episode_range.stop)
+                frame_contact[start:stop] = self._debounced_contact(
+                    frame_magnitude[start:stop][None, :]
+                )[0]
         timestamps = self._timestamp_seconds(self.timestamps)
         contact_onset = np.full((len(self.episode_ranges),), np.nan, dtype=np.float64)
         for episode_idx, episode_range in enumerate(self.episode_ranges):
@@ -1093,13 +1149,18 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
 
     def get_validation_dataset(self) -> "HirolLeRobotV3Dataset":
         val_set = copy.copy(self)
-        val_set.indices = create_indices(
-            self.episode_ends,
-            sequence_length=self.sequence_length,
-            pad_before=self.pad_before,
-            pad_after=self.sampler_pad_after,
-            episode_mask=self.val_mask,
-        )
+        # The Numba sampler cannot materialize an empty list of index rows.
+        # Full-data training intentionally has no validation episodes.
+        if self.val_mask.any():
+            val_set.indices = create_indices(
+                self.episode_ends,
+                sequence_length=self.sequence_length,
+                pad_before=self.pad_before,
+                pad_after=self.sampler_pad_after,
+                episode_mask=self.val_mask,
+            )
+        else:
+            val_set.indices = np.empty((0, 4), dtype=np.int64)
         val_set.indices = val_set._filter_indices_for_windowed_features(val_set.indices)
         val_set.phase_labels = val_set._build_phase_labels(val_set.indices)
         val_set.image_randomer = None
