@@ -24,9 +24,15 @@ def override(key):
     return next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith(key + '='))
 output = Path(json.loads(override('hydra.run.dir')))
 is_dp = Path(__file__).name == 'sim_force_aware_dp_train.py'
+events = output.parent/'stage_order.jsonl'
+with events.open('a') as log:
+    log.write(json.dumps(['teacher' if is_dp else 'student', 'start']) + '\\n')
 if is_dp and os.environ.get('FAKE_DP_FAIL'):
     print('DP failed', flush=True)
     sys.exit(7)
+if not is_dp and os.environ.get('FAKE_STUDENT_FAIL'):
+    print('student failed', flush=True)
+    sys.exit(9)
 if is_dp:
     (output/'checkpoints').mkdir()
     (output/'checkpoints/latest.ckpt').write_text('finished DP')
@@ -35,8 +41,13 @@ if is_dp:
 else:
     teacher = Path(json.loads(override('teacher_checkpoint')))
     assert teacher.is_file(), 'distillation must wait for DP checkpoint'
+    (output/'checkpoints').mkdir()
+    (output/'checkpoints/latest.ckpt').write_text('finished RenderDP')
+(output/'config.yaml').write_text('stage: teacher\\n' if is_dp else 'stage: student\\n')
 (output/'argv.json').write_text(json.dumps({'args':sys.argv[1:], 'gpus':os.environ.get('CUDA_VISIBLE_DEVICES')}))
 print('stage completed', flush=True)
+with events.open('a') as log:
+    log.write(json.dumps(['teacher' if is_dp else 'student', 'end']) + '\\n')
 '''
     for name in ("sim_force_aware_dp_train.py", "train_distill_render_net.py"):
         (root / name).write_text(script)
@@ -56,17 +67,38 @@ def test_all_runs_stages_in_order_and_hands_off_checkpoint(repository, tmp_path,
     plan = pipeline.run_pipeline(args, repository)
     teacher_name = "best" if best else "latest"
     assert plan["status"] == "completed"
-    assert Path(plan["teacher_checkpoint"]) == output / f"dp/checkpoints/{teacher_name}.ckpt"
-    dp_args = json.loads((output / "dp/argv.json").read_text())
-    distill_args = json.loads((output / "distill/argv.json").read_text())
+    assert Path(plan["teacher_checkpoint"]) == output / f"teacher/checkpoints/{teacher_name}.ckpt"
+    dp_args = json.loads((output / "teacher/argv.json").read_text())
+    distill_args = json.loads((output / "student/argv.json").read_text())
     assert "training.num_optimizer_steps=100000" in dp_args["args"]
     assert "training.num_epochs=10" in distill_args["args"]
     assert "training.num_epochs=10" not in dp_args["args"]
     assert dp_args["gpus"] == distill_args["gpus"] == "0"
     manifest = json.loads((output / "pipeline.json").read_text())
     assert all(stage["status"] == "completed" for stage in manifest["stages"].values())
-    for name in ("dp", "distill"):
+    assert set(manifest["stages"]) == {"dp", "distill"}
+    for name in ("teacher", "student"):
         assert "stage completed" in (output / name / "train.log").read_text()
+        assert (output / name / "config.yaml").is_file()
+        assert (output / name / "checkpoints/latest.ckpt").is_file()
+    assert not (output / "dp").exists() and not (output / "distill").exists()
+    events = [json.loads(line) for line in (output / "stage_order.jsonl").read_text().splitlines()]
+    assert events == [["teacher", "start"], ["teacher", "end"],
+                      ["student", "start"], ["student", "end"]]
+
+
+def test_default_invocation_runs_teacher_then_student(repository, tmp_path):
+    output = tmp_path / "default_pipeline"
+    args = pipeline.make_parser().parse_args(["--output-dir", str(output), "--gpus", "0"])
+    assert args.stage == "all"
+    plan = pipeline.run_pipeline(args, repository)
+    assert plan["status"] == "completed" and plan["stage"] == "all"
+    assert plan["stages"]["dp"]["output_dir"] == str(output / "teacher")
+    assert plan["stages"]["distill"]["output_dir"] == str(output / "student")
+    assert plan["teacher_checkpoint"] == str(output / "teacher/checkpoints/latest.ckpt")
+    student_args = json.loads((output / "student/argv.json").read_text())["args"]
+    assert "teacher_checkpoint=" + json.dumps(plan["teacher_checkpoint"]) in student_args
+    assert not (output / "dp").exists() and not (output / "distill").exists()
 
 
 def test_dp_failure_stops_before_distillation(repository, tmp_path, monkeypatch):
@@ -76,9 +108,35 @@ def test_dp_failure_stops_before_distillation(repository, tmp_path, monkeypatch)
     with pytest.raises(subprocess.CalledProcessError) as failure:
         pipeline.run_pipeline(args, repository)
     assert failure.value.returncode == 7
-    assert not (output / "distill").exists()
+    assert not (output / "student").exists()
+    assert (output / "teacher/train.log").is_file()
     manifest = json.loads((output / "pipeline.json").read_text())
     assert manifest["status"] == manifest["stages"]["dp"]["status"] == "failed"
+
+
+def test_student_failure_preserves_completed_teacher(repository, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_STUDENT_FAIL", "1")
+    output = tmp_path / "failed_student"
+    args = pipeline.make_parser().parse_args(["--output-dir", str(output)])
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        pipeline.run_pipeline(args, repository)
+    assert failure.value.returncode == 9
+    assert (output / "teacher/checkpoints/latest.ckpt").read_text() == "finished DP"
+    assert "student failed" in (output / "student/train.log").read_text()
+    manifest = json.loads((output / "pipeline.json").read_text())
+    assert manifest["stages"]["dp"]["status"] == "completed"
+    assert manifest["status"] == manifest["stages"]["distill"]["status"] == "failed"
+    assert not (output / "dp").exists() and not (output / "distill").exists()
+
+
+def test_dp_mode_writes_teacher_without_starting_student(repository, tmp_path):
+    output = tmp_path / "teacher_only"
+    args = pipeline.make_parser().parse_args(["dp", "--output-dir", str(output)])
+    plan = pipeline.run_pipeline(args, repository)
+    assert plan["status"] == "completed" and set(plan["stages"]) == {"dp"}
+    assert (output / "teacher/checkpoints/latest.ckpt").is_file()
+    assert not (output / "student").exists()
+    assert not (output / "dp").exists() and not (output / "distill").exists()
 
 
 def test_distill_mode_uses_existing_run_without_retraining_dp(repository, tmp_path):
@@ -92,7 +150,9 @@ def test_distill_mode_uses_existing_run_without_retraining_dp(repository, tmp_pa
     ])
     plan = pipeline.run_pipeline(args, repository)
     assert plan["teacher_checkpoint"] == str(checkpoint)
-    assert plan["status"] == "completed" and not (output / "dp").exists()
+    assert plan["status"] == "completed" and not (output / "teacher").exists()
+    assert (output / "student/checkpoints/latest.ckpt").is_file()
+    assert not (output / "dp").exists() and not (output / "distill").exists()
 
 
 def test_dry_run_creates_nothing_and_builds_ddp_commands(repository, tmp_path, capsys):
@@ -105,7 +165,11 @@ def test_dry_run_creates_nothing_and_builds_ddp_commands(repository, tmp_path, c
     command = pipeline.stage_command("dp", plan["stages"]["dp"], plan, repository)
     assert "torch.distributed.run" in command and "--nproc_per_node=2" in command
     assert "++training.distributed.enabled=true" in command
-    assert "auto-selected after DP" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "auto-selected after teacher training" in printed
+    assert str(output / "teacher/checkpoints") in printed
+    assert str(output / "student") in printed
+    assert str(output / "dp/checkpoints") not in printed
 
 
 @pytest.mark.parametrize("arguments,message", [

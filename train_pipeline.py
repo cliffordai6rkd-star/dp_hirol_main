@@ -1,9 +1,12 @@
-"""One entry point for DP training, RenderNet distillation, or both in sequence.
+"""Train an FDP teacher and distill a RenderDP student from one entry point.
 
+    python train_pipeline.py --gpus 0
     python train_pipeline.py dp
     python train_pipeline.py distill --teacher-run data/outputs/<teacher-run>
-    python train_pipeline.py all --dry-run
+    python train_pipeline.py --dry-run
 
+The default runs both stages sequentially, writing teacher/ and student/ beneath
+one pipeline output directory and handing the teacher checkpoint to the student.
 Stage-specific Hydra overrides use repeatable --dp-override/--distill-override.
 Launch this entry point once; --nproc-per-node creates torchrun workers.
 """
@@ -26,7 +29,8 @@ DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net.yaml"
 
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stage", choices=("dp", "distill", "all"), help="Run DP, distillation, or DP followed by distillation")
+    parser.add_argument("stage", nargs="?", default="all", choices=("dp", "distill", "all"),
+                        help="dp: FDP teacher; distill: RenderDP student; all: both sequentially (default)")
     parser.add_argument("--dp-config", default=DEFAULT_DP_CONFIG)
     parser.add_argument("--distill-config", default=DEFAULT_DISTILL_CONFIG)
     parser.add_argument("--dp-override", action="append", default=[], metavar="KEY=VALUE")
@@ -36,7 +40,7 @@ def make_parser():
     teacher.add_argument("--teacher-run", help="Teacher run directory containing checkpoints/ (distill mode)")
     parser.add_argument("--teacher-selection", choices=("auto", "best", "latest"), default="auto",
                         help="auto selects best.ckpt if present, otherwise latest.ckpt")
-    parser.add_argument("--output-dir", help="New pipeline directory; stages write dp/ and distill/ beneath it")
+    parser.add_argument("--output-dir", help="New pipeline directory; stages write teacher/ and student/ beneath it")
     parser.add_argument("--gpus", help="CUDA_VISIBLE_DEVICES, e.g. 0 or 0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="Number of local GPU workers per stage")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without creating files or starting training")
@@ -106,10 +110,10 @@ def build_plan(args, repo_root=REPO_ROOT):
     stages = {}
     if args.stage in {"dp", "all"}:
         stages["dp"] = {"script": "sim_force_aware_dp_train.py", "config": str(resolve_config(args.dp_config, repo_root)),
-                        "overrides": args.dp_override, "output_dir": str(output / "dp")}
+                        "overrides": args.dp_override, "output_dir": str(output / "teacher")}
     if args.stage in {"distill", "all"}:
         stages["distill"] = {"script": "train_distill_render_net.py", "config": str(resolve_config(args.distill_config, repo_root)),
-                             "overrides": args.distill_override, "output_dir": str(output / "distill")}
+                             "overrides": args.distill_override, "output_dir": str(output / "student")}
     return {"status": "planned", "stage": args.stage, "output_dir": str(output), "stages": stages,
             "teacher_checkpoint": str(teacher) if teacher else None, "teacher_selection": args.teacher_selection,
             "nproc_per_node": args.nproc_per_node, "gpus": args.gpus, "created_at": now.isoformat()}
@@ -126,7 +130,9 @@ def stage_command(name, stage, plan, repo_root=REPO_ROOT):
     if plan["nproc_per_node"] > 1:
         command += ["++training.distributed.enabled=true", "++training.distributed.timeout_seconds=86400"]
     if name == "distill":
-        teacher = plan["teacher_checkpoint"] or f"<auto-selected after DP: {Path(plan['output_dir']) / 'dp/checkpoints'}>"
+        teacher = plan["teacher_checkpoint"] or (
+            f"<auto-selected after teacher training: {Path(plan['stages']['dp']['output_dir']) / 'checkpoints'}>"
+        )
         # JSON quotes are interpreted by Hydra, preserving spaces and '=' in paths.
         command += ["teacher_checkpoint=" + json.dumps(teacher)]
     command += ["hydra.run.dir=" + json.dumps(stage["output_dir"]), "hydra.job.chdir=false"]

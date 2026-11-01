@@ -27,8 +27,8 @@ conda activate fdp
 # 单独训练 DP：默认使用本次 20 Hz、LSTM 2 层、cross-attn 1 层配置。
 python train_pipeline.py dp --gpus 0
 
-# 先完成 DP 训练，再自动把教师检查点交给 RenderNet 蒸馏。
-python train_pipeline.py all --gpus 0
+# 默认先训练 FDP，再自动把教师检查点交给 RenderNet 蒸馏。
+python train_pipeline.py --gpus 0
 
 # 已有教师时只蒸馏；该命令会立即读取此目录当前保存的检查点。
 python train_pipeline.py distill \
@@ -36,10 +36,10 @@ python train_pipeline.py distill \
   --gpus 0
 
 # 只打印两个阶段的命令，不创建目录、不启动训练。
-python train_pipeline.py all --dry-run
+python train_pipeline.py --dry-run
 ```
 
-DP 默认参数为全部 50 条训练、batch 128、100,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。蒸馏使用 `train_distill_render_net.yaml` 的独立训练参数（batch 32、最多 1000 epoch），继承教师的数据与 normalizer；教师没有验证集时，蒸馏也使用全部演示，关闭验证、早停及 best 选择，每个 epoch 保存 `latest.ckpt`。
+DP 默认参数为全部 50 条训练、batch 32、100,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。蒸馏使用 `train_distill_render_net.yaml` 的独立训练参数（batch 32、最多 1000 epoch），继承教师的数据与 normalizer；教师没有验证集时，蒸馏也使用全部演示，关闭验证、早停及 best 选择，每个 epoch 保存 `latest.ckpt`。
 
 `--teacher-run` 默认优先使用 `best.ckpt`，没有则使用 `latest.ckpt`；可用 `--teacher-selection latest` 明确选择最新权重，或用 `--teacher-checkpoint /path/to/model.ckpt` 精确指定。`all` 模式始终使用刚完成的 DP 阶段作为教师，DP 阶段失败时不会启动蒸馏。
 
@@ -61,7 +61,22 @@ python train_pipeline.py all \
 python train_pipeline.py all --gpus 0,1,2,3 --nproc-per-node 4
 ```
 
-每个 `--dp-override` / `--distill-override` 后跟一个 `key=value`，可重复使用；多卡由入口内部启动 `torchrun`，batch 按全局大小分配。输出集中在一个新目录，包含 `pipeline.json`、`dp/` 和 `distill/`；各阶段分别保存配置、`train.log`、指标和检查点。默认输出为 `data/outputs/<日期>/<时间>_dp_distill_pipeline/`。已有输出目录会报错，以免覆盖实验。
+每个 `--dp-override` / `--distill-override` 后跟一个 `key=value`，可重复使用；多卡由入口内部启动 `torchrun`，batch 按全局大小分配。省略阶段参数等同于 `all`，仍支持 `dp` 或 `distill` 单独运行。
+输出集中在一个新目录，教师和学生分别保存配置、`train.log`、指标和检查点：
+
+```text
+data/outputs/<日期>/<时间>_dp_distill_pipeline/
+├── pipeline.json
+├── teacher/
+│   ├── checkpoints/
+│   └── train.log
+└── student/
+    ├── checkpoints/
+    └── train.log
+```
+
+默认自动选择 `teacher/checkpoints/best.ckpt`，没有则使用 `latest.ckpt`，并传给学生。
+`--output-dir` 可以指定共同的输出目录；已有目录会报错，以免覆盖实验。
 
 ### 双相机纯视觉 DP（DINOv3 + Transformer）
 
@@ -368,6 +383,34 @@ FP16 AMP。编译保持相同的损失定义，但浮点融合会产生数值舍
 batch 的训练样本也会保留。编译错误会直接报告，可用
 `training.compile.enabled=false` 关闭；也可分别关闭 `render_backbone` 或 `student_dino`。
 保存的 checkpoint 使用普通参数键，推理／可视化不需要 `torch.compile`。
+
+2026-11-01 实测当前默认的**高斯光团＋去噪输出蒸馏**：RTX 5090 D v2，batch 32，
+双相机、两帧 192×256，wrench 为 `[32,2,8,6]`，BF16，学生区域预测与教师区域监督开启。
+使用刚停止的 20 Hz LSTM2 教师 40,000-step EMA 检查点、32 个真实数据样本；
+每种模式独立进程，预热 5 步后测量 20 步，CPU 线程数为 4。
+
+| 配置 | 平均每步 | P90 每步 | 样本／秒 | 稳态峰值分配显存 |
+| --- | ---: | ---: | ---: | ---: |
+| 不编译 | 249.7 ms | 258.6 ms | 128.2 | 12.95 GiB |
+| 默认 compile | 134.2 ms | 139.3 ms | 238.5 | 9.74 GiB |
+
+计时包含教师 DiT 前向、学生 RenderNet／DINO／DiT 前后向、区域监督、梯度裁剪与 AdamW；
+重复使用已在 GPU 上的真实 batch，每步重新采样扩散噪声／时间步。
+不包含数据加载、传输、教师 context／attention 的预计算、日志绘图与 checkpoint 写入。
+编译模式首次训练步耗时约 42.7 秒；表中显存统计在预热后重置，未包含首次编译的分配峰值。
+这些是计算步骤的短测结果，不代表完整 epoch 耗时或收敛质量。
+原始报告保存在 `data/benchmarks/2026.11.01/rendernet_glow_b32/{eager,compiled}/report.json`，
+汇总为同目录下的 `comparison.json`。
+
+可用独立测速脚本复现；`--no-compile` 可测普通执行模式，两次测量使用不同输出目录：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TORCHINDUCTOR_COMPILE_THREADS=2 \
+python -m diffusion_policy.scripts.benchmark_render_net_training \
+  --checkpoint /path/to/teacher.ckpt \
+  --output-dir data/benchmarks/rendernet_b32_compiled \
+  --batch-size 32 --warmup 5 --steps 20 --compile --video-backend pyav
+```
 
 以下是旧 **residual + token MSE** 的本机短测，不能作为新光团／去噪蒸馏的速度预估：
 RTX 5090 D v2，batch 32、两观测×双相机 192×256、BF16、区域监督开启，
