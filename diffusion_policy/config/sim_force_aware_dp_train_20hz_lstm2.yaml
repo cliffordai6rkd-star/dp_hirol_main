@@ -9,6 +9,7 @@ dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
 policy:
   # Two LSTM layers, one image-query cross-attention layer, and the original DiT.
   force_encoder_layers: 2
+  cross_attn_query_residual: true
   # Use the percentage-based learned token mask from the base sim config.
   image_blur_schedule: null
   mask_schedule:
@@ -34,11 +35,11 @@ optimizer:
 training:
   resume: false
   num_epochs: null
-  num_optimizer_steps: 100000
+  num_optimizer_steps: 200000
   lr_scheduler: cosine
   lr_warmup_steps: 500
   # No held-out split: validation stays disabled throughout this 100k-step run.
-  validation_start_optimizer_step: 100001
+  validation_start_optimizer_step: 150000
   checkpoint_every_optimizer_steps: 20000
   max_val_steps: null
 

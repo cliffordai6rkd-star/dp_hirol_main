@@ -39,7 +39,7 @@ python train_pipeline.py distill \
 python train_pipeline.py --dry-run
 ```
 
-DP 默认参数为全部 50 条训练、batch 32、100,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。蒸馏使用 `train_distill_render_net.yaml` 的独立训练参数（batch 32、最多 1000 epoch），继承教师的数据与 normalizer；教师没有验证集时，蒸馏也使用全部演示，关闭验证、早停及 best 选择，每个 epoch 保存 `latest.ckpt`。
+DP 默认参数为全部 50 条训练、batch 32、100,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。蒸馏使用 `train_distill_render_net.yaml` 的独立训练参数（batch 32、最多 1000 epoch），继承教师的数据与 normalizer，并单独按 episode 留出 10% 作为学生验证集；验证去噪 MSE 连续 30 个 epoch 没有至少 0.0001 的改善时自动停止。每轮保存 `latest.ckpt`，验证最优时保存 `best.ckpt`。设置 `dataset.val_ratio=0` 可选回全数据蒸馏，此时没有验证早停。
 
 `--teacher-run` 默认优先使用 `best.ckpt`，没有则使用 `latest.ckpt`；可用 `--teacher-selection latest` 明确选择最新权重，或用 `--teacher-checkpoint /path/to/model.ckpt` 精确指定。`all` 模式始终使用刚完成的 DP 阶段作为教师，DP 阶段失败时不会启动蒸馏。
 
@@ -173,7 +173,8 @@ CUDA_VISIBLE_DEVICES=0,1 \
 入口为 `train_distill_render_net.py`，配置为
 `diffusion_policy/config/train_distill_render_net.yaml`。默认教师是 image-query
 LSTM checkpoint 的 `best.ckpt`，使用其配置实例化 policy，优先恢复 EMA 权重，
-沿用保存的 normalizer 和数据集的 episode 训练／验证划分。
+沿用保存的 normalizer；默认对同一数据集按 episode 单独划分学生训练／验证集（90%／10%）。
+学生验证集只用于检验渲染器对教师行为的泛化，不代表这些 episode 未被教师训练见过。
 
 教师始终 eval 且完全冻结，教师 context 来自
 `teacher_policy._encode_context(obs_dict, apply_curriculum_mask=False).detach()`。
@@ -249,6 +250,36 @@ LayerNorm，学生需要通过 RGB 同时逼近这部分基础变换和力引起
 调制光团或残差，不直接用教师 mask 替换学生输出。
 预测区域是教师区域的近似，不能保证与教师阈值区域完全相同。默认总损失为
 `denoiser_mse + mask_loss_weight * mask_mse`，另可开启上述辅助目标。
+
+也可以用图 C 的最终融合变化作为区域监督：设置
+`render_net.high_attention_render.source=context_effect`、
+`selection=binary_top_percentile`、`percentile=90`。教师固定 RGB，比较真实 wrench
+与 `raw_zero` 参考条件的最终融合 token，按 `||Z(W)-Z(W_ref)||2` 对每个相机、
+每个观测槽位独立选择最高 10% patch，作为二值目标。192 个 patch 时选择 20 个；
+并列值稳定排序，全零响应不选取区域。原始差值用两个 FP32 encoder 前向计算，
+无需采集 DiT attention，缓存与原注意力缓存使用不同指纹。
+
+该模式下学生仍用 RGB+wrench 自行预测区域，mask MSE 监督其接近教师二值目标。
+渲染时在 patch 网格上选择学生预测最高 10%、且置信度超过
+`prediction_threshold=0.5` 的位置，其余位置严格不写入图像；最近邻上采样避免
+区域边界插值扩散。训练使用直通梯度，推理使用相同硬门控，均无需在线教师。
+面积上限是严格约束，位置是学生对教师 context 区域的近似，不能保证完全重合。
+`teacher_cache.precision=float32` 可令对照实验两组的教师 token 都关闭 AMP 计算；
+`teacher_cache.dtype` 仍独立控制缓存存储精度。
+
+```bash
+# 不约束区域，直接学习渲染
+python train_distill_render_net.py teacher_checkpoint=/path/to/teacher.ckpt \
+  render_net.high_attention_render.enabled=false teacher_cache.precision=float32
+
+# context effect 的 p90 以上区域监督 + 学生 patch 硬门控
+python train_distill_render_net.py teacher_checkpoint=/path/to/teacher.ckpt \
+  render_net.high_attention_render.enabled=true \
+  render_net.high_attention_render.source=context_effect \
+  render_net.high_attention_render.selection=binary_top_percentile \
+  render_net.high_attention_render.percentile=90 teacher_cache.precision=float32
+```
+
 日志中 `train_mse/val_mse` 表示所选主目标，`train_token_mse` 单独记录 context 差异。
 关闭区域开关时不建立区域头、不计算区域损失；去噪输出蒸馏仍需运行 DiT。
 开启区域监督时，教师额外运行完整去噪链获取注意力。
@@ -335,7 +366,7 @@ python train_distill_render_net.py \
 使用 AdamW、CUDA bfloat16 AMP、梯度裁剪 1.0，最多训练 1000 个
 epoch，每个 epoch 结束时验证并保存 `checkpoints/latest.ckpt`。验证 MSE 创历史
 最低时保存 `checkpoints/best.ckpt`；连续 30 个 epoch 无改善则早停，
-`training.early_stopping.min_delta` 默认 0，可配置判定改善的最小幅度。best 始终
+`training.early_stopping.min_delta` 默认 0.0001，可配置判定改善的最小幅度。best 始终
 按实际最低 MSE 保存，不受 min_delta 影响。初始未训练模型也参与 best 比较。
 默认 `training.max_val_batches=null`，使用完整验证集；`training.max_steps=null`，
 不会再按 10,000 步截断。smoke test 可单独设置这两个上限。
@@ -1061,23 +1092,44 @@ wrench Key：`heatmap_m(i) = mean_head A[head, image_i, wrench_m]`。
 DiT 采样轨迹，并将各去噪步的注意力百分比取平均。一个视频帧对应 episode 的
 一个观测时刻，默认按数据集原始帧率连续播放：上方将动作 token 的注意力回溯到
 wrist/side 的 DINO patch，使用与 `wrench_image_self_attn_episode_50.mp4` 一致的
-JET 叠加配色；下方在同一百分比坐标系中绘制图像和 wrench 输入的路由占比
-曲线，竖线指向当前 episode 时刻。热力图与曲线的数值都以**每个去噪步
-路由到条件 token 的总量**为分母，先按步计算百分比，再跨去噪步取平均；所有选中的观测帧和相机
-共用一个热力图色标：先跨去噪步取平均，再对本段视频全部观测窗口、指定相机和
-观测时刻的 patch 百分比计算 p1/p99，分别映射为 JET 的最冷色和最热色；
-范围外的值截断显示。色条标注实际百分比上下限，整段视频固定使用这一范围。
-可通过 `--attention-percentiles 2 98` 或 `--attention-percentiles 10 90`
-修改分位范围，默认 `1 99`；画面和元数据均记录所选分位范围及实际百分比上下限。
-该显示拉伸不改变 NPZ 中的原始路由百分比或下方曲线数值。
-默认显示最新观测的两路图像，曲线统计全部观测时刻。
+JET 叠加配色；下方使用 Matplotlib 分别绘制数据中的 `Fx/Fy/Fz` 和
+`Tx/Ty/Tz`，竖线和曲线上的圆点与当前图像时刻同步移动。曲线读取
+`phase_source_key` 指定的原始六维 wrench，不使用模型归一化、门控后的输入或
+`future_wrench`。接触阴影使用 teacher 的接触判定参数，对整个原始 episode
+连续扫描后生成（初始 free），进入/退出经过连续帧确认后，把边界回溯到
+对应确认窗口的第一帧。例如 20 Hz 下连续 5 帧确认，离线标注比确认时刻提前
+4 帧，即 0.20 秒；不足 5 帧的短段不切换状态。该标注不会受 `--stride` 影响；它是从
+wrench 推导的接触区间，不是人工接触标签或包含未来窗口的采样 phase 标签。
+图注和 metadata 记录阈值、进入/退出连续帧数及来源。完整曲线可能比有效推理
+帧多出末尾的未来上下文；另存 `_wrench.png` 供静态查看。
+
+热力图的数值以**每个去噪步路由到条件 token 的总量**为分母，
+先按步计算百分比，再跨去噪步取平均。默认 `--color-scale episode_max`：令
+`A(t,c,o,p)` 为去噪均值后的 patch 注意力，整段视频使用
+`H(t,c,o,p) = A(t,c,o,p) / max(A)`，色标固定为零到本 episode 的最大值，
+并标注 `0–100% of episode max`。最大值覆盖所有选中的 observation anchor、相机、
+观测槽位及 patch，包括 `--observation last` 隐藏的历史槽位；先取去噪均值再取最大值，
+不使用某一次去噪的瞬时峰值，也不按每张图片分别归一化。这里的“整段数据”指选中的
+一条 episode，不是所有 episode 的整个数据集；`--stride`、`--max-frames` 会限定统计范围。
+`camera_N_episode_max_relative` 保存同一公式计算的 `[frame, obs, patch]` 数组，范围为
+`0–1`；原始注意力数组仍完整保留。metadata 记录最大原始百分比、公式、相机和统计范围。
+
+需要旧的分位数显示时，指定 `--color-scale percentile`（默认分位为 `1 99`），
+或直接使用 `--attention-percentiles 2 98` / `--attention-percentiles 10 90`，后者自动选择
+percentile 模式。该模式将 episode 分位数映射为 JET 的最冷色和最热色，范围外截断。
+`--color-bounds LOW HIGH` 始终优先使用固定原始百分比范围。
+该显示拉伸不改变 NPZ 中的原始路由百分比或下方物理 wrench 曲线。
+默认显示最新观测的两路图像；横轴按原始 timestamp 相对 episode 起点计算。
 
 `--camera wrist|side|both` 选择注意力统计和显示的相机，默认 `both`。
-推理仍输入 checkpoint 配置的全部相机，但热力图、分位色标、原始图像注意力
-数据和图像路由曲线只统计所选相机。百分比仍以全部相机和 wrench 的条件路由
-总量为分母；wrench 曲线统计范围保持全部 wrench，所以单相机模式的两条曲线
-不一定合计为 100%。曲线标签注明所选相机，元数据的 `raw_camera_keys`
-按顺序对应 NPZ 中的 `camera_0_percent` 等数组。
+推理仍输入 checkpoint 配置的全部相机，但热力图、共享色标、原始图像注意力
+数据只统计所选相机。百分比仍以全部相机和 wrench 的条件路由总量为分母；
+原图像/wrench 路由占比保留在 NPZ 中用于诊断，不再绘制为下方曲线。
+元数据的 `raw_camera_keys` 按顺序对应 NPZ 中的 `camera_0_percent` 等数组。
+`recorded_wrench`、`wrench_time_sec`、`wrench_contact` 保存完整原始曲线及接触状态；
+`frame_wrench`、`frame_contact` 与视频帧逐一对齐，`contact_intervals_sec` 保存接触区间。
+`wrench_causal_contact`、`frame_causal_contact` 另外保留 teacher 规则在确认时刻才
+切换状态的原始结果；回溯仅用于离线标注，不改变 teacher 的训练或推理。
 
 比较纯视觉与 image-query cross-attention 的视觉空间集中度时，使用
 `--heatmap-normalization image_relative`。该模式对每个去噪调用的所选图像
@@ -1085,6 +1137,8 @@ patch 重新归一化，使全部选中图像路由合计 100%，消除带视觉
 的固定 0.5 图像残差分支因子；原始绝对百分比仍保存在 `camera_N_percent`，归一化结果
 保存在 `camera_N_image_relative_percent`。默认 `absolute` 模式保留图像／wrench
 总路由量，输出文件名不增加后缀；归一化模式的输出增加 `_image_relative`。
+该选项也可与 `episode_max` 组合：先生成 image-relative 注意力，再取 episode 最大值；
+对应的 `0–1` 数组另存为 `camera_N_image_relative_episode_max_relative`。
 
 对于 image-query cross-attention 且关闭图像 Query residual 的 checkpoint，脚本会自动
 切换为 `dit_to_image_query_slots`：仍从 DiT 去噪 query 开始，但把相关性映射到
@@ -1108,7 +1162,7 @@ python diffusion_policy/scripts/visualize_denoising_attention_episode.py \
   --heatmap-normalization image_relative --color-bounds 0.05 1.0 --overwrite
 ```
 
-若不指定 `--color-bounds`，每个视频仍会根据自己的 episode 分位数计算色标，
+若不指定 `--color-bounds`，每个视频会按自己的 episode 最大值（默认）或分位数计算色标，
 适合单独观察，不适合比较两个模型的颜色强弱。归一化热图和集中度仍是 action-to-
 image route 诊断，不等同于最终动作的因果归因。
 
@@ -1148,13 +1202,100 @@ python diffusion_policy/scripts/visualize_denoising_attention_episode.py \
 该图是跨 DiT decoder、condition encoder 和观测融合层的残差注意力路由近似，
 不是最终动作的因果归因。特别是旧的带视觉残差的 `image` Query、一层 CA、无前置联合 SA
 的 checkpoint，残差路由按固定的 0.5/0.5 分给全部图像和 wrench，因此 `--camera both`
-的两条占比曲线保持 50%/50%；单相机曲线只计该相机在全部图像路由中的份额。
+保存的两组占比数组保持 50%/50%；单相机数组只计该相机在全部图像路由中的份额。
 热力图仍可显示动作读取的图像位置如何随 episode 推进而变化，
 NPZ 中保留各去噪步的原始百分比。
 带图像+wrench 联合 SA 的 checkpoint 则能得到随步数变化的模态路由占比。
 关闭 Query 残差后，CA 的这类 rollout 全部沿 V 路径传播；若没有前置联合 SA，
 会得到零图像路由。该近似没有追踪图像 Q 对注意力权重的影响，零图像路由不表示
 模型不使用图像；要观察这部分影响，应使用下述对输入图像反传的敏感度工具。
+
+### wrench 写入图像 patch 的残差更新
+
+`visualize_wrench_effect_episode.py` 对当前 image-query、单层 CA、无前置联合 SA
+的 teacher 导出两个独立视频，不运行 DiT 去噪采样：
+
+- `ca_update`：`||U(W)||2`，MHA 输出投影后、图像残差加法和 FFN 前的更新幅度。
+- `injection_effect`：`||U(W)-U(W0)||2`，固定 RGB、网络与观测顺序，先对更新
+  向量相减，再沿通道求 L2，表示相对中性 wrench 的残差变化。
+
+默认基线 `--baseline raw_zero` 将全部原始 wrench 和 phase 输入置零，两支均经过
+完整预处理、force encoder 和融合层。因此差值包含接触门控及 future prefix fill
+变化；零力分支仍保留网络偏置、位置编码和 LSTM，原始 `U` 在无力时也可能非零。
+`--baseline normalized_zero` 则保留原始输入与接触预处理，仅在 learned encoder
+入口将 `wrench_history` 置零，用于对照基线选择的影响。
+
+默认 FP32，减少差分误差。默认 `--color-scope image`：每个时刻、相机和观测槽位
+分别按本张图片的 patch 计算 p2/p98，每个图像面板独立显示实际色标上下限。
+完全恒定的图统一显示冷色并标注 `flat`。此模式会放大图内的微小差异，不能通过
+颜色比较不同图片、相机或两个指标的绝对强度；原始幅度完整保存在 NPZ。
+`--color-scope episode` 可恢复每个指标的整段共享色标。色条为特征 L2 单位，
+不是百分比、物理力或最终动作贡献。
+下方保留原始六维 wrench 曲线和确认窗口回溯后的接触标注。
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python \
+  diffusion_policy/scripts/visualize_wrench_effect_episode.py \
+  --checkpoint data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00200000.ckpt \
+  --episode 0 --camera both --stride 1 --color-scope image --attention-percentiles 2 98 \
+  --video-backend pyav --device cuda:0 --save-frames --overwrite
+```
+
+输出位于 teacher 的 `attention_visualize/`，文件名前缀为 `wrench_effect_episode_0`。
+NPZ 的 `camera_N_ca_update`、`camera_N_baseline_ca_update`、
+`camera_N_injection_effect` 和 `camera_N_context_effect` 均为 `[frame, obs, patch]`；
+相机顺序由 metadata 的 `raw_camera_keys` 指定。`context_effect` 为
+`||Z(W)-Z(W0)||2`，包括 FFN 和最终 context normalization，默认仅缓存，不另出视频；
+可通过 `--metrics ca_update injection_effect context_effect` 一起导出。
+`--save-vectors` 额外保存每个 patch 的原始更新向量及差向量，文件会明显增大。
+metadata 记录基线、捕获位置、模型未来 wrench 偏移及色标范围；NPZ 同时保存
+模型实际使用的 normalized wrench，便于与底部当前时刻的物理 wrench 区分。
+`camera_N_<metric>_color_bounds` 保存每张图的 `[frame, obs, 2]` 分位范围。
+
+图 C（Final Context Effect）可以直接读取已有缓存，不加载 teacher、不重算编码：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python \
+  diffusion_policy/scripts/visualize_wrench_effect_episode.py \
+  --from-cache data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/attention_visualize/wrench_effect_episode_0_raw.npz \
+  --episode 0 --metrics context_effect --save-frames
+```
+
+输出 `wrench_effect_episode_0_context_effect.mp4` 和同名 `_frames/`，布局、
+逐图 p2/p98 色标、wrench 曲线与图 B 一致。原始 NPZ 和采集 metadata 保留，
+另写 `_context_effect_render_metadata.json`。图 C 表示经过 FFN 和最终 LayerNorm
+保留下来的空间特征差异。
+
+图 D（Action Sensitivity）执行空间 CA 残差干预：每次只将一个观测槽位、一个相机、
+一个 patch 的 `U_p(W)` 替换为 `U_p(W_ref)`，其余正常条件固定。基线和帧序列
+从图 B 的 metadata/NPZ 继承：
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python \
+  diffusion_policy/scripts/visualize_wrench_action_sensitivity_episode.py \
+  --source-cache data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/attention_visualize/wrench_effect_episode_0_raw.npz \
+  --device cuda:0 --batch-size 32 --seed 42 --save-frames
+```
+
+单层 image-query CA、无前置联合 SA 时，CA 后的残差、FFN 和 LayerNorm 均逐 token
+独立，因此精确重算替换位置并复用未改变的 token；对正常支和参考支检查该计算与
+完整 encoder 输出一致。每次干预都会完整重跑 DiT 条件 Encoder 和动作 Decoder。
+在正常采样轨迹每个 DDIM 步骤固定相同的 `x_t`、`t`，计算
+`D_A(t,p) = ||epsilon_normal(x_t,t) - epsilon_patch_replaced(x_t,t)||2`，
+L2 覆盖整个动作 horizon 和所有动作维度。视频显示各 DDIM 步骤 L2 的算术平均，
+不另行推进干预后的采样轨迹。正常对照在同一 batch 内重算，另放两个相同正常
+样本记录无干预数值误差。
+
+默认输出同目录的 `wrench_action_sensitivity_episode_0_action_sensitivity.mp4`、
+同名 `_frames/`、`wrench_action_sensitivity_episode_0_raw.npz` 和 `_metadata.json`。
+NPZ 中 `camera_N_action_sensitivity_per_step` 为 `[frame, DDIM, obs, patch]`，
+`camera_N_action_sensitivity` 为 `[frame, obs, patch]`；同时保存 DDIM timesteps、
+正常噪声输入和预测，以及无干预误差。图 D 的色条单位是噪声预测 L2，反映该
+wrench 更新位置对去噪预测的影响；图 B、C 的特征 L2 与它不能直接比较数值。
+所有逐图色标均只表达图内差异，跨帧强度须读原始数值或使用整段共享色标。
+可用 `visualize_wrench_effect_episode.py --from-cache <图D的_raw.npz>
+--episode 0 --metrics action_sensitivity --color-scope episode --output-dir <新目录>`
+重绘共享色标，无需再执行干预。覆盖已生成结果时添加 `--overwrite`。
 
 ### 最终动作对图像区域的敏感度
 

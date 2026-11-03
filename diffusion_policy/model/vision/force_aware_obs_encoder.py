@@ -321,11 +321,19 @@ class ForceAwareObsEncoder(nn.Module):
                 else torch.cat(attended_by_camera, dim=1)
             )
             weights = weights_by_camera
+        return self.finish_cross_attention(block, query_tokens, attended), weights
+
+    def finish_cross_attention(self, block, query_tokens, attended):
+        """Apply the query residual and tokenwise fusion layers to a CA update.
+
+        Also used by spatial interventions to replay the exact downstream
+        fusion on a replaced update without recomputing unchanged encoders.
+        """
         fused = block.cross_dropout(attended)
         if self.cross_attn_query_residual:
             fused = query_tokens + fused
         fused = fused + block.cross_ffn(block.cross_output_norm(fused))
-        return fused, weights
+        return fused
 
     def train(self, mode: bool = True):
         super().train(mode)

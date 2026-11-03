@@ -33,7 +33,8 @@ from diffusion_policy.dataset.render_net_teacher_cache import (
 from diffusion_policy.dataset.image_result_cache import use_shared_ram_result_cache
 from diffusion_policy.model.vision.render_net import RenderNet, build_render_net
 from diffusion_policy.model.vision.render_net_attention import (
-    attention_regions, teacher_attention_targets, validate_percentiles,
+    attention_regions, context_effect_regions, teacher_attention_targets,
+    teacher_context_effect_targets, validate_percentiles,
 )
 from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
@@ -135,7 +136,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.attention_enabled = bool(self.attention_config.get("enabled", False))
         self.mask_loss_weight = float(self.attention_config.get("mask_loss_weight", 1.0))
         if self.attention_enabled:
-            validate_percentiles(self.attention_config["percentiles"])
+            source = self.attention_config.get("source", "attention")
+            if source not in {"attention", "context_effect"}:
+                raise ValueError("high_attention_render.source must be attention or context_effect")
+            if source == "context_effect":
+                if self.attention_config.get("selection") != "binary_top_percentile":
+                    raise ValueError("context_effect supervision requires binary_top_percentile selection")
+                if self.attention_config.get("baseline", "raw_zero") != "raw_zero":
+                    raise ValueError("context_effect supervision requires baseline=raw_zero")
+            else:
+                validate_percentiles(self.attention_config["percentiles"])
             if not math.isfinite(self.mask_loss_weight) or self.mask_loss_weight <= 0:
                 raise ValueError("high_attention_render.mask_loss_weight must be positive and finite")
         self.loss_metrics = {}
@@ -200,10 +210,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      self.model.conv_block, getattr(self.model, "rendering_mode", "residual"),
                      self.model.image_keys, self.model.initialize_wrench_from_teacher)
         if self.attention_enabled:
-            log.info("Teacher attention: executed-action DiT→fusion→DINO patches, all denoising calls; "
-                  f"percentiles={list(self.attention_config['percentiles'])}; "
-                  "batched rollout on model device; student predicts region at inference; "
-                  f"validation metric={self.metric_name}")
+            if self.attention_config.get("source", "attention") == "context_effect":
+                log.info("Teacher region: FP32 L2(Z(W)-Z(raw_zero)), binary top percentile=%g; "
+                         "student hard patch gate at inference, prediction threshold=%g; no teacher at inference",
+                         self.attention_config["percentile"],
+                         self.attention_config.get("prediction_threshold", 0.5))
+            else:
+                log.info("Teacher attention: executed-action DiT→fusion→DINO patches, all denoising calls; "
+                         f"percentiles={list(self.attention_config['percentiles'])}; "
+                         "batched rollout on model device; student predicts region at inference; "
+                         f"validation metric={self.metric_name}")
         log.info("Distillation objective=%s; token auxiliary weight=%g; demo weight=%g; "
                  "DINO and DiT stay frozen, student input gradients remain enabled",
                  self.objective, self.distillation_config.get("token_loss_weight", 0.0),
@@ -366,6 +382,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      f"ETA={(total - completed) * elapsed / completed:.1f}s")
             self.attention_progress_last_seconds = elapsed
 
+    def _region_masks(self, patches, obs):
+        if self.attention_config.get("source", "attention") == "context_effect":
+            return context_effect_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
+                                          percentile=self.attention_config["percentile"])
+        return attention_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
+                                 self.attention_config["percentiles"])
+
+    def _region_targets(self, obs, *, return_patch_attention=False):
+        if self.attention_config.get("source", "attention") == "context_effect":
+            tokens, patches = teacher_context_effect_targets(
+                self.teacher_policy, obs, baseline=self.attention_config.get("baseline", "raw_zero"))
+            return tokens, (patches if return_patch_attention else self._region_masks(patches, obs))
+        return teacher_attention_targets(
+            self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
+            seed=self.attention_config.get("teacher_seed", 42),
+            progress_callback=self._attention_progress, return_patch_attention=return_patch_attention,
+        )
+
     def _loss(self, obs, cached_targets=None, *, action=None):
         # The student always uses its own region prediction. Spatial targets
         # are training-only; model selection excludes all auxiliary losses.
@@ -375,16 +409,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if cached_targets is not None:
                     teacher_tokens = cached_targets["tokens"].to(self.device, non_blocking=True)
                     if supervise_regions:
-                        target_masks = attention_regions(
-                            cached_targets["patch_attention"], obs, self.teacher_policy.obs_encoder.backbone,
-                            self.attention_config["percentiles"],
-                        )
+                        target_masks = self._region_masks(cached_targets["patch_attention"], obs)
                 elif supervise_regions:
-                    teacher_tokens, target_masks = teacher_attention_targets(
-                        self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
-                        seed=self.attention_config.get("teacher_seed", 42),
-                        progress_callback=self._attention_progress,
-                    )
+                    teacher_tokens, target_masks = self._region_targets(obs)
                 else:
                     teacher_tokens = self.teacher_policy._encode_context(
                         obs, apply_curriculum_mask=False,
@@ -552,6 +579,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         # Keep the identity of existing float32 caches; FP16 gets a distinct path.
         if token_dtype != "float32":
             identity["token_storage_dtype"] = token_dtype
+        precision = config.get("precision", "model")
+        if precision not in {"model", "float32"}:
+            raise ValueError("teacher_cache.precision must be model or float32")
+        if precision != "model":
+            identity["target_precision"] = precision
+        if self.attention_enabled and self.attention_config.get("source", "attention") == "context_effect":
+            identity["region_source"] = "context_effect_v1"
+            identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
+            identity["context_effect_precision"] = "float32"
         for name, source in (("train", dataset), ("validation", validation_dataset)):
             indices = np.ascontiguousarray(source.indices)
             identity[name] = {"samples": len(source), "indices_shape": list(indices.shape),
@@ -611,13 +647,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                         initial=cache.completed, unit="sample") as progress:
                         for batch in self._iterate_loader(loader):
                             obs = self._obs(batch)
-                            with self._autocast():
+                            amp = (torch.autocast(device_type=self.device.type, enabled=False)
+                                   if config.get("precision", "model") == "float32" else self._autocast())
+                            with amp:
                                 if self.attention_enabled:
-                                    tokens, attention = teacher_attention_targets(
-                                        self.teacher_policy, obs, percentiles=self.attention_config["percentiles"],
-                                        seed=self.attention_config.get("teacher_seed", 42),
-                                        progress_callback=self._attention_progress, return_patch_attention=True,
-                                    )
+                                    tokens, attention = self._region_targets(obs, return_patch_attention=True)
                                 else:
                                     tokens = self.teacher_policy._encode_context(obs, apply_curriculum_mask=False).detach()
                                     attention = {}

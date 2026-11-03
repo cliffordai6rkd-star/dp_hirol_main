@@ -15,6 +15,7 @@ teacher_cache:
   enabled: true
   cleanup_on_exit: true # Delete this run's teacher targets on completion, errors and stop signals.
   dtype: float16 # Context storage/transfer only; losses remain float32.
+  precision: model # float32 computes both comparison groups' teacher targets without AMP.
   directory: data/cache/render_net_teacher
   batch_size: 8
   num_workers: 4
@@ -51,16 +52,22 @@ render_net:
     dropout: 0.0
   high_attention_render:
     enabled: true
+    source: attention # context_effect uses paired final-fusion changes instead of DiT attention.
+    selection: soft # binary_top_percentile restricts rendering to predicted top patches.
+    percentile: 90.0 # Binary selection: highest 10% per camera and observation.
+    prediction_threshold: 0.5 # Binary student gate may be empty when all scores are low.
+    baseline: raw_zero # Reference used for context_effect supervision.
     # Arbitrary floats: 0 <= lower < upper <= 100. Per camera/observation.
     percentiles: [80.0, 99.0]
     # Teacher rollout supervises a student mask head; inference needs no teacher.
     mask_loss_weight: 1.0
     teacher_seed: 42
 
-# Inherit the teacher's dataset class, windows and episode train/val split.
-# With val_ratio=0, train on all episodes and save latest without validation/early stopping.
+# Inherit the teacher's dataset class/windows; hold out student validation episodes independently.
+# Set val_ratio=0 to train on all episodes without validation/early stopping.
 # Keep RGB identical on teacher and student paths, and use the saved normalizer.
 dataset:
+  val_ratio: 0.1 # Episode split for student early stopping, even if the teacher used all episodes.
   video_backend: null
   video_decode_device: cuda:0
   preload_images: true
@@ -112,7 +119,7 @@ training:
   early_stopping:
     enabled: true
     patience: 30
-    min_delta: 0.0
+    min_delta: 0.0001 # Require meaningful improvement in validation denoiser MSE.
   amp:
     enabled: true
     dtype: bfloat16

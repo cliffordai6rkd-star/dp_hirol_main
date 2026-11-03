@@ -65,7 +65,9 @@ policy:
   pre_cross_self_attn_layers: 0
   cross_attn_query: image
   cross_attn_layers: 1
-  cross_attn_query_residual: false
+  # Keep the image query path in the fused context.  This is required for
+  # residual-aware image/wrench routing and for stable teacher context tokens.
+  cross_attn_query_residual: true
   camera_attention_mode: joint
   n_emb: 256
   n_head: 4

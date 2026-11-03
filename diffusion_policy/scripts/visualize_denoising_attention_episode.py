@@ -1,13 +1,15 @@
-"""Render episode video with denoising-averaged image heatmaps and route curves.
+"""Render denoising-averaged image heatmaps with recorded six-axis wrench.
 
 Each video frame represents one observation anchor at the dataset frame rate.
 The upper panels average the eight (or configured number of) denoiser calls
-into a percentage heatmap on each input image, with a shared episode-wide
-percentile color scale across selected cameras and observation times (default
-p1/p99). All configured cameras remain model inputs. The lower curves track
-the selected image/wrench routing percentages across
-physical episode time; a vertical
-cursor marks the current video frame. Attention rollout is a routing
+into a percentage heatmap on each input image. By default, all selected
+cameras and observation times share a zero-to-episode-maximum color scale,
+computed after averaging the denoising calls. All configured cameras remain
+model inputs. The lower Matplotlib
+plots show recorded force and torque with offline contact intervals derived
+using the teacher's thresholds and confirmation lengths. Confirmed boundaries
+are backdated to the start of their window; a cursor marks the image time.
+Original routing percentages remain in the NPZ diagnostics. Attention rollout is a routing
 diagnostic, not final-action attribution. In image-query CA without preceding
 joint SA, equal-residual rollout fixes the total image/wrench route split at
 50/50 by construction; selecting one camera excludes the other image route.
@@ -38,6 +40,7 @@ import torch
 from diffusion_policy.scripts import visualize_cross_attention_episode as common
 from diffusion_policy.scripts import visualize_image_query_cross_attention_episode as rendering
 from diffusion_policy.scripts.dit_action_attention_capture import DitActionAttentionCapture
+from diffusion_policy.scripts.episode_wrench_plot import load_episode_wrench, WrenchEpisodePlot
 from diffusion_policy.scripts.fusion_visual_attention_trace import FusionVisualAttentionTrace
 
 
@@ -57,14 +60,16 @@ def parse_args(argv=None):
     parser.add_argument("--alpha", type=float, default=0.45)
     parser.add_argument("--camera", choices=("wrist", "side", "both"), default="both",
                         help="Cameras included in attention statistics and display; inference still uses all cameras.")
+    parser.add_argument("--color-scale", choices=("episode_max", "percentile"),
+                        help="Shared heatmap color scale (default: episode_max; percentile uses 1 99).")
     parser.add_argument("--attention-percentiles", nargs=2, type=float,
-                        metavar=("LOW", "HIGH"), default=(1.0, 99.0),
-                        help="Shared episode heatmap display percentiles (default: 1 99).")
+                        metavar=("LOW", "HIGH"),
+                        help="Shared episode percentiles; specifying this selects percentile scaling.")
     parser.add_argument("--heatmap-normalization", choices=("absolute", "image_relative"),
                         default="absolute",
                         help="Display absolute route percentages or renormalize selected image patches to 100%%.")
     parser.add_argument("--color-bounds", nargs=2, type=float, metavar=("LOW", "HIGH"),
-                        help="Fixed heatmap color bounds in percent; otherwise compute episode percentiles.")
+                        help="Fixed heatmap color bounds in percent; overrides --color-scale.")
     parser.add_argument("--concentration-top-k", type=float, default=0.10,
                         help="Fraction of patches used for top-k concentration metrics (default: 0.10).")
     parser.add_argument("--observation", choices=("last", "all"), default="last")
@@ -73,6 +78,12 @@ def parse_args(argv=None):
     parser.add_argument("--device")
     parser.add_argument("--save-frames", action="store_true")
     args = parser.parse_args(argv)
+    if args.color_scale is None:
+        args.color_scale = "percentile" if args.attention_percentiles is not None else "episode_max"
+    elif args.color_scale == "episode_max" and args.attention_percentiles is not None and args.color_bounds is None:
+        parser.error("--attention-percentiles requires --color-scale percentile")
+    if args.attention_percentiles is None:
+        args.attention_percentiles = (1.0, 99.0)
     if args.episode < 0 or args.stride < 1 or (args.max_frames is not None and args.max_frames < 1):
         parser.error("--episode must be nonnegative; --stride and --max-frames must be positive")
     if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
@@ -179,6 +190,21 @@ def heatmap_color_bounds(records, percentiles=(1.0, 99.0)):
                              for key, camera in record["cameras"].items()}}
                 for record in records]
     return rendering.percentile_bounds(averaged, "percent", percentiles)
+
+
+def episode_max_color_bounds(records):
+    """Share zero and the largest denoising-averaged patch across the episode."""
+    maxima = []
+    for record in records:
+        for camera in record["cameras"].values():
+            values = np.asarray(camera["percent"])
+            if values.ndim != 3 or not np.isfinite(values).all() or (values < 0).any():
+                raise ValueError("Episode maximum requires finite nonnegative [steps, obs, patches] attention")
+            maxima.append(float(values.mean(axis=0).max()))
+    maximum = max(maxima, default=0.0)
+    if not math.isfinite(maximum) or maximum <= 0:
+        raise ValueError("Episode maximum requires positive image attention")
+    return 0.0, maximum
 
 
 def image_relative_records(records):
@@ -297,55 +323,8 @@ def _write(frame, message, x, y, scale=0.45, color=(245, 245, 245)):
                 scale, color, 1, cv2.LINE_AA)
 
 
-def render_chart(visual, wrench, episode_times, selected, width, image_label="image"):
-    height = 245
-    chart = np.full((height, width, 3), 18, dtype=np.uint8)
-    _write(chart, "Episode route (%)", 16, 23, 0.46)
-    left, right, top, bottom = 52, width - 24, 46, height - 37
-    if right <= left:
-        raise ValueError("Camera panels are too narrow for the routing chart")
-    count = len(visual)
-    duration = float(episode_times[-1] - episode_times[0])
-    xs = (left + (np.asarray(episode_times) - episode_times[0]) *
-          (right - left) / duration).round().astype(int) if duration > 0 else np.full(count, left, dtype=int)
-    ys = lambda values: np.rint(bottom - np.asarray(values) * (bottom - top) / 100).astype(int)
-    for value in (0, 25, 50, 75, 100):
-        y = int(ys([value])[0])
-        cv2.line(chart, (left, y), (right, y), (53, 53, 53), 1)
-        _write(chart, str(value), 10, y + 4, 0.38, (175, 175, 175))
-    cv2.line(chart, (left, top), (left, bottom), (170, 170, 170), 1)
-    image_points = np.stack((xs, ys(visual)), axis=1).astype(np.int32)
-    wrench_points = np.stack((xs, ys(wrench)), axis=1).astype(np.int32)
-    if count > 1:
-        cv2.polylines(chart, [image_points], False, (255, 220, 65), 2, cv2.LINE_AA)
-        # The dashed line leaves both routes visible when both equal 50%.
-        for start, end in zip(wrench_points[:-1], wrench_points[1:]):
-            for fraction in np.arange(0.0, 1.0, 0.16):
-                first = start + (end - start) * fraction
-                last = start + (end - start) * min(fraction + 0.08, 1.0)
-                cv2.line(chart, tuple(np.rint(first).astype(int)),
-                         tuple(np.rint(last).astype(int)), (105, 225, 255), 2, cv2.LINE_AA)
-    for x, y in image_points:
-        cv2.circle(chart, (int(x), int(y)), 3, (255, 220, 65), -1, cv2.LINE_AA)
-    for x, y in wrench_points:
-        cv2.circle(chart, (int(x), int(y)), 5, (105, 225, 255), 1, cv2.LINE_AA)
-    cv2.line(chart, (int(xs[selected]), top), (int(xs[selected]), bottom),
-             (255, 255, 255), 1, cv2.LINE_AA)
-    _write(chart, image_label, max(left, width - 230), 22, 0.42, (255, 220, 65))
-    _write(chart, "wrench", max(left, width - 102), 22, 0.42, (105, 225, 255))
-    for fraction in np.linspace(0, 1, 5):
-        x = int(left + fraction * (right - left))
-        precision = 2 if duration < 1 else 1
-        _write(chart, f"{fraction * duration:.{precision}f}s", min(x - 8, width - 35),
-               bottom + 17, 0.35, (180, 180, 180))
-    _write(chart, f"episode {episode_times[selected] - episode_times[0]:.2f}s | "
-                  f"{image_label} {visual[selected]:.2f}% | wrench {wrench[selected]:.2f}%",
-           left, height - 5, 0.42)
-    return chart
-
-
 def render_frame(record, frame_index, camera_keys, color_bounds, args, label,
-                 visual_curve, wrench_curve, episode_times):
+                 wrench_timeline, chart):
     rows = []
     observation_indices = (range(len(record["cameras"][camera_keys[0]]["images"]))
                            if args.observation == "all" else [len(record["cameras"][camera_keys[0]]["images"]) - 1])
@@ -367,24 +346,30 @@ def render_frame(record, frame_index, camera_keys, color_bounds, args, label,
         images = cv2.resize(images, (512, height), interpolation=cv2.INTER_CUBIC)
     width = images.shape[1]
     banner = np.full((34, width, 3), 17, dtype=np.uint8)
-    _write(banner, f"{label.upper()} attention | ep {args.episode} | {frame_index + 1}/{len(visual_curve)} "
+    _write(banner, f"{label.upper()} attention | ep {args.episode} | {frame_index + 1}/{len(wrench_timeline['anchor_times'])} "
                    f"| anchor {record['anchor']}", 9, 23, 0.46)
     scale = np.full((56, width, 3), 18, dtype=np.uint8)
     low, high = color_bounds
     p_low, p_high = args.attention_percentiles
     normalization = getattr(args, "heatmap_normalization", "absolute")
+    episode_max = (getattr(args, "color_scale", "episode_max") == "episode_max"
+                   and getattr(args, "color_bounds", None) is None)
     bounds_label = (f"fixed {low:g}-{high:g}" if getattr(args, "color_bounds", None) is not None
                     else f"p{p_low:g}-p{p_high:g}")
-    _write(scale, f"Action to image patches | {normalization} | denoising-step mean | {bounds_label}",
-           10, 17, 0.40)
+    legend = ("Patch / episode max | denoising mean" if episode_max else
+              f"{normalization} patch % | denoising mean | {bounds_label}")
+    _write(scale, legend, 10, 17, 0.40)
     gradient = np.linspace(0, 255, width - 32, dtype=np.uint8)[None, :]
     scale[25:39, 16:width - 16] = cv2.cvtColor(
         cv2.applyColorMap(gradient, cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
-    _write(scale, f"{low:.3g}%", 16, 54, 0.37)
-    _write(scale, f"{high:.3g}%", width - 78, 54, 0.37)
-    image_label = "image" if args.camera == "both" else f"image:{camera_keys[0]}"
-    chart = render_chart(visual_curve, wrench_curve, episode_times, frame_index, width, image_label)
-    frame = np.concatenate((banner, images, scale, chart), axis=0)
+    _write(scale, "0%" if episode_max else f"{low:.3g}%", 16, 54, 0.37)
+    if episode_max:
+        source_label = "raw" if normalization == "absolute" else "img-rel"
+        _write(scale, f"100% of episode max ({high:.3g}% {source_label})", max(64, width - 290), 54, 0.37)
+    else:
+        _write(scale, f"{high:.3g}%", width - 78, 54, 0.37)
+    plot = chart.render(wrench_timeline["anchor_times"][frame_index])
+    frame = np.concatenate((banner, images, scale, plot), axis=0)
     return np.ascontiguousarray(np.pad(
         frame, ((0, frame.shape[0] % 2), (0, frame.shape[1] % 2), (0, 0))))
 
@@ -421,6 +406,9 @@ def run(args):
             raise RuntimeError("No episode frames remain after filtering")
         dataset_fps = common.infer_dataset_fps(dataset)
         output_fps = args.fps if args.fps is not None else dataset_fps / args.stride
+        wrench_timeline = load_episode_wrench(
+            dataset, policy, args.episode, [anchor for anchor, _ in selected], dataset_fps
+        )
         rendering.prepare_outputs(paths, overwrite=args.overwrite, save_frames=args.save_frames)
         records = []
         with fusion, dit:
@@ -455,16 +443,29 @@ def run(args):
                     print(f"Captured {frame_number}/{len(selected)} observation windows", flush=True)
         relative_records = image_relative_records(records)
         display_records = (relative_records if args.heatmap_normalization == "image_relative" else records)
-        color_bounds = (tuple(args.color_bounds) if args.color_bounds is not None else
-                        heatmap_color_bounds(display_records, args.attention_percentiles))
+        raw_max = episode_max_color_bounds(records)[1]
+        image_relative_max = episode_max_color_bounds(relative_records)[1]
+        if args.color_bounds is not None:
+            color_bounds = tuple(args.color_bounds)
+            color_bounds_source = "fixed_cli"
+        elif args.color_scale == "episode_max":
+            color_bounds = episode_max_color_bounds(display_records)
+            color_bounds_source = "episode_max"
+        else:
+            color_bounds = heatmap_color_bounds(display_records, args.attention_percentiles)
+            color_bounds_source = "episode_percentiles"
         concentration = concentration_metrics(records, attention_camera_keys,
                                               args.concentration_top_k)
         visual_curve = np.asarray([record["visual"].mean() for record in records])
         wrench_curve = np.asarray([record["wrench"].mean() for record in records])
-        episode_times = np.asarray([record["anchor"] for record in records], dtype=np.float64) / dataset_fps
+        episode_times = wrench_timeline["anchor_times"]
+        chart_width = sum(records[0]["cameras"][key]["images"].shape[2] for key in camera_keys)
+        if len(camera_keys) == 1:
+            chart_width = max(chart_width, 512)
+        chart = WrenchEpisodePlot(wrench_timeline, chart_width)
         for frame_index, record in enumerate(records):
             frame = render_frame(display_records[frame_index], frame_index, camera_keys, color_bounds, args, label,
-                                 visual_curve, wrench_curve, episode_times)
+                                 wrench_timeline, chart)
             if writer is None:
                 writer = common.FFmpegVideoWriter(paths["video"], frame.shape[1], frame.shape[0],
                                                    output_fps, args.video_codec)
@@ -475,12 +476,23 @@ def run(args):
                     raise RuntimeError(f"Could not save frame: {path}")
         closing_writer, writer = writer, None
         closing_writer.close()
+        plot_path = paths["video"].with_name(paths["video"].stem + "_wrench.png")
+        chart.save(plot_path)
         arrays = {"anchors": np.asarray([record["anchor"] for record in records], dtype=np.int64),
                   "timesteps": np.stack([record["timesteps"] for record in records]),
                   "visual_percent": np.stack([record["visual"] for record in records]),
                   "wrench_percent": np.stack([record["wrench"] for record in records]),
                   "visual_episode_percent": visual_curve, "wrench_episode_percent": wrench_curve,
-                  "episode_time_sec": episode_times - episode_times[0],
+                  "episode_time_sec": episode_times,
+                  "recorded_wrench": wrench_timeline["values"],
+                  "wrench_time_sec": wrench_timeline["times"],
+                  "wrench_contact": wrench_timeline["contact"],
+                  "wrench_causal_contact": wrench_timeline["causal_contact"],
+                  "wrench_contact_magnitude": wrench_timeline["contact_magnitude"],
+                  "frame_wrench": wrench_timeline["values"][wrench_timeline["anchor_offsets"]],
+                  "frame_contact": wrench_timeline["contact"][wrench_timeline["anchor_offsets"]],
+                  "frame_causal_contact": wrench_timeline["causal_contact"][wrench_timeline["anchor_offsets"]],
+                  "contact_intervals_sec": wrench_timeline["contact_intervals_sec"],
                   "context_mass": np.stack([record["context_mass"] for record in records])}
         for index, key in enumerate(attention_camera_keys):
             absolute = np.stack([record["cameras"][key]["percent"]
@@ -489,16 +501,19 @@ def run(args):
                                  for record in relative_records])
             arrays[f"camera_{index}_percent"] = absolute
             arrays[f"camera_{index}_episode_percent"] = absolute.mean(axis=1)
+            arrays[f"camera_{index}_episode_max_relative"] = absolute.mean(axis=1) / raw_max
             arrays[f"camera_{index}_image_relative_percent"] = relative
             arrays[f"camera_{index}_image_relative_episode_percent"] = relative.mean(axis=1)
+            arrays[f"camera_{index}_image_relative_episode_max_relative"] = relative.mean(axis=1) / image_relative_max
             arrays[f"camera_{index}_entropy"] = concentration["cameras"][key]["entropy"]
             arrays[f"camera_{index}_top_k_mass_percent"] = concentration["cameras"][key]["top_k_mass_percent"]
         arrays["image_entropy"] = concentration["global"]["entropy"]
         arrays["image_top_k_mass_percent"] = concentration["global"]["top_k_mass_percent"]
         np.savez_compressed(paths["raw"], **arrays)
         color_scale = (f"fixed {color_bounds[0]:g} to {color_bounds[1]:g}"
-                       if args.color_bounds is not None else
-                       f"shared p{args.attention_percentiles[0]:g} to p{args.attention_percentiles[1]:g}")
+                       if color_bounds_source == "fixed_cli" else
+                       ("0 to 100% of episode maximum" if color_bounds_source == "episode_max" else
+                        f"shared p{args.attention_percentiles[0]:g} to p{args.attention_percentiles[1]:g}"))
         metadata = {
             "checkpoint": str(checkpoint), "episode": args.episode, "fusion_label": label,
             "inference_steps": int(len(records[0]["timesteps"])), "observation_windows": len(records),
@@ -523,18 +538,35 @@ def run(args):
                  if args.heatmap_normalization == "absolute" else
                  "Arithmetic mean over denoising calls after normalizing selected image patch routes to 100% per call")
             ),
-            "route_curves": (
+            "route_arrays_not_displayed": (
                 "One point per episode observation: mean over denoising calls of selected image-query slot relevance; "
-                "curves need not sum to 100 when cameras are excluded"
+                "arrays need not sum to 100 when cameras are excluded"
                 if query_slot_attribution else
-                "One point per episode observation: mean over denoising calls of (100 * selected-camera image or wrench route / all routed condition mass at that call); curves need not sum to 100 when cameras are excluded"
+                "One point per episode observation: mean over denoising calls of (100 * selected-camera image or wrench route / all routed condition mass at that call); arrays need not sum to 100 when cameras are excluded"
             ),
-            "time_axis": "Episode anchor time in seconds; one video frame per selected observation anchor",
+            "wrench_plot": {**wrench_timeline["metadata"], "static_plot": str(plot_path)},
+            "time_axis": "Recorded anchor timestamp relative to the source episode start; one video frame per selected observation anchor",
             "heatmap_normalization": args.heatmap_normalization,
             "color_scale": f"{color_scale} of denoising-averaged {args.heatmap_normalization} patch percentages over selected cameras and observation windows/times; display clipped outside bounds",
             "color_percentiles": list(args.attention_percentiles),
+            "color_percentiles_applied": color_bounds_source == "episode_percentiles",
             "color_bounds_percent": list(color_bounds),
-            "color_bounds_source": "fixed_cli" if args.color_bounds is not None else "episode_percentiles",
+            "color_bounds_source": color_bounds_source,
+            "episode_max_scale": {
+                "source": args.heatmap_normalization,
+                "max_raw_percent": raw_max,
+                "max_display_percent": image_relative_max if args.heatmap_normalization == "image_relative" else raw_max,
+                "formula": "H(t,c,o,p) = mean_d A(t,d,c,o,p) / max_{t,c,o,p}(mean_d A(t,d,c,o,p))",
+                "A": ("Original camera_N_percent routing percentages" if args.heatmap_normalization == "absolute" else
+                      "camera_N_image_relative_percent, normalized over selected image patches at each denoising call"),
+                "scope": "All captured observation anchors of this episode after stride/max-frames selection, all selected cameras, all observation slots, all patches; not all dataset episodes",
+                "camera_keys": attention_camera_keys,
+                "observation_slots": "all, including slots hidden by --observation last",
+                "range": [0.0, 1.0],
+                "display_percent_range": [0.0, 100.0],
+                "npz_absolute": "camera_N_episode_max_relative",
+                "npz_image_relative": "camera_N_image_relative_episode_max_relative",
+            },
             "color_peak_percent": color_bounds[1], "color_map": "JET, matching wrench_image_self_attn episode videos",
             "concentration": concentration_metadata(concentration, args.concentration_top_k),
             "fusion_architecture": fusion.architecture, "dit_diagnostics": dit.diagnostics(),

@@ -7,6 +7,21 @@ from torch import nn
 from torch.nn import functional as F
 
 
+def top_percentile_mask(values, percentile, *, minimum=0.0):
+    """Select the highest ceil((100-p)% * patches) independently per image.
+
+    Zero responses remain empty. Stable sorting resolves ties without ever
+    expanding the support beyond the requested patch count.
+    """
+    percentile = float(percentile)
+    if not math.isfinite(percentile) or not 0 <= percentile < 100:
+        raise ValueError("Region percentile must satisfy 0 <= percentile < 100")
+    count = max(1, math.ceil(values.shape[-1] * (100 - percentile) / 100))
+    indices = values.detach().argsort(dim=-1, descending=True, stable=True)[..., :count]
+    mask = torch.zeros_like(values).scatter_(-1, indices, 1)
+    return mask * (values.detach() > minimum).to(values.dtype)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -312,6 +327,15 @@ class RenderNet(nn.Module):
             nn.init.zeros_(self.output.weight)
             nn.init.zeros_(self.output.bias)
         self.high_attention_enabled = bool((high_attention_render or {}).get("enabled", False))
+        region_config = high_attention_render or {}
+        self.region_selection = region_config.get("selection", "soft")
+        self.region_percentile = float(region_config.get("percentile", 90.0))
+        self.region_prediction_threshold = float(region_config.get("prediction_threshold", 0.5))
+        if self.region_selection not in {"soft", "binary_top_percentile"}:
+            raise ValueError("Unknown high_attention_render.selection")
+        if self.region_selection == "binary_top_percentile":
+            if not 0 <= self.region_percentile < 100 or not 0 <= self.region_prediction_threshold < 1:
+                raise ValueError("Invalid binary region percentile or prediction threshold")
         self.mask_head = (nn.Conv2d(self.backbone.feature_dim, 1, 1)
                           if self.high_attention_enabled else None)
         self._compiled_backbone_forward = None
@@ -371,7 +395,21 @@ class RenderNet(nn.Module):
             residual = (raw_residual if self.rendering_mode == "gaussian_glow"
                         else raw_residual.tanh()).reshape_as(image)
             if use_mask:
-                mask = self.mask_head(features).sigmoid()
+                logits = self.mask_head(features)
+                mask = (logits.float() if self.region_selection == "binary_top_percentile" else logits).sigmoid()
+                gate = mask
+                if self.region_selection == "binary_top_percentile":
+                    height, width = image.shape[-2:]
+                    patch = self.backbone.patch_size
+                    grid = (math.ceil(height / patch), math.ceil(width / patch))
+                    scores = F.adaptive_avg_pool2d(mask, grid)
+                    hard = top_percentile_mask(scores.flatten(1), self.region_percentile,
+                                               minimum=self.region_prediction_threshold).reshape_as(scores)
+                    # Hard support in the forward pass; soft surrogate gradients
+                    # train the region head through the denoiser objective too.
+                    gate = scores + (hard - scores).detach()
+                    padded_size = (grid[0] * patch, grid[1] * patch)
+                    gate = F.interpolate(gate, size=padded_size, mode="nearest")[:, :, :height, :width]
                 if self.rendering_mode == "gaussian_glow":
                     height, width = image.shape[-2:]
                     patch = self.backbone.patch_size
@@ -380,7 +418,9 @@ class RenderNet(nn.Module):
                     mask = mask[:, :, :height, :width]
                 mask = mask.reshape(batch, steps, 1, *image.shape[-2:])
                 masks[key] = mask
-                residual = residual * mask
+                if self.region_selection == "soft":
+                    gate = mask
+                residual = residual * gate.reshape(batch, steps, 1, *image.shape[-2:])
             if self.rendering_mode == "gaussian_glow":
                 # Positive optical exposure gives smooth bounded brightening without clamp saturation.
                 strength = -torch.expm1(-self.residual_scale * residual)

@@ -354,6 +354,20 @@ def test_batched_teacher_targets_match_serial_rollout_and_noise(scheduler_class,
     assert progress == [(0, 2), (2, 2)]
 
 
+def test_residual_free_image_query_uses_query_slot_region_targets():
+    """The old teacher layout must not collapse spatial targets to all ones."""
+    teacher, obs, shapes = make_attention_teacher()
+    teacher.obs_encoder.cross_attn_query_residual = False
+    _, patches = teacher_attention_targets(
+        teacher, obs, percentiles=[80, 99], seed=42, return_patch_attention=True,
+    )
+    for key, shape in shapes.items():
+        values = patches[key]
+        assert values.shape == (2, 2, shape[-2] // 8 * (shape[-1] // 8))
+        assert torch.isfinite(values).all() and (values >= 0).all()
+        assert values.max() > values.min()
+
+
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("mode", ["train", "eval", "no_grad", "cached_train"])
 def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, mode):
