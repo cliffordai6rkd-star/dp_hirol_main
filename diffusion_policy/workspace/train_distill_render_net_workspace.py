@@ -11,6 +11,7 @@ import math
 import pathlib
 import random
 import shutil
+import sys
 import time
 
 import hydra
@@ -23,6 +24,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from diffusion_policy.common.render_net_training_logger import RenderNetTrainingLogger
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -47,6 +49,27 @@ from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
 
 
 log = logging.getLogger(__name__)
+
+
+REGION_SOURCE_ALIASES = {
+    # Canonical names exposed in the config.
+    "noise_attention": "noise_attention",
+    "context": "context",
+    # Names used by earlier runs; keep them loadable for old checkpoints.
+    "attention": "noise_attention",
+    "context_effect": "context",
+}
+
+
+def normalize_region_source(source):
+    source = str(source).strip().lower()
+    try:
+        return REGION_SOURCE_ALIASES[source]
+    except KeyError as exc:
+        choices = ", ".join(("noise_attention", "context"))
+        raise ValueError(
+            f"high_attention_render.source must be one of: {choices}"
+        ) from exc
 
 
 class _NullTrainingLogger:
@@ -135,16 +158,29 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.attention_config = cfg.render_net.get("high_attention_render", {})
         self.attention_enabled = bool(self.attention_config.get("enabled", False))
         self.mask_loss_weight = float(self.attention_config.get("mask_loss_weight", 1.0))
+        self.region_source = normalize_region_source(
+            self.attention_config.get("source", "noise_attention")
+        )
         if self.attention_enabled:
-            source = self.attention_config.get("source", "attention")
-            if source not in {"attention", "context_effect"}:
-                raise ValueError("high_attention_render.source must be attention or context_effect")
-            if source == "context_effect":
-                if self.attention_config.get("selection") != "binary_top_percentile":
-                    raise ValueError("context_effect supervision requires binary_top_percentile selection")
+            selection = self.attention_config.get("selection", "soft")
+            if self.region_source == "context":
                 if self.attention_config.get("baseline", "raw_zero") != "raw_zero":
-                    raise ValueError("context_effect supervision requires baseline=raw_zero")
-            else:
+                    raise ValueError("context supervision requires baseline=raw_zero")
+                if selection == "soft":
+                    validate_percentiles(self.attention_config.get("percentiles", [80.0, 99.0]))
+                    strength_scale = self.attention_config.get("strength_scale")
+                    if strength_scale is not None and (
+                            not math.isfinite(float(strength_scale)) or float(strength_scale) <= 0):
+                        raise ValueError("context strength_scale must be positive and finite")
+                elif selection == "binary_top_percentile":
+                    percentile = float(self.attention_config.get("percentile", 90.0))
+                    if not 0 <= percentile < 100:
+                        raise ValueError("context binary selection requires 0 <= percentile < 100")
+                else:
+                    raise ValueError(
+                        "high_attention_render.selection must be soft or binary_top_percentile"
+                    )
+            elif self.region_source == "noise_attention":
                 validate_percentiles(self.attention_config["percentiles"])
             if not math.isfinite(self.mask_loss_weight) or self.mask_loss_weight <= 0:
                 raise ValueError("high_attention_render.mask_loss_weight must be positive and finite")
@@ -210,11 +246,18 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      self.model.conv_block, getattr(self.model, "rendering_mode", "residual"),
                      self.model.image_keys, self.model.initialize_wrench_from_teacher)
         if self.attention_enabled:
-            if self.attention_config.get("source", "attention") == "context_effect":
-                log.info("Teacher region: FP32 L2(Z(W)-Z(raw_zero)), binary top percentile=%g; "
-                         "student hard patch gate at inference, prediction threshold=%g; no teacher at inference",
-                         self.attention_config["percentile"],
-                         self.attention_config.get("prediction_threshold", 0.5))
+            if self.region_source == "context":
+                if self.attention_config.get("selection", "soft") == "soft":
+                    scale = self.attention_config.get("strength_scale")
+                    mapping = (f"strength=d/(d+{float(scale):g})" if scale is not None else
+                               f"legacy percentiles={list(self.attention_config.get('percentiles', [80., 99.]))}")
+                    log.info("Teacher context: FP32 L2(Z(W)-Z(raw_zero)); %s; zero effect stays zero; "
+                             "student predicts the field during training and inference", mapping)
+                else:
+                    log.info("Teacher region: FP32 L2(Z(W)-Z(raw_zero)), binary top percentile=%g; "
+                             "student hard patch gate at inference, prediction threshold=%g; no teacher at inference",
+                             self.attention_config["percentile"],
+                             self.attention_config.get("prediction_threshold", 0.5))
             else:
                 log.info("Teacher attention: executed-action DiT→fusion→DINO patches, all denoising calls; "
                          f"percentiles={list(self.attention_config['percentiles'])}; "
@@ -367,30 +410,52 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                  "mode=%s; first training batch includes compilation; validation uses eager execution",
                  config.get("render_backbone", True), config.get("student_dino", True), options["mode"])
 
+    def _progress_enabled(self):
+        config = getattr(self, "cfg", {}).get("logging", {})
+        return (self.is_main_process and bool(config.get("progress_bar", True))
+                and (config.get("progress_bar_non_tty", True) or sys.stderr.isatty()))
+
     def _progress(self, iterable, description, total=None, *, initial=0, unit="batch"):
         config = getattr(self, "cfg", {}).get("logging", {})
         return tqdm(iterable, desc=description, total=total, initial=initial, unit=unit, dynamic_ncols=True,
                     mininterval=float(config.get("tqdm_interval_sec", 1.0)),
-                    disable=not self.is_main_process or not config.get("progress_bar", True))
+                    leave=bool(config.get("tqdm_leave", False)),
+                    disable=not self._progress_enabled())
+
+    def _status_interval(self):
+        return max(1.0, float(getattr(self, "cfg", {}).get("logging", {}).get("status_interval_sec", 60.0)))
 
     def _attention_progress(self, completed, total, elapsed):
         if completed == 0:
             self.attention_progress_last_seconds = 0.0
             return
-        if elapsed - self.attention_progress_last_seconds >= 30:
-            log.info(f"Teacher attention: samples={completed}/{total}, elapsed={elapsed:.1f}s, "
-                     f"ETA={(total - completed) * elapsed / completed:.1f}s")
+        if elapsed - self.attention_progress_last_seconds >= self._status_interval():
+            if not self._progress_enabled() and self.is_main_process:
+                log.info(f"Teacher attention: samples={completed}/{total}, elapsed={elapsed:.1f}s, "
+                         f"ETA={(total - completed) * elapsed / completed:.1f}s")
             self.attention_progress_last_seconds = elapsed
 
     def _region_masks(self, patches, obs):
-        if self.attention_config.get("source", "attention") == "context_effect":
+        source = getattr(
+            self, "region_source",
+            normalize_region_source(self.attention_config.get("source", "noise_attention")),
+        )
+        if source == "context":
             return context_effect_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
-                                          percentile=self.attention_config["percentile"])
+                                          percentile=self.attention_config.get("percentile", 90.0),
+                                          percentiles=self.attention_config.get(
+                                              "percentiles", [80.0, 99.0]),
+                                          selection=self.attention_config.get("selection", "soft"),
+                                          strength_scale=self.attention_config.get("strength_scale"))
         return attention_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
                                  self.attention_config["percentiles"])
 
     def _region_targets(self, obs, *, return_patch_attention=False):
-        if self.attention_config.get("source", "attention") == "context_effect":
+        source = getattr(
+            self, "region_source",
+            normalize_region_source(self.attention_config.get("source", "noise_attention")),
+        )
+        if source == "context":
             tokens, patches = teacher_context_effect_targets(
                 self.teacher_policy, obs, baseline=self.attention_config.get("baseline", "raw_zero"))
             return tokens, (patches if return_patch_attention else self._region_masks(patches, obs))
@@ -584,8 +649,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             raise ValueError("teacher_cache.precision must be model or float32")
         if precision != "model":
             identity["target_precision"] = precision
-        if self.attention_enabled and self.attention_config.get("source", "attention") == "context_effect":
-            identity["region_source"] = "context_effect_v1"
+        region_source = None
+        if self.attention_enabled:
+            region_source = getattr(
+                self, "region_source",
+                normalize_region_source(self.attention_config.get("source", "noise_attention")),
+            )
+            identity["region_source"] = (
+                "context_effect_v1" if region_source == "context" else "noise_attention_v1"
+            )
+        if self.attention_enabled and region_source == "context":
             identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
             identity["context_effect_precision"] = "float32"
         for name, source in (("train", dataset), ("validation", validation_dataset)):
@@ -658,7 +731,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                             cache.append(tokens, attention)
                             progress.update(len(tokens))
                             now = time.monotonic()
-                            if cache.completed == start_count + len(tokens) or cache.complete or now - last_log >= 30:
+                            if (not self._progress_enabled()
+                                    and now - last_log >= self._status_interval()):
                                 elapsed = now - started
                                 rate = (cache.completed - start_count) / max(elapsed, 1e-6)
                                 log.info(f"Teacher cache {name}: {cache.completed}/{len(source)}, "
@@ -666,6 +740,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                          f"ETA={(len(source) - cache.completed) / max(rate, 1e-6):.1f}s; "
                                          f"token_shape={list(tokens.shape)}")
                                 last_log = now
+                    log.info("Teacher cache %s ready: %d samples, %.1fs", name, cache.completed,
+                             time.monotonic() - started)
                 prepared.append(CachedTeacherDataset(source, cache))
         if self.is_main_process:
             manifest_path = pathlib.Path(self.output_dir, "teacher_cache.json")
@@ -743,14 +819,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.model.eval()
         total, count = 0.0, 0
         component_totals = {key: 0.0 for key in ("token_mse", "denoiser_mse", "demo_mse")}
-        started = time.monotonic()
+        started = last_status = time.monotonic()
         batches = len(loader)
         if self.max_val_batches is not None:
             batches = min(batches, int(self.max_val_batches))
-        log.info(f"Validation started: epoch={self.epoch}, batches={batches}; "
-                 f"metric={self.metric_name}; auxiliary losses excluded; no attention capture")
         progress = self._progress(itertools.islice(self._iterate_loader(loader), batches),
-                                  f"Validation epoch {self.epoch}", batches)
+                                  f"Val {self.epoch}", batches)
         for index, batch in enumerate(progress):
             loss = self._batch_loss(batch)
             if not torch.isfinite(loss):
@@ -761,11 +835,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * size
             count += size
             progress.set_postfix(mse=f"{total / count:.6f}", refresh=False)
-            if index == 0 or (index + 1) % 10 == 0 or index + 1 == batches:
-                elapsed = time.monotonic() - started
-                log.info(f"Validating epoch={self.epoch}: batches={index + 1}/{batches}, "
-                         f"samples={count}, mse={total / count:.8f}, elapsed={elapsed:.1f}s, "
-                         f"ETA={(batches - index - 1) * elapsed / (index + 1):.1f}s")
+            now = time.monotonic()
+            if not self._progress_enabled() and self.is_main_process and now - last_status >= self._status_interval():
+                log.info("Val %d | batch=%d/%d mse=%.6f elapsed=%.1fs",
+                         self.epoch, index + 1, batches, total / count, now - started)
+                last_status = now
+        progress.close()
         total, count = self._sum([total, count])
         count = int(count)
         if count == 0:
@@ -828,8 +903,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.best_step = self.global_step
             if self.is_main_process:
                 self.save_checkpoint(tag="best", use_thread=False)
-            log.info(f"New best checkpoint: {self.get_checkpoint_path('best')} "
-                     f"(epoch={self.epoch}, val_mse={self.best_val_loss:.8f})")
         metrics = {"global_step": self.global_step, "epoch": self.epoch,
                    "objective": self.objective,
                    "val_mse": self.latest_val_loss, "best_val_mse": self.best_val_loss,
@@ -840,15 +913,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         metrics.update({f"val_{key}": value for key, value in getattr(self, "validation_metrics", {}).items()})
         logger.log(metrics)
         logger.save_plot()
-        log.info(f"epoch={self.epoch}/{self.num_epochs} step={self.global_step} "
-              f"val_mse={self.latest_val_loss:.8f} best={self.best_val_loss:.8f} "
-              f"samples={self.validation_samples} stale_epochs={self.epochs_without_improvement}/{self.patience}")
         self._summary("running")
         return self.early_stopping_enabled and self.epochs_without_improvement >= self.patience
 
     def run(self):
         cache_config = self.cfg.get("teacher_cache", {})
-        with TeacherCacheLifecycle(cleanup_on_exit=cache_config.get("cleanup_on_exit", True)) as lifetime:
+        with logging_redirect_tqdm(), TeacherCacheLifecycle(
+                cleanup_on_exit=cache_config.get("cleanup_on_exit", True)) as lifetime:
             self._teacher_cache_lifetime = lifetime
             try:
                 return self._run()
@@ -965,14 +1036,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     epoch_total, epoch_samples = 0.0, 0
                     epoch_loss_total = epoch_mask_total = 0.0
                     epoch_components = {key: 0.0 for key in ("token_mse", "denoiser_mse", "demo_mse")}
-                    epoch_started = previous_end = time.monotonic()
+                    epoch_started = previous_end = last_status = time.monotonic()
                     batches = len(train_loader)
                     if self.max_steps is not None:
                         batches = min(batches, int(self.max_steps) - self.global_step)
                     progress = self._progress(itertools.islice(self._iterate_loader(train_loader), batches),
-                                              f"Training epoch {epoch_number}/{self.num_epochs}", batches)
-                    log.info(f"Training epoch={epoch_number}/{self.num_epochs} started: batches={batches}, "
-                             f"per_rank_batch_size={train_loader.batch_size}, lr={self.optimizer.param_groups[0]['lr']:.3g}")
+                                              f"Train {epoch_number}/{self.num_epochs}", batches)
                     self.model.train()
                     for batch_index, batch in enumerate(progress):
                         step_started = time.monotonic()
@@ -1016,26 +1085,22 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         metrics.update({f"train_{key}": value / global_size
                                         for key, value in zip(epoch_components, component_totals)})
                         logger.log(metrics)
-                        progress.set_postfix(mse=f"{metrics['train_mse']:.6f}",
-                                             mean=f"{epoch_total / epoch_samples:.6f}",
-                                             mask=f"{metrics['train_mask_mse']:.5f}", lr=f"{metrics['lr']:.2g}",
+                        progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
+                                             mse=f"{epoch_total / epoch_samples:.4f}",
+                                             field=f"{metrics['train_mask_mse']:.4f}", lr=f"{metrics['lr']:.2g}",
                                              refresh=False)
-                        if (self.global_step == 1 or self.global_step % int(self.cfg.training.log_every) == 0
-                                or batch_index + 1 == batches):
-                            elapsed = time.monotonic() - epoch_started
-                            log.info(f"epoch={epoch_number}/{self.num_epochs} step={self.global_step} "
-                                  f"batch={batch_index + 1}/{batches} "
-                                  f"train_mse={metrics['train_mse']:.8f} "
-                                  f"epoch_mean_mse={epoch_total / epoch_samples:.8f} "
-                                  f"mask_mse={metrics['train_mask_mse']:.8f} loss={metrics['train_loss']:.8f} "
-                                  f"grad_norm={metrics['grad_norm']:.5f} "
-                                  f"lr={metrics['lr']:.3g} samples/s={metrics['samples_per_second']:.1f} "
-                                  f"data={data_seconds:.3f}s step_time={step_seconds:.3f}s "
-                                  f"elapsed={elapsed:.1f}s ETA={(batches - batch_index - 1) * elapsed / (batch_index + 1):.1f}s "
-                                  f"GPU_peak_MiB={metrics.get('gpu_peak_allocated_mib', 0):.0f}")
+                        now = time.monotonic()
+                        if (not self._progress_enabled() and self.is_main_process
+                                and now - last_status >= self._status_interval()):
+                            log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f mse=%.5f field=%.5f lr=%.2g",
+                                     epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
+                                     metrics['train_loss'], epoch_total / epoch_samples,
+                                     metrics['train_mask_mse'], metrics['lr'])
+                            last_status = now
                         previous_end = time.monotonic()
                         if self.max_steps is not None and self.global_step >= int(self.max_steps):
                             break
+                    progress.close()
                     self.epoch = epoch_number
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
@@ -1047,10 +1112,18 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                 "epoch_samples_per_second": epoch_samples / max(epoch_seconds, 1e-6),
                                 **{f"epoch_train_{key}": value / epoch_samples
                                    for key, value in epoch_components.items()}})
-                    log.info(f"Training epoch={self.epoch} complete: samples={epoch_samples}, "
-                             f"mean_mse={epoch_total / epoch_samples:.8f}, "
-                             f"mean_loss={epoch_loss_total / epoch_samples:.8f}, elapsed={epoch_seconds:.1f}s")
                     early_stop = self._validate_and_save(val_loader, logger)
+                    if self.is_main_process:
+                        validation = (
+                            f" val={self.latest_val_loss:.6f} best={self.best_val_loss:.6f}"
+                            f" stale={self.epochs_without_improvement}/{self.patience}"
+                            f"{' [best saved]' if self.best_step == self.global_step else ''}"
+                            if val_loader is not None else "")
+                        log.info("Epoch %d/%d | step=%d loss=%.6f train=%.6f field=%.6f%s elapsed=%.1fs",
+                                 self.epoch, self.num_epochs, self.global_step,
+                                 epoch_loss_total / epoch_samples, epoch_total / epoch_samples,
+                                 epoch_mask_total / epoch_samples, validation,
+                                 time.monotonic() - epoch_started)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                     elif early_stop:

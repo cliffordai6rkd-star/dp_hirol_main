@@ -1,0 +1,40 @@
+# Reviewable experiment draft; composing this file does not start training.
+defaults:
+  - train_distill_render_net
+  - _self_
+
+name: train_distill_render_net_patch_context
+teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00200000.ckpt
+
+distillation:
+  objective: denoiser_mse
+  token_loss_weight: 0.0 # Selected: token MSE is diagnostic only.
+  demo_loss_weight: 0.0
+
+render_net:
+  backbone: transformer
+  rendering_mode: patch_residual
+  patch_residual_refine: true
+  residual_scale: 1.0 # Selected: RGB-channel change is bounded by predicted strength.
+  high_attention_render:
+    enabled: true
+    source: context
+    selection: soft
+    activation: relu
+    baseline: raw_zero
+    strength_scale: 5.0 # Draft, not dataset-calibrated: D_Z=5 maps to intensity=0.5.
+    mask_loss_weight: 1.0
+
+teacher_cache:
+  precision: float32
+  dtype: float16 # Storage precision; paired context-effect computation remains FP32.
+
+dataloader:
+  batch_size: 32
+
+optimizer:
+  lr: 0.0003
+
+hydra:
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_distill_patch_context

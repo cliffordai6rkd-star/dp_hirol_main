@@ -38,6 +38,10 @@ def make_checkpoint(tmp_path, backbone="unet", region_enabled=False, version=2, 
                                "image_keys": ["side", "wrist"], "conv_block": conv_block})
         if rendering_mode == "gaussian_glow":
             cfg.render_net.update({"rendering_mode": rendering_mode, "glow": {"num_blobs": 3}})
+        elif rendering_mode == "patch_residual":
+            cfg.render_net.update({"rendering_mode": rendering_mode, "patch_residual_refine": True})
+            cfg.render_net.high_attention_render.update({"source": "context", "selection": "soft",
+                                                         "activation": "relu", "strength_scale": 2.0})
     OmegaConf.save(teacher_cfg, root / "teacher_config.yaml")
     model = build_render_net(6, OmegaConf.to_container(cfg.render_net, resolve=True))
     with torch.no_grad():
@@ -62,7 +66,7 @@ def make_checkpoint(tmp_path, backbone="unet", region_enabled=False, version=2, 
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("version,conv_block,rendering_mode", [
     (1, "standard", "residual"), (2, "standard", "residual"), (2, "bottleneck", "residual"),
-    (2, "bottleneck", "gaussian_glow"),
+    (2, "bottleneck", "gaussian_glow"), (2, "bottleneck", "patch_residual"),
 ])
 def test_checkpoint_restores_rendering_and_training_normalization(
     tmp_path, backbone, region_enabled, version, conv_block, rendering_mode,
@@ -73,6 +77,8 @@ def test_checkpoint_restores_rendering_and_training_normalization(
     model, restored_preprocessor, _, _, device, info = visual.load_render_net(checkpoint)
     assert device.type == "cpu" and info == {"global_step": 400, "best_val_loss": 0.4}
     assert not model.training and all(not p.requires_grad for p in model.parameters())
+    if rendering_mode == "patch_residual":
+        assert model.rendering_mode == "patch_residual" and model.region_activation == "relu"
     obs = {"side": torch.rand(1, 3, 3, 8, 12), "wrist": torch.rand(1, 3, 3, 8, 12),
            "future_wrench": torch.randn(1, 3, 7, 6), "tau_ext": torch.zeros(1, 3, 7, 7),
            "future_tau_ext": torch.zeros(1, 3, 7, 7)}
@@ -104,7 +110,7 @@ def test_video_shows_actual_rendered_rgb_and_gain_affects_only_difference():
 
 
 @pytest.mark.parametrize("camera", ["both", "wrist"])
-@pytest.mark.parametrize("rendering_mode", ["residual", "gaussian_glow"])
+@pytest.mark.parametrize("rendering_mode", ["residual", "gaussian_glow", "patch_residual"])
 def test_episode_export_uses_real_time_and_selected_cameras(monkeypatch, tmp_path, camera, rendering_mode):
     checkpoint, _, _ = make_checkpoint(tmp_path, rendering_mode=rendering_mode)
 

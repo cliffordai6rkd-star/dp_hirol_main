@@ -5,12 +5,12 @@ teacher_checkpoint: data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_i
 # Stage 2 follows completed FDP training: freeze the teacher and train only RenderNet.
 distillation:
   objective: denoiser_mse # token_mse restores the previous context-matching objective.
-  token_loss_weight: 0.0 # Context token MSE is always logged as a diagnostic.
+  token_loss_weight: 0.0 # Diagnostic only: the first experiment uses denoiser + context-strength supervision.
   demo_loss_weight: 0.0 # Optional original diffusion objective against demonstration actions.
   validation_seed: 42 # Repeat the same noisy-action probes for checkpoint selection.
 
 # Complete both train/validation caches before any optimizer update.
-# Raw patch percentages are independent of the rendering percentile interval.
+# Cache raw patch effects/attention independently of the intensity mapping.
 teacher_cache:
   enabled: true
   cleanup_on_exit: true # Delete this run's teacher targets on completion, errors and stop signals.
@@ -25,7 +25,8 @@ teacher_cache:
 render_net:
   architecture_version: 2
   backbone: transformer # CNN + image/wrench attention; unet omits image self-attention.
-  rendering_mode: gaussian_glow # residual restores the previous full-resolution RGB decoder.
+  rendering_mode: patch_residual # Per-token 3x16x16 RGB residual; gaussian_glow remains an ablation.
+  patch_residual_refine: true # Small identity-initialized 3x3 RGB residual refinement across patch seams.
   base_channels: 16
   conv_block: bottleneck # Narrow spatial convolutions in the image encoder.
   initialize_wrench_from_teacher: true
@@ -35,8 +36,8 @@ render_net:
   wrench_layers: 1
   wrench_dropout: 0.0
   image_keys: [side, wrist]
-  residual_scale: 1.0 # Optical exposure for glow; RGB residual amplitude in residual mode.
-  # Learn all blob parameters from RGB + wrench; no prescribed wrench-to-color mapping.
+  residual_scale: 1.0 # Maximum absolute per-channel RGB change before strength modulation and clipping.
+  # Retained for gaussian_glow ablations; patch_residual does not use these values.
   glow:
     num_blobs: 8
     sigma_min: 0.03 # Gaussian radii in normalized image coordinates.
@@ -52,14 +53,16 @@ render_net:
     dropout: 0.0
   high_attention_render:
     enabled: true
-    source: attention # context_effect uses paired final-fusion changes instead of DiT attention.
-    selection: soft # binary_top_percentile restricts rendering to predicted top patches.
-    percentile: 90.0 # Binary selection: highest 10% per camera and observation.
+    source: context # context is the continuous wrench-effect strength field.
+    selection: soft # Continuous region gate; binary_top_percentile remains available for ablations.
+    activation: relu # Negative logits represent exact zero rendering strength.
+    strength_scale: 5.0 # Absolute context effect scale: strength=D_Z/(D_Z+scale); zero stays zero.
+    percentile: 90.0 # Used only by context + binary_top_percentile.
     prediction_threshold: 0.5 # Binary student gate may be empty when all scores are low.
-    baseline: raw_zero # Reference used for context_effect supervision.
-    # Arbitrary floats: 0 <= lower < upper <= 100. Per camera/observation.
+    baseline: raw_zero # Reference used for context supervision.
+    # Used by noise_attention; context uses this legacy ramp only when strength_scale is null.
     percentiles: [80.0, 99.0]
-    # Teacher rollout supervises a student mask head; inference needs no teacher.
+    # The selected teacher source supervises a student intensity head; rendering needs no teacher.
     mask_loss_weight: 1.0
     teacher_seed: 42
 
@@ -96,7 +99,10 @@ optimizer:
 
 logging:
   progress_bar: true # tqdm for decoding/teacher caching, training and validation
+  progress_bar_non_tty: false # Redirected logs contain periodic summaries instead of carriage-return bars.
   tqdm_interval_sec: 1.0
+  tqdm_leave: false # Keep one live train/validation line, then print the epoch summary.
+  status_interval_sec: 60.0 # Plain-text heartbeat when no live progress bar is shown.
   plot_every_steps: 100 # also save after initial validation and each epoch; 0 = epoch only
 
 training:
@@ -113,7 +119,7 @@ training:
   # Optional step cap for smoke tests; normal training is limited by epochs.
   max_steps: null
   max_grad_norm: 1.0
-  log_every: 10
+  log_every: 10 # Legacy compatibility only; terminal updates now use logging.* intervals.
   # Validate the entire validation split after every epoch.
   max_val_batches: null
   early_stopping:
@@ -132,6 +138,14 @@ training:
     mode: default # First training batch compiles; a new batch/image shape may recompile.
 
 hydra:
+  job_logging:
+    formatters:
+      concise:
+        format: '%(asctime)s %(levelname).1s | %(message)s'
+        datefmt: '%H:%M:%S'
+    handlers:
+      console:
+        formatter: concise
   run:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_distill_render_net
   job:

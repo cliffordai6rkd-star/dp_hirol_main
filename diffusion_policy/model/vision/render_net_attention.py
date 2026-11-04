@@ -25,7 +25,7 @@ def validate_percentiles(percentiles):
     return low, high
 
 
-def percentile_region(patch_attention, percentiles):
+def percentile_region(patch_attention, percentiles, *, zero_is_zero=False):
     """Soft weights per camera/observation, quantiles over the last (patch) axis.
 
     Below q_low => 0; above q_high => 1; linear between. If the quantile
@@ -43,7 +43,10 @@ def percentile_region(patch_attention, percentiles):
     upper = torch.where(collapsed, values.amax(-1, keepdim=True), upper)
     span = upper - lower
     weights = ((values - lower) / span.clamp_min(torch.finfo(values.dtype).tiny)).clamp(0, 1)
-    return torch.where(span > 0, weights, torch.ones_like(weights))
+    result = torch.where(span > 0, weights, torch.ones_like(weights))
+    if zero_is_zero:
+        result = torch.where(values.amax(-1, keepdim=True) > 0, result, torch.zeros_like(result))
+    return result
 
 
 def attention_regions(patch_attention, images, backbone, percentiles):
@@ -60,8 +63,25 @@ def attention_regions(patch_attention, images, backbone, percentiles):
     return masks
 
 
-def context_effect_regions(patch_effect, images, backbone, *, percentile=90.0):
-    """Binary top-percentile context-change targets; nearest patch boundaries."""
+def context_effect_regions(
+    patch_effect,
+    images,
+    backbone,
+    *,
+    percentile=90.0,
+    percentiles=(80.0, 99.0),
+    selection="binary_top_percentile",
+    strength_scale=None,
+):
+    """Map final-context effects to either soft or binary RGB region targets.
+
+    With ``selection=soft`` and a positive ``strength_scale``, the raw
+    context-effect magnitude is converted to an absolute saturating strength
+    ``effect / (effect + strength_scale)``.  This keeps zero effects at zero
+    and preserves cross-frame magnitude differences.  If no scale is given,
+    the legacy per-image percentile ramp is used.  The binary mode remains
+    available for reproducing the earlier hard top-percentile experiment.
+    """
     masks = {}
     for key, effect in patch_effect.items():
         values = effect.detach().float()
@@ -70,9 +90,23 @@ def context_effect_regions(patch_effect, images, backbone, *, percentile=90.0):
         batch, steps, patches = values.shape
         height, width = images[key].shape[-2:]
         gh, gw = patch_grid(patches, height, width, backbone)
-        selected = top_percentile_mask(values, percentile)
-        masks[key] = F.interpolate(selected.reshape(batch * steps, 1, gh, gw),
-                                   size=(height, width), mode="nearest").reshape(
+        if selection == "soft":
+            if strength_scale is not None:
+                scale = float(strength_scale)
+                if not math.isfinite(scale) or scale <= 0:
+                    raise ValueError("strength_scale must be positive and finite")
+                weights = values / (values + scale)
+            else:
+                weights = percentile_region(values, percentiles, zero_is_zero=True)
+            mode = "bilinear"
+        elif selection == "binary_top_percentile":
+            weights = top_percentile_mask(values, percentile)
+            mode = "nearest"
+        else:
+            raise ValueError(f"Unknown context region selection: {selection!r}")
+        masks[key] = F.interpolate(weights.reshape(batch * steps, 1, gh, gw),
+                                   size=(height, width), mode=mode,
+                                   align_corners=False if mode == "bilinear" else None).reshape(
                                        batch, steps, 1, height, width).to(images[key].device)
     return masks
 

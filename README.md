@@ -168,7 +168,7 @@ CUDA_VISIBLE_DEVICES=0,1 \
 
 `FDP_DATASET_PATH` 指向当前任务的数据集目录；`DINOV3_MODEL_PATH` 指向包含 `config.json` 和模型权重的本地 DINOv3 文件夹。默认使用全局 batch size 512、梯度累积 1 次、60000 optimizer steps 和在线 W&B 日志；DDP 时该 batch 会按 rank 均分。
 
-### RenderNet 光团与去噪输出蒸馏
+### RenderNet RGB 残差与去噪输出蒸馏
 
 入口为 `train_distill_render_net.py`，配置为
 `diffusion_policy/config/train_distill_render_net.yaml`。默认教师是 image-query
@@ -198,29 +198,33 @@ context MSE 和演示动作扩散损失；token MSE 始终记录为诊断指标�
 身份 embedding，以图像 patch 为 Q、完整 LSTM 序列为 K/V 执行残差 cross-attention。
 `render_net.backbone=transformer`（默认）还在每个融合块中执行图像 self-attention；
 `unet` 使用同一 CNN 编码器和 wrench cross-attention，但省略图像 self-attention。
-各相机共享参数，以独立相机 embedding 区分视角。
-默认 `rendering_mode=gaussian_glow`：移除全分辨率 RGB 解码器，由可学习 query
-读取融合后的空间特征，预测 `glow.num_blobs=8` 个椭圆高斯的中心、半径、角度、
-颜色和强度；区域头在低分辨率预测软 mask，再上采样到 RGB 尺寸。
-所有光团参数都由 RGB 与 wrench 的融合特征预测；不手工规定某个力／力矩分量
-对应哪种颜色或亮度，也不添加 wrench 重建损失。教师去噪行为监督网络学习对任务
-有用的力信息表达。复制初始化的学生 wrench LSTM 同样参与训练。
-渲染为 `1 - (1 - image) * exp(-residual_scale * predicted_region * glow_field)`，
-光团只增亮，输出有界，`residual_scale` 在这里表示曝光强度。
-半径受 `glow.sigma_min/sigma_max` 约束，初始化为弱光，避免几何参数因全零光团失去梯度。
+各相机独立前向处理、共享网络参数，以独立相机 embedding 区分视角；这里没有
+跨相机图像 self-attention。
+默认 `rendering_mode=patch_residual`：CNN、图像 self-attention 和 wrench
+cross-attention 融合后，每个空间 token 通过线性层预测一个
+`3 × patch_size × patch_size` 的 RGB 残差块，默认即 `3 × 16 × 16`，
+再按空间位置拼回图像。它不预测 Gaussian 中心或渲染点。
+`patch_residual_refine=true` 可在拼接后增加一个 identity 初始化的可学习 3×3 RGB
+卷积，让相邻 patch 边界交换信息；该卷积不保证输出平滑，也不是平滑损失。
+残差头零初始化，预测残差经 `tanh` 后乘以学生预测的连续强度场：
+`clamp(image + residual_scale * predicted_strength * tanh(residual), 0, 1)`。
+默认 `residual_scale=1.0`，每通道 RGB 修改幅度由预测强度场进一步限制，
+允许增亮或变暗；复制初始化的学生 wrench LSTM 同样参与训练。
 `transformer.patch_size` 表示 CNN 下采样倍率，
 支持不小于 2 的 2 次幂；维度、层数、head 数仍可配置，并处理非整除图像尺寸。
 新训练默认 `render_net.conv_block=bottleneck`：保留原图 stem，编码层在较窄通道上
-执行空间卷积。`rendering_mode=residual` 可选回旧的逐像素 RGB 残差和 skip 解码器；
-其输出为 `clamp(image + residual_scale * predicted_region * tanh(residual), 0, 1)`，
-区域关闭时 `predicted_region=1`，RGB 输出层零初始化。
+执行空间卷积。`rendering_mode=residual` 可选回旧的逐像素 RGB 残差和 skip 解码器。
+`rendering_mode=gaussian_glow` 保留作消融：预测若干椭圆高斯的中心、半径、角度、颜色
+和强度，按 `1 - (1 - image) * exp(-residual_scale * predicted_strength * glow_field)`
+仅增亮；其 `residual_scale` 表示曝光强度。关闭区域头时 `predicted_strength=1`。
 缺少 rendering_mode 的旧配置仍使用 residual。`conv_block=standard` 可选回 v2 原始卷积块；缺少该字段的 v2
 checkpoint 也按 standard 恢复。两种卷积结构的权重不互换，需分别训练。
-增强图像经过教师冻结的 DINOv3、image projection、位置／相机／模态 embedding
-和输出 LayerNorm，得到相同布局的 student context；学生路径不执行教师的
+增强图像通过共享冻结的 `obs_encoder.encode_image_context`，经过 DINOv3、
+image projection、位置／相机／模态 embedding 和输出 LayerNorm，得到相同布局的
+student context；学生路径不执行教师的
 wrench encoder 或融合 cross-attention，DINO 后也不添加学生专用的 token 融合层
 或 adapter。去噪输出蒸馏再将此 context 送入共享冻结 DiT。
-光团骨干和 residual 骨干权重不互换，切换模式需新开训练。
+三种渲染骨干的输出头和权重布局不同，切换模式需新开训练。
 
 教师与 RenderNet 共享同一套 wrench 预处理：按 `tau_ext` 判定接触、沿
 `future_tau_ext` 进行未来接触状态推演、用首个接触 wrench 填充未来窗口的自由
@@ -228,42 +232,38 @@ wrench encoder 或融合 cross-attention，DINO 后也不添加学生专用的 t
 wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`，不再直接
 归一化原始 `future_wrench`。`tau_ext/future_tau_ext` 仅用于同教师一致的门控，
 不作为额外的可学习输入。教师的融合 token 监督目标保持不变。
-零 wrench 不强制渲染图等于原图：教师在零 wrench 下仍执行融合、FFN 与
-LayerNorm，学生需要通过 RGB 同时逼近这部分基础变换和力引起的变化。
+网络不额外按零 wrench 或接触标签硬切渲染，而是学习下述连续强度场。
 
-高注意力区域渲染由 `render_net.high_attention_render.enabled` 开关控制，默认开启。
-开启时，用冻结教师的 DiT→context→融合输入图像 patch 的 attention rollout 作为
-区域监督，复用当前注意力视频的路径：平均 heads、包含残差路由、对每次去噪
-的条件注意力质量归一化后，再对全部去噪步求均值，action query 为执行的动作段。
-原始教师 token 通过独立的无 hook 前向计算；注意力捕获不会替换 token 监督目标。
-它是 DINO patch 层面的空间参考，不能解释为像素因果贡献。image-query cross-attention
-的每行对 wrench 求和恒为 1，因此不使用这个和来选取图像位置。
+连续强度场由 `render_net.high_attention_render.enabled` 控制，默认开启，
+`source=context`、`selection=soft`。教师监督与图 C 使用同一个原始量：
+`d = ||Z(W)-Z(W_raw-zero)||2`，在完整融合、FFN 和最终 LayerNorm 后按 image patch
+取差向量的 L2 范数。真实条件与 `raw_zero` 参考条件各执行一次 FP32 encoder，
+无需采集 DiT attention；教师原始 `d` 缓存与 noise attention 缓存使用不同指纹。
 
-`percentiles: [80, 99]` 表示对**每个相机、每个观测窗口内的每帧**独立计算 patch
-权重分位数：低于 p80 的区域权重为 0，高于 p99 为 1，中间线性过渡，然后上采样
-到图像尺寸。支持任意 `0 <= lower < upper <= 100` 的小数，如 `[2,98]`、
-`[10,90]`、`[82.5,97.3]`。这两个数是渐变的端点，超过上界仍保持权重 1。
-若分位数重合则退回实际 min/max；若整张图注意力相同则使用全图权重 1。
-这里按帧生成训练目标，与视频整段共享显示色阶的统计范围不同。
+默认把原始幅度转换为 `target_strength = d / (d + strength_scale)`，再双线性
+上采样到 RGB 尺寸。这样 `d=0` 的监督严格为 0，并保留跨帧强弱关系；不再对每帧
+context 分别做分位数拉伸。`strength_scale=5.0` 是待实验校准的草案值，
+并非从数据拟合或已经验证的最优值：`d=5` 对应强度 0.5。
 
-学生区域预测头用教师上述软区域做 MSE 监督；训练和推理都使用**学生预测的区域**
-调制光团或残差，不直接用教师 mask 替换学生输出。
-预测区域是教师区域的近似，不能保证与教师阈值区域完全相同。默认总损失为
-`denoiser_mse + mask_loss_weight * mask_mse`，另可开启上述辅助目标。
+学生用 RGB+wrench 融合特征预测低分辨率强度场，默认
+`activation=relu` 后截到 `[0,1]`，再双线性上采样，逐像素调制 RGB 残差。
+负 logits 可以表示精确零强度。训练和推理都使用**学生预测的强度场**，
+不把教师场直接乘到渲染结果上。只有学生预测场为 0 的位置才严格保持原图；
+教师 `d=0` 提供零场监督，有限的 MSE 训练本身不能保证预测也精确为 0。
+教师零 wrench 路径仍包含融合模块的 FFN 和 LayerNorm，未必等于学生的纯视觉路径；
+因此即使保留原图，去噪 MSE 也可能包含这部分基础路径差异。
+默认总损失为 `denoiser_mse + mask_loss_weight * field_mse`，
+`token_loss_weight=0`，token MSE 仅作诊断；日志兼容字段仍叫 `mask_mse`。
 
-也可以用图 C 的最终融合变化作为区域监督：设置
-`render_net.high_attention_render.source=context_effect`、
-`selection=binary_top_percentile`、`percentile=90`。教师固定 RGB，比较真实 wrench
-与 `raw_zero` 参考条件的最终融合 token，按 `||Z(W)-Z(W_ref)||2` 对每个相机、
-每个观测槽位独立选择最高 10% patch，作为二值目标。192 个 patch 时选择 20 个；
-并列值稳定排序，全零响应不选取区域。原始差值用两个 FP32 encoder 前向计算，
-无需采集 DiT attention，缓存与原注意力缓存使用不同指纹。
-
-该模式下学生仍用 RGB+wrench 自行预测区域，mask MSE 监督其接近教师二值目标。
-渲染时在 patch 网格上选择学生预测最高 10%、且置信度超过
-`prediction_threshold=0.5` 的位置，其余位置严格不写入图像；最近邻上采样避免
-区域边界插值扩散。训练使用直通梯度，推理使用相同硬门控，均无需在线教师。
-面积上限是严格约束，位置是学生对教师 context 区域的近似，不能保证完全重合。
+`source=noise_attention` 保留 DiT→context→融合输入图像 patch 的 attention rollout：
+平均 heads、包含残差路由、每次去噪的条件质量归一化后对全部去噪步求均值，
+action query 为执行动作段。它仍按每个相机／观测槽位的 `percentiles: [80,99]`
+生成软区域，低于下界为 0、高于上界为 1、中间线性变化，随后双线性上采样。
+这是 DINO patch 层面的空间参考，不能解释为像素因果贡献。
+原始教师 token 由独立无 hook 前向计算，注意力捕获不替换监督目标。
+`context` 设 `strength_scale=null` 可恢复旧的逐图分位数方式，但全零 context
+仍生成全零场。旧名称 `attention`、`context_effect` 和
+`binary_top_percentile` 模式保留用于历史实验。
 `teacher_cache.precision=float32` 可令对照实验两组的教师 token 都关闭 AMP 计算；
 `teacher_cache.dtype` 仍独立控制缓存存储精度。
 
@@ -272,24 +272,22 @@ LayerNorm，学生需要通过 RGB 同时逼近这部分基础变换和力引起
 python train_distill_render_net.py teacher_checkpoint=/path/to/teacher.ckpt \
   render_net.high_attention_render.enabled=false teacher_cache.precision=float32
 
-# context effect 的 p90 以上区域监督 + 学生 patch 硬门控
-python train_distill_render_net.py teacher_checkpoint=/path/to/teacher.ckpt \
-  render_net.high_attention_render.enabled=true \
-  render_net.high_attention_render.source=context_effect \
-  render_net.high_attention_render.selection=binary_top_percentile \
-  render_net.high_attention_render.percentile=90 teacher_cache.precision=float32
+# Patch RGB 残差 + context 连续强度场的训练草案（参数尚未校准）
+# 使用 2026.11.01 教师、RGB 修改幅度上限 1.0、token loss 权重 0。
+python train_distill_render_net.py \
+  --config diffusion_policy/config/train_distill_render_net_patch_context.yaml
 ```
 
 日志中 `train_mse/val_mse` 表示所选主目标，`train_token_mse` 单独记录 context 差异。
 关闭区域开关时不建立区域头、不计算区域损失；去噪输出蒸馏仍需运行 DiT。
-开启区域监督时，教师额外运行完整去噪链获取注意力。
+仅 `source=noise_attention` 为区域监督额外运行完整去噪链；`context` 直接计算配对 encoder 差分。
 默认先为整个训练集和验证集生成缓存，再开始训练，后续 epoch 直接读取监督。
 验证与初始化评估使用所选主目标，学生仍使用自己预测的区域渲染图像。
 注意力采集生成的最终动作被丢弃；去噪监督在每个随机 `a_t,t` 上在线计算，
 不缓存为固定噪声标签。学生路径保持仅通过 RenderNet 接收 wrench。
 只生成渲染图时无需教师融合网络、DINO 或 DiT；完整 RenderDP 动作推理仍需要冻结视觉路径和 DiT。
 
-新的主目标增加了教师 DiT 前向和学生 DiT 前后向；移除 RGB 解码器能减少部分计算，
+新的主目标增加了教师 DiT 前向和学生 DiT 前后向；更换 RGB 输出头会改变部分计算，
 但不能据此保证每步更快。普通 FDP 的冻结 DINO 通常只做前向，RenderDP 则必须保留
 DINO 的输入反向，因此可训练参数较少也不等于单步成本更低。新目标是否减少收敛步数需实测。
 当前入口实现的是**冻结教师后蒸馏**，未实现 FDP/RenderDP 联合训练。
@@ -297,8 +295,8 @@ DINO 的输入反向，因此可训练参数较少也不等于单步成本更低
 教师变化时 context／attention 缓存也会失效，需要在线计算或刷新，并考虑 warmup 或 EMA 教师。
 
 `teacher_cache.enabled=true` 默认将教师 context token 以 **float16** 保存到
-`data/cache/render_net_teacher/<指纹>/{train,validation}/`，原始 patch 注意力百分比
-仍保存为 float32。token 在磁盘、CPU 和 CPU→GPU 传输时保持 FP16，计算 MSE 时
+`data/cache/render_net_teacher/<指纹>/{train,validation}/`，原始 patch 注意力百分比或
+context 差分幅度仍保存为 float32。token 在磁盘、CPU 和 CPU→GPU 传输时保持 FP16，计算 MSE 时
 与学生 token 一起转为 FP32。FP16 存储会引入少量量化误差；可用
 `teacher_cache.dtype=float32` 保留原精度，并复用原有 float32 缓存。切换存储精度
 使用独立缓存目录。
@@ -311,7 +309,7 @@ Ctrl+C、SIGTERM 或 SIGHUP 退出时，删除本次使用的教师缓存（包�
 SIGKILL（`kill -9`）、系统断电无法执行进程内清理；已有 `nohup` 的 SIGHUP 忽略行为保留。
 如需保留缓存以便复用或断点生成，设置 `teacher_cache.cleanup_on_exit=false`。
 缓存按原数据集样本索引读取，训练 shuffle 不改变对应关系；有保留的未完成缓存时，
-会接着未完成的样本生成。更换教师、数据集或 AMP 设置会使用新的缓存；只修改渲染分位数或
+会接着未完成的样本生成。更换教师、数据集或 AMP 设置会使用新的缓存；只修改强度映射、渲染分位数或
 学生主干可直接复用。生成缓存要求关闭随机图像增强。
 
 默认 `teacher_cache.load_into_ram=false`，教师监督保留在 SSD，通过只读 memory map
@@ -323,11 +321,13 @@ SIGKILL（`kill -9`）、系统断电无法执行进程内清理；已有 `nohup
 `teacher_cache.load_into_ram=true`，Linux DataLoader worker 共享加载后的只读数组。
 这里缓存的是教师监督；源 RGB 仍由数据集读取，增强图像变化后的学生 DINO 前向／
 反向仍需每步执行。`teacher_cache.batch_size` 独立控制教师预计算 batch。
-开启区域监督时，教师编码、完整去噪链和注意力 rollout 均按该 batch 并行执行，
+`noise_attention` 的教师编码、完整去噪链和 attention rollout 均按该 batch 并行执行，
 注意力在 GPU 上汇总后随整个 batch 写入缓存，避免逐样本运行和逐步回传 CPU。
 各样本独立使用 `teacher_seed`，保留原来的噪声初始化与逐去噪步归一化后求平均的定义；
 普通 context token 目标仍通过单独的无注意力提取前向计算，原有 float32 缓存仍兼容。
-若关闭缓存，区域监督回到每个有梯度的训练步骤在线采集，验证仍不运行教师 DiT。
+`context` 则按 batch 执行正常／参考 encoder 并缓存原始差分幅度。若关闭缓存，区域
+监督回到每个有梯度的训练步骤在线计算；验证不为区域监督额外采集 DiT attention，
+但 denoiser MSE 验证仍需教师和学生共享的冻结 DiT。
 
 ```bash
 conda activate fdp
@@ -351,6 +351,7 @@ python train_distill_render_net.py \
   render_net.backbone=transformer \
   dataloader.batch_size=32 \
   render_net.high_attention_render.enabled=true \
+  render_net.high_attention_render.source=noise_attention \
   'render_net.high_attention_render.percentiles=[80,99]'
 
 # 只预计算／复用完整教师缓存，完成后退出；不加载 RAM、不训练。
@@ -467,15 +468,12 @@ checkpoint 会按原 GRU／FiLM 结构加载，可继续可视化；新结构需
 观测数量和 patch 数量，不硬编码 token 长度。
 训练摘要记录当前 epoch、最优 epoch／step、早停计数和停止原因；达到 epoch 上限、
 显式 step 上限或验证早停会分别记录为 `max_epochs`、`max_steps`、`early_stopping`。
-终端和 `train_distill_render_net.log` 同时记录运行进度：首次训练 batch 的评估
-开始／结束、缓存样本数／速率／ETA、验证首个／每 10 个／最后一个 batch 的 MSE、耗时与 ETA；教师注意力
-逐样本采集超过 30 秒时也会输出进度。训练步骤按 `training.log_every` 打印
-主目标 MSE、token 诊断值、区域 MSE、总 loss、梯度范数和显存。`logs.json.txt` 保存指标。
-
-本地日志参考 DP 的训练进度方式，不启动 W&B。终端显示训练／验证进度条；
-文件日志按 `training.log_every` 记录 batch 进度、当前及本轮平均 MSE、区域 MSE、
-总损失、学习率、梯度裁剪前范数、数据等待／计算耗时、samples/s、ETA 和显存。
-每轮按样本数加权汇总训练指标，记录验证 MSE、最佳 checkpoint 和早停计数。
+本地日志不启动 W&B。TTY 终端的训练／验证使用单行实时 tqdm；训练显示 loss、平均
+MSE、field MSE 和学习率，验证显示 MSE。每轮结束清除进度条，打印按样本数加权的训练／验证摘要、
+最佳 MSE 与早停计数。重定向到文件时默认不输出带回车符的进度条，而是每
+`logging.status_interval_sec=60` 秒输出一条进度心跳，并保留每个 epoch 的摘要。
+`logs.json.txt` 仍逐步保存完整指标，包括 token 诊断值、field MSE、梯度范数、
+数据等待／计算耗时、samples/s 和显存；减少终端输出不会减少 JSON 记录。
 
 训练目录中的 **`training_metrics.png`** 包含六组曲线：逐步主目标 MSE、按 epoch
 汇总的训练／验证 MSE（标记最优验证点）、主目标／token 诊断／区域／总损失、梯度范数、学习率，
@@ -485,8 +483,9 @@ checkpoint 会按原 GRU／FiLM 结构加载，可继续可视化；新结构需
 `Decode + teacher cache [train/validation]` 进度条，按已保存的样本数显示百分比、
 sample/s 和 ETA；续算时从已有缓存数量开始。当前 RGB 按 batch 懒解码，因此该条
 显示解码及教师前向、落盘的整体进度。训练／验证另按 batch 显示。
-进度条支持终端、IDE 和重定向输出，可通过 `logging.progress_bar=false` 关闭；
-普通文件日志仍保留进度。缓存锁表示另一个进程正在生成同一缓存；停止持锁任务后
+进度条可通过 `logging.progress_bar=false` 关闭；
+`logging.progress_bar_non_tty=true` 可显式在重定向输出中启用进度条，默认关闭。
+缓存锁表示另一个进程正在生成同一缓存；停止持锁任务后
 直接重新运行即可续算，无需删除缓存或锁文件。
 
 已有 JSON 日志也可以重新生成曲线：
@@ -526,8 +525,8 @@ python diffusion_policy/scripts/visualize_render_net_episode.py \
 在 CPU 上推理。
 主干和区域头从 checkpoint 配置自动恢复。区域头启用训练的模型，在推理命令中
 加 `--disable-high-attention-render` 可以临时改为整图渲染作对比；该选项不会修改
-checkpoint。修改分位数会改变教师区域监督目标，需要重新训练，推理时不重新
-运行教师注意力或用新分位数伪装已有预测区域。
+checkpoint。修改 `strength_scale` 或分位数会改变教师场监督目标，需要重新训练；
+推理时不重新运行教师差分／注意力，也不按新参数重算已有模型的预测场。
 使用原始 wrench 直接归一化的旧 checkpoint 不包含一致的预处理状态，推理脚本
 会提示重新训练，避免静默改变模型训练时的输入分布。旧错误训练产物已清理。
 

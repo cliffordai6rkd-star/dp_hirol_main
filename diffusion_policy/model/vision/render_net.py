@@ -199,6 +199,44 @@ class ConvAttentionBackbone(nn.Module):
         return self.output(features), features
 
 
+class PatchResidualBackbone(ConvAttentionBackbone):
+    """Predict one RGB residual block for every spatial feature token.
+
+    The feature grid is aligned with the DINO patch grid.  Each token emits a
+    ``patch_size x patch_size`` RGB block, which is tiled back to the padded
+    image and cropped to the original resolution.  The image path still uses
+    the same CNN, optional image self-attention and image-query/wrench-key
+    cross-attention as :class:`ConvAttentionBackbone`.
+    """
+
+    def __init__(self, base_channels, conditioning_dim, *, patch_size=16,
+                 embed_dim=128, residual_refine=True, **kwargs):
+        super().__init__(base_channels, conditioning_dim, patch_size=patch_size,
+                         embed_dim=embed_dim, decode=False, **kwargs)
+        self.output = nn.Linear(self.embed_dim, 3 * self.patch_size * self.patch_size)
+        self.residual_refine = bool(residual_refine)
+        if self.residual_refine:
+            self.refine = nn.Conv2d(3, 3, kernel_size=3, padding=1)
+            with torch.no_grad():
+                self.refine.weight.zero_()
+                self.refine.bias.zero_()
+                self.refine.weight[:, :, 1, 1] = torch.eye(3)
+
+    def forward(self, image, wrench_tokens, camera_embedding):
+        features, _, height, width = self.encode(image, wrench_tokens, camera_embedding)
+        batch, _, grid_h, grid_w = features.shape
+        tokens = features.flatten(2).transpose(1, 2)
+        residual = self.output(tokens).reshape(
+            batch, grid_h, grid_w, 3, self.patch_size, self.patch_size,
+        )
+        residual = residual.permute(0, 3, 1, 4, 2, 5).reshape(
+            batch, 3, grid_h * self.patch_size, grid_w * self.patch_size,
+        )
+        if self.residual_refine:
+            residual = self.refine(residual)
+        return residual[:, :, :height, :width], features
+
+
 class GaussianGlowBackbone(ConvAttentionBackbone):
     """Learn blob parameters from fused RGB/wrench tokens, without force/color rules."""
 
@@ -282,7 +320,7 @@ class RenderNet(nn.Module):
                  architecture_version=2, wrench_history_steps=8, max_obs_steps=2,
                  wrench_layers=1, wrench_dropout=0.0, image_keys=("side", "wrist"),
                  initialize_wrench_from_teacher=True, conv_block="standard",
-                 rendering_mode="residual", glow=None):
+                 rendering_mode="residual", glow=None, patch_residual_refine=True):
         super().__init__()
         if architecture_version != 2:
             raise ValueError("Use build_render_net to load a version 1 checkpoint")
@@ -292,8 +330,8 @@ class RenderNet(nn.Module):
             raise ValueError("Wrench dimensions, sequence lengths and LSTM layers must be positive")
         if backbone not in {"unet", "transformer"}:
             raise ValueError("backbone must be 'unet' or 'transformer'")
-        if rendering_mode not in {"residual", "gaussian_glow"}:
-            raise ValueError("rendering_mode must be residual or gaussian_glow")
+        if rendering_mode not in {"residual", "patch_residual", "gaussian_glow"}:
+            raise ValueError("rendering_mode must be residual, patch_residual or gaussian_glow")
         self.rendering_mode = rendering_mode
         self.image_keys = tuple(sorted(str(key) for key in image_keys))
         if not self.image_keys or len(set(self.image_keys)) != len(self.image_keys):
@@ -312,32 +350,47 @@ class RenderNet(nn.Module):
             conditioning_dim, conditioning_dim, num_layers=wrench_layers, batch_first=True,
             dropout=wrench_dropout if wrench_layers > 1 else 0.0,
         )
-        backbone_type = GaussianGlowBackbone if rendering_mode == "gaussian_glow" else ConvAttentionBackbone
-        self.backbone = backbone_type(
-            base_channels, conditioning_dim, self_attention=backbone == "transformer",
+        backbone_options = dict(transformer or {})
+        backbone_options.update(
+            base_channels=base_channels,
+            conditioning_dim=conditioning_dim,
+            self_attention=backbone == "transformer",
             conv_block=conv_block,
-            **({"glow": glow} if rendering_mode == "gaussian_glow" else {}),
-            **(transformer or {}),
         )
+        if rendering_mode == "gaussian_glow":
+            self.backbone = GaussianGlowBackbone(glow=glow, **backbone_options)
+        elif rendering_mode == "patch_residual":
+            self.backbone = PatchResidualBackbone(
+                residual_refine=patch_residual_refine, **backbone_options,
+            )
+        else:
+            self.backbone = ConvAttentionBackbone(**backbone_options)
         self.camera_embedding = nn.Embedding(len(self.image_keys), self.backbone.embed_dim)
         for parameter in (self.wrench_position, self.obs_position, self.force_modality,
                           self.camera_embedding.weight):
             nn.init.normal_(parameter, std=0.02)
-        if rendering_mode == "residual":
+        if rendering_mode in {"residual", "patch_residual"}:
             nn.init.zeros_(self.output.weight)
             nn.init.zeros_(self.output.bias)
         self.high_attention_enabled = bool((high_attention_render or {}).get("enabled", False))
         region_config = high_attention_render or {}
         self.region_selection = region_config.get("selection", "soft")
+        self.region_activation = str(region_config.get("activation", "sigmoid"))
         self.region_percentile = float(region_config.get("percentile", 90.0))
         self.region_prediction_threshold = float(region_config.get("prediction_threshold", 0.5))
         if self.region_selection not in {"soft", "binary_top_percentile"}:
             raise ValueError("Unknown high_attention_render.selection")
+        if self.region_activation not in {"sigmoid", "relu"}:
+            raise ValueError("Unknown high_attention_render.activation")
         if self.region_selection == "binary_top_percentile":
             if not 0 <= self.region_percentile < 100 or not 0 <= self.region_prediction_threshold < 1:
                 raise ValueError("Invalid binary region percentile or prediction threshold")
         self.mask_head = (nn.Conv2d(self.backbone.feature_dim, 1, 1)
                           if self.high_attention_enabled else None)
+        if self.mask_head is not None and self.region_activation == "relu":
+            # Keep the first forward pass trainable while allowing negative
+            # logits to represent an exact zero-strength field.
+            nn.init.constant_(self.mask_head.bias, 0.1)
         self._compiled_backbone_forward = None
 
     def compile_backbone(self, **kwargs):
@@ -396,7 +449,10 @@ class RenderNet(nn.Module):
                         else raw_residual.tanh()).reshape_as(image)
             if use_mask:
                 logits = self.mask_head(features)
-                mask = (logits.float() if self.region_selection == "binary_top_percentile" else logits).sigmoid()
+                if self.region_activation == "relu":
+                    mask = F.relu(logits).clamp(max=1.0)
+                else:
+                    mask = (logits.float() if self.region_selection == "binary_top_percentile" else logits).sigmoid()
                 gate = mask
                 if self.region_selection == "binary_top_percentile":
                     height, width = image.shape[-2:]
@@ -410,7 +466,7 @@ class RenderNet(nn.Module):
                     gate = scores + (hard - scores).detach()
                     padded_size = (grid[0] * patch, grid[1] * patch)
                     gate = F.interpolate(gate, size=padded_size, mode="nearest")[:, :, :height, :width]
-                if self.rendering_mode == "gaussian_glow":
+                if self.rendering_mode in {"gaussian_glow", "patch_residual"}:
                     height, width = image.shape[-2:]
                     patch = self.backbone.patch_size
                     padded_size = (height + (-height) % patch, width + (-width) % patch)

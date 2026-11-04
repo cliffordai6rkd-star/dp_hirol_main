@@ -8,7 +8,17 @@ from test_render_net_distillation import make_attention_teacher
 from diffusion_policy.model.vision.render_net import RenderNet, top_percentile_mask
 from diffusion_policy.model.vision.render_net_attention import context_effect_regions, teacher_context_effect_targets
 from diffusion_policy.scripts.visualize_wrench_effect_episode import make_zero_wrench_obs
-from diffusion_policy.workspace.train_distill_render_net_workspace import TrainDistillRenderNetWorkspace
+from diffusion_policy.workspace.train_distill_render_net_workspace import (
+    TrainDistillRenderNetWorkspace,
+    normalize_region_source,
+)
+
+
+def test_region_source_names_have_canonical_config_and_legacy_aliases():
+    assert normalize_region_source("noise_attention") == "noise_attention"
+    assert normalize_region_source("context") == "context"
+    assert normalize_region_source("attention") == "noise_attention"
+    assert normalize_region_source("context_effect") == "context"
 
 
 def test_context_targets_match_full_fp32_encoder_difference_and_do_not_call_dit():
@@ -47,6 +57,41 @@ def test_binary_top90_has_only_twenty_of_192_patches_and_empty_zero_response():
     assert masks["wrist"].count_nonzero() == 0
 
 
+def test_context_effect_soft_regions_use_continuous_quantile_weights():
+    teacher, obs, _ = make_attention_teacher()
+    maps = {
+        "side": torch.arange(16, dtype=torch.float32).reshape(1, 1, 16).expand(2, 2, -1),
+        "wrist": torch.zeros(2, 2, 6),
+    }
+    masks = context_effect_regions(
+        maps, obs, teacher.obs_encoder.backbone,
+        selection="soft", percentiles=[25, 75],
+    )
+    assert masks["side"].shape == (2, 2, 1, *obs["side"].shape[-2:])
+    assert float(masks["side"].min()) == 0.0
+    assert float(masks["side"].max()) == 1.0
+    assert ((masks["side"] > 0) & (masks["side"] < 1)).any()
+    # A zero effect means no rendering strength anywhere.
+    torch.testing.assert_close(masks["wrist"], torch.zeros_like(masks["wrist"]))
+
+
+def test_context_effect_absolute_strength_keeps_zero_effect_zero_and_uses_bilinear_field():
+    teacher, obs, _ = make_attention_teacher()
+    maps = {
+        "side": torch.tensor([[[0., 2., 8., 18.]]]).expand(2, 2, -1),
+        "wrist": torch.zeros(2, 2, 6),
+    }
+    masks = context_effect_regions(
+        maps, obs, teacher.obs_encoder.backbone,
+        selection="soft", strength_scale=8.0,
+    )
+    assert masks["side"].shape == (2, 2, 1, *obs["side"].shape[-2:])
+    assert float(masks["side"].min()) == 0.0
+    assert float(masks["side"].max()) < 1.0
+    assert ((masks["side"] > 0) & (masks["side"] < 1)).any()
+    torch.testing.assert_close(masks["wrist"], torch.zeros_like(masks["wrist"]))
+
+
 @pytest.mark.parametrize("rendering_mode", ["gaussian_glow", "residual"])
 def test_binary_student_gate_has_no_outside_rendering_and_keeps_region_gradients(rendering_mode):
     torch.manual_seed(5)
@@ -77,6 +122,31 @@ def test_binary_student_gate_has_no_outside_rendering_and_keeps_region_gradients
     torch.testing.assert_close(empty, image, rtol=0, atol=0)
 
 
+def test_patch_residual_outputs_pixel_blocks_and_zero_strength_is_identity():
+    torch.manual_seed(9)
+    model = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
+        rendering_mode="patch_residual", patch_residual_refine=True,
+        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        high_attention_render={"enabled": True, "activation": "relu"},
+    ).eval()
+    image = torch.full((1, 2, 3, 32, 40), .3)
+    wrench = torch.randn(1, 2, 3, 6)
+    with torch.no_grad():
+        model.mask_head.weight.zero_()
+        model.mask_head.bias.fill_(-1.)
+        rendered, masks = model({"wrist": image}, wrench, return_aux=True)
+    assert rendered["wrist"].shape == image.shape
+    assert masks["wrist"].count_nonzero() == 0
+    torch.testing.assert_close(rendered["wrist"], image, rtol=0, atol=0)
+    assert model.output.out_features == 3 * 8 * 8
+    with torch.no_grad():
+        model.output.weight.normal_(std=.05)
+        model.mask_head.bias.fill_(1.)
+    rendered = model({"wrist": image}, wrench)["wrist"]
+    assert (rendered - image).abs().sum() > 0
+
+
 @pytest.mark.parametrize("cached", [False, True])
 def test_context_region_supervision_integrates_with_cached_and_online_training(cached):
     teacher, obs, _ = make_attention_teacher()
@@ -100,6 +170,35 @@ def test_context_region_supervision_integrates_with_cached_and_online_training(c
         tokens, patches = workspace._region_targets(obs, return_patch_attention=True)
         targets = {"tokens": tokens, "patch_attention": patches}
     loss = workspace._loss(obs, cached_targets=targets)
+    loss.backward()
+    assert workspace.loss_metrics["mask_supervised"]
+    assert workspace.loss_metrics["mask_mse"] > 0
+    assert workspace.model.mask_head.weight.grad.abs().sum() > 0
+
+
+def test_context_region_soft_supervision_integrates_with_cached_training():
+    teacher, obs, _ = make_attention_teacher()
+    config = {
+        "enabled": True, "source": "context", "selection": "soft",
+        "percentiles": [80, 99], "baseline": "raw_zero",
+    }
+    workspace = object.__new__(TrainDistillRenderNetWorkspace)
+    workspace.teacher_policy = teacher
+    workspace.device = torch.device("cpu")
+    workspace.cfg = OmegaConf.create({})
+    workspace.model = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
+        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        rendering_mode="gaussian_glow", high_attention_render=config,
+    ).train()
+    workspace.attention_config = config
+    workspace.region_source = "context"
+    workspace.attention_enabled = True
+    workspace.mask_loss_weight = 1.
+    workspace.amp_enabled = False
+    workspace.shape_info = {}
+    tokens, patches = workspace._region_targets(obs, return_patch_attention=True)
+    loss = workspace._loss(obs, cached_targets={"tokens": tokens, "patch_attention": patches})
     loss.backward()
     assert workspace.loss_metrics["mask_supervised"]
     assert workspace.loss_metrics["mask_mse"] > 0
