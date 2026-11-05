@@ -26,7 +26,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    fill_future_wrench_prefix, preprocess_wrench,
+    fill_future_wrench_prefix, preprocess_wrench, validate_future_contact_mode,
 )
 
 
@@ -90,9 +90,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
+        future_contact_mode: str = "legacy_rollout",
+        contact_fusion_gate: bool = False,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
+        self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
+        self.contact_fusion_gate = bool(contact_fusion_gate)
+        if self.contact_fusion_gate and future_phase_wrench_key is None:
+            raise ValueError("contact_fusion_gate requires future_phase_wrench_key and future contact data")
         obs_shape_meta = shape_meta.get("obs", {})
         configured_image_keys = tuple(
             sorted(
@@ -214,6 +220,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
+        if self.contact_fusion_gate and (
+            getattr(obs_encoder, "cross_attn_query", None) != "image"
+            or getattr(obs_encoder, "cross_attn_layers", 0) <= 0
+        ):
+            raise ValueError("contact_fusion_gate requires image-query fusion with cross_attn_layers > 0")
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
             raise ValueError(
                 f"obs_encoder cameras={list(encoder_image_keys)} do not match "
@@ -443,6 +454,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             shared_phase_signal=self.phase_wrench_key == self.wrench_key,
             contact_detector=self.contact_detector, input_gate=self.input_gate,
             normalizer=self.normalizer, wrench_key=self.wrench_key,
+            future_contact_mode=getattr(self, "future_contact_mode", "legacy_rollout"),
         )
         return images, normalized_wrench, contact, future_has_contact
 
@@ -453,6 +465,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         images, normalized_wrench, contact, future_has_contact = self.prepare_context_inputs(obs_dict)
+        contact_gate = None
+        if self.contact_fusion_gate:
+            if future_has_contact is None:
+                raise ValueError("contact_fusion_gate requires future contact data; current contact is insufficient")
+            contact_gate = future_has_contact
         # The curriculum degrades image evidence only for windows
         # whose *future* reaches contact.  The current observation is often
         # still free in these windows, and its tau_ext history is therefore
@@ -469,6 +486,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 mask_contact, probability=1.0,
                 enabled=apply_curriculum_mask and sigma > 0,
             )
+            if contact_gate is not None:
+                blurred_images = blurred_images & contact_gate
             if blurred_images.any():
                 images = {key: value.clone() for key, value in images.items()}
                 for value in images.values():
@@ -483,6 +502,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 enabled=apply_curriculum_mask,
                 generator=generator,
             )
+            if contact_gate is not None:
+                image_mask = image_mask & contact_gate
             blurred_images = torch.zeros_like(image_mask)
         self.last_curriculum_metrics = {
             "curriculum/mask_probability": probability,
@@ -498,10 +519,12 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "curriculum/blurred_image_fraction": blurred_images.float().mean().item(),
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
+        gate_kwargs = {} if contact_gate is None else {"contact_gate": contact_gate}
         return self.obs_encoder(
             images=images,
             wrench_history=normalized_wrench,
             image_token_mask=image_mask,
+            **gate_kwargs,
         )
 
     def conditional_sample(

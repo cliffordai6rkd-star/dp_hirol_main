@@ -7,6 +7,8 @@ camera/observation image's own patch p2/p98 color scale. Use --color-scope
 episode for a shared episode scale. These are feature magnitudes, not attention
 probabilities, physical force units, or final-action attribution. No diffusion
 sampling is needed. Original values and preprocessing diagnostics are saved.
+When complete fusion is gated off, update maps are zero; context differences
+still include the entire fused-versus-visual branch change.
 """
 
 from __future__ import annotations
@@ -46,8 +48,8 @@ METRICS = {
 }
 METRIC_LABELS = {
     **METRICS,
-    "action_sensitivity": ("Action sensitivity | single-patch CA replacement",
-                           "mean_DDIM ||epsilon(W)-epsilon(U_p<-U_p(W0))||2"),
+    "action_sensitivity": ("Action sensitivity | single-patch fusion replacement",
+                           "mean_DDIM ||epsilon(W)-epsilon(Z_p<-Z_p(W0))||2"),
 }
 
 
@@ -119,23 +121,26 @@ class WrenchEffectCapture:
         if first.shape[0] != 1:
             raise ValueError("Episode residual visualization requires batch size one")
         self._updates = []
-        replacement = None
-        if normalized_zero:
-            signature = inspect.signature(self.encoder.forward)
+        signature = inspect.signature(self.encoder.forward)
+        contact_gate = None
 
-            def replace_wrench(module, args, kwargs):
-                bound = signature.bind_partial(*args, **kwargs)
+        def capture_inputs(module, args, kwargs):
+            nonlocal contact_gate
+            bound = signature.bind_partial(*args, **kwargs)
+            gate = bound.arguments.get("contact_gate")
+            if gate is not None:
+                contact_gate = gate[0].detach().cpu().clone()
+            if normalized_zero:
                 if "wrench_history" not in bound.arguments:
                     raise ValueError("Encoder has no explicit wrench_history input")
                 bound.arguments["wrench_history"] = torch.zeros_like(bound.arguments["wrench_history"])
                 return bound.args, bound.kwargs
 
-            replacement = self.encoder.register_forward_pre_hook(replace_wrench, with_kwargs=True)
+        replacement = self.encoder.register_forward_pre_hook(capture_inputs, with_kwargs=True)
         try:
             context = self.policy._encode_context(obs, apply_curriculum_mask=False)
         finally:
-            if replacement is not None:
-                replacement.remove()
+            replacement.remove()
         expected = 1 if self.mode == "joint" else len(self.encoder.image_keys)
         if len(self._updates) != expected:
             raise RuntimeError(f"Expected {expected} CA calls, captured {len(self._updates)}")
@@ -146,7 +151,17 @@ class WrenchEffectCapture:
         context = context.detach().float().cpu().reshape(self.steps, patches, channels)
         if not torch.isfinite(update).all() or not torch.isfinite(context).all():
             raise ValueError("Encoder produced non-finite residual updates or context")
-        return {"context": context, "ca_update": update}
+        result = {"context": context, "ca_update": update}
+        if contact_gate is not None:
+            result["contact_gate"] = contact_gate
+        return result
+
+
+def applied_ca_update(branch):
+    """Exclude computed CA updates discarded by the complete fusion gate."""
+    update = branch["ca_update"]
+    gate = branch.get("contact_gate")
+    return update if gate is None else torch.where(gate[:, None, None], update, torch.zeros_like(update))
 
 
 @torch.inference_mode()
@@ -165,11 +180,12 @@ def capture_pair(policy, obs, capture=None, *, baseline="raw_zero", save_vectors
         _, normalized_baseline, _, _ = policy.prepare_context_inputs(zero_obs)
     else:
         normalized_baseline = torch.zeros_like(normalized)
-    delta_u = full["ca_update"] - zero["ca_update"]
+    full_update, zero_update = applied_ca_update(full), applied_ca_update(zero)
+    delta_u = full_update - zero_update
     delta_z = full["context"] - zero["context"]
     pair = {
-        "ca_update": torch.linalg.vector_norm(full["ca_update"], dim=-1).numpy(),
-        "baseline_ca_update": torch.linalg.vector_norm(zero["ca_update"], dim=-1).numpy(),
+        "ca_update": torch.linalg.vector_norm(full_update, dim=-1).numpy(),
+        "baseline_ca_update": torch.linalg.vector_norm(zero_update, dim=-1).numpy(),
         "injection_effect": torch.linalg.vector_norm(delta_u, dim=-1).numpy(),
         "context_effect": torch.linalg.vector_norm(delta_z, dim=-1).numpy(),
         "normalized_wrench": normalized[0].detach().float().cpu().numpy(),
@@ -178,8 +194,8 @@ def capture_pair(policy, obs, capture=None, *, baseline="raw_zero", save_vectors
         "future_has_contact": None if future is None else future[0].detach().cpu().numpy(),
     }
     if save_vectors:
-        pair.update(ca_update_vector=full["ca_update"].numpy(),
-                    baseline_ca_update_vector=zero["ca_update"].numpy(),
+        pair.update(ca_update_vector=full_update.numpy(),
+                    baseline_ca_update_vector=zero_update.numpy(),
                     delta_u_vector=delta_u.numpy(), delta_z_vector=delta_z.numpy())
     return pair
 

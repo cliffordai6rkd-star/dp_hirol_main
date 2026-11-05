@@ -1,0 +1,65 @@
+name: diffusion-policy
+
+services:
+  trainer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.1}
+        APT_MIRROR: ${APT_MIRROR:-archive.ubuntu.com}
+    image: diffusion-policy:train
+    container_name: ${CONTAINER_NAME:-diffusion-policy-trainer}
+    working_dir: /workspace
+    # The image contains the source tree and Python runtime.  Override
+    # TRAIN_COMMAND in .env or on the command line for another experiment.
+    command: ["bash", "-lc", "exec bash -lc \"$${TRAIN_COMMAND}\""]
+    stdin_open: true
+    tty: true
+    ipc: host
+    # Container /dev/shm for DataLoader workers and the shared image cache.
+    # Four RTX 4090 cards do not determine this value; host RAM does.
+    shm_size: ${SHM_SIZE:-64g}
+    gpus: all
+    init: true
+    stop_grace_period: 30s
+    environment:
+      PYTHONPATH: /workspace
+      # W&B is offline by default, so a copied project can train without an
+      # account. Set WANDB_MODE=online and WANDB_API_KEY on the host if needed.
+      WANDB_MODE: ${WANDB_MODE:-offline}
+      WANDB_DIR: /workspace/data/wandb
+      MPLCONFIGDIR: /tmp/matplotlib
+      HF_HOME: /workspace/.cache/huggingface
+      # Paths inside the container. Host paths are configured below in volumes.
+      DATASET_PATH: ${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
+      DP_DATASET_PATH: ${DP_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
+      DP_BASELINE_DATASET_PATH: ${DP_BASELINE_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
+      DINOV3_MODEL_PATH: ${DINOV3_MODEL_PATH:-/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m}
+      TEACHER_CHECKPOINT: ${TEACHER_CHECKPOINT:-/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt}
+      # Default deployment command: current structured RenderNet + pure token MSE.
+      # Use TRAIN_COMMAND to run DP, denoiser distillation, or a custom Hydra job.
+      TRAIN_COMMAND: >-
+        python train_distill_render_net.py
+        --config-name=train_distill_render_net
+        teacher_checkpoint=${TEACHER_CHECKPOINT:-/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt}
+        +dataset.dataset_path=${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
+        dataset.video_backend=pyav
+        distillation.objective=token_mse
+        render_net.high_attention_render.enabled=false
+        training.intensity_warmup_epochs=0
+        teacher_cache.precision=float32
+        teacher_cache.dtype=float32
+      NPROC_PER_NODE: ${NPROC_PER_NODE:-}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      # The image owns /workspace source code. Mount only mutable experiment data.
+      - ${DATA_DIR:-../data}:/workspace/data
+      - ${MODEL_DIR:-../model}:/workspace/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -428,6 +428,7 @@ class ForceAwareObsEncoder(nn.Module):
         wrench_history: Optional[torch.Tensor] = None,
         image_token_mask: Optional[torch.Tensor] = None,
         images: Optional[Mapping[str, torch.Tensor]] = None,
+        contact_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if images is not None and image is not None:
             raise ValueError("provide either images or the legacy image argument, not both")
@@ -500,6 +501,18 @@ class ForceAwareObsEncoder(nn.Module):
                 f"wrench history has {history_steps} steps, expected {self.wrench_history_steps}"
             )
 
+        if contact_gate is not None:
+            if self.cross_attn_query != "image" or self.cross_attn_layers <= 0:
+                raise ValueError("contact_gate requires image-query fusion with cross_attn_layers > 0")
+            if not isinstance(contact_gate, torch.Tensor) or contact_gate.dtype != torch.bool:
+                raise TypeError("contact_gate must be a bool tensor [B, To]")
+            if contact_gate.shape != (batch_size, obs_steps):
+                raise ValueError("contact_gate must have shape [B, To] matching the observations")
+            if contact_gate.device != wrench_history.device or any(
+                contact_gate.device != images[key].device for key in image_keys
+            ):
+                raise ValueError("contact_gate must be on the same device as images and wrench_history")
+
         obs_position = self.obs_position[:, :obs_steps]
         if image_token_mask is not None and image_token_mask.shape != (
             batch_size,
@@ -509,6 +522,9 @@ class ForceAwareObsEncoder(nn.Module):
                 "image_token_mask must be [B, To], "
                 f"got {tuple(image_token_mask.shape)}"
             )
+        if image_token_mask is not None and contact_gate is not None:
+            # Closed observations must retain the original visual tokens.
+            image_token_mask = image_token_mask & contact_gate
 
         encoded_camera_patches, camera_patch_tokens = self._encode_image_streams(
             images, image_keys, batch_size, obs_steps, image_token_mask,
@@ -532,6 +548,9 @@ class ForceAwareObsEncoder(nn.Module):
         flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
             batch_size * obs_steps, image_token_count, self.n_emb
         )
+        # Save X before any joint image/wrench attention. All fusion residuals,
+        # including pre-CA self-attention and FFNs, are selected together below.
+        x_base = flat_images
         if self.pre_cross_self_attn_layers:
             # Per observation: [all camera patches, all temporal wrench outputs].
             # Self-attention changes features, preserving token order/length.
@@ -575,5 +594,7 @@ class ForceAwareObsEncoder(nn.Module):
                 if self.camera_attention_mode == "per_camera":
                     self.last_cross_attention_weights_by_camera = self.last_cross_attention_weights
 
+        if contact_gate is not None:
+            context = torch.where(contact_gate.reshape(-1, 1, 1), context, x_base)
         context = context.reshape(batch_size, -1, self.n_emb)
         return self.context_norm(context)

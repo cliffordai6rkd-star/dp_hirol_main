@@ -4,11 +4,13 @@
 
 ## 本机构建和打包
 
-在项目根目录执行：
+先回到项目根目录，再执行：
 
 ```bash
+cd /home/lcy/code/dp_hirol_main
+
 APT_MIRROR=mirrors.aliyun.com \
-  docker compose -f docker/docker_compose.yaml build --progress=plain trainer
+  docker compose --progress plain -f docker/docker_compose.yaml build trainer
 
 mkdir -p docker/artifacts
 docker save -o docker/artifacts/diffusion-policy-train.tar diffusion-policy:train
@@ -83,4 +85,13 @@ docker compose -f docker/docker_compose.yaml down
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 nvidia-smi
+```
+
+如果出现 `permission denied while trying to connect to the Docker API`，当前用户还没有加入
+`docker` 用户组。执行一次下面的命令，然后重新登录，或在当前终端运行 `newgrp docker`：
+
+```bash
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker version
 ```

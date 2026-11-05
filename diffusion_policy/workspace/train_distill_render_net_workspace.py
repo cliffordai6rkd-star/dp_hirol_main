@@ -40,7 +40,9 @@ from diffusion_policy.model.vision.render_net_attention import (
     percentile_region, teacher_attention_targets, teacher_context_effect_targets,
     validate_percentiles,
 )
-from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
+from diffusion_policy.model.vision.wrench_preprocessing import (
+    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor,
+)
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
     instantiate_policy, load_checkpoint_payload, patch_grid,
 )
@@ -795,6 +797,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "checkpoint": {"path": str(checkpoint), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
             "state_key": self.teacher_state_key,
             "policy": OmegaConf.to_container(self.teacher_cfg.policy, resolve=True),
+            "wrench_preprocessing_version": WRENCH_PREPROCESSING_VERSION,
+            "future_contact_mode": getattr(self.teacher_policy, "future_contact_mode", "legacy_rollout"),
+            "contact_fusion_gate": bool(getattr(self.teacher_policy, "contact_fusion_gate", False)),
             "dataset": OmegaConf.to_container(dataset_cfg, resolve=True),
             "source": dataset_source_signature(dataset.dataset_path),
             "amp_enabled": self.amp_enabled, "amp_dtype": str(self.amp_dtype),
@@ -803,7 +808,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "attention_seed": int(self.attention_config.get("teacher_seed", 42)),
             "cache_batch_size": int(config["batch_size"]),
         }
-        # Keep the identity of existing float32 caches; FP16 gets a distinct path.
+        # Storage precision is separate from the preprocessing/fusion contract.
         if token_dtype != "float32":
             identity["token_storage_dtype"] = token_dtype
         precision = config.get("precision", "model")

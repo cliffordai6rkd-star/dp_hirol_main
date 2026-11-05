@@ -162,6 +162,8 @@ def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero"):
     device = next(iter(obs.values())).device
     with torch.autocast(device_type=device.type, enabled=False):
         normal = teacher._encode_context(obs, apply_curriculum_mask=False).detach()
+        # Re-enter shared preprocessing on raw zeros: both future labels and
+        # the complete fusion gate must be recomputed for this counterfactual.
         zero = teacher._encode_context(reference, apply_curriculum_mask=False).detach()
         encoder = teacher.obs_encoder
         steps = int(teacher.n_obs_steps)

@@ -239,6 +239,28 @@ wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`
 不作为额外的可学习输入。教师的融合 token 监督目标保持不变。
 网络不额外按零 wrench 或接触标签硬切渲染，而是学习下述连续强度场。
 
+教师接触门控实验使用
+`sim_force_aware_dp_train_20hz_lstm2_gripper_contact_gate.yaml`，继承现有 gripper
+配置并启用 `policy.future_contact_mode=token_threshold` 与
+`policy.contact_fusion_gate=true`。未来标签直接在配置的原始物理信号
+`future_phase_wrench_key` 上逐点比较进入接触阈值，任意一点超过阈值就保留未来
+wrench（沿用首接触点填充自由前缀）并立即融合；窗口末尾的单点尖峰也会触发。
+当前接触仍使用原来的连续 5 点确认，当前已接触不会强制开启未来门。
+门关闭时，教师绕过完整联合 self-attention、cross-attention 和 FFN，使用原图的
+DINO 投影及位置／相机／模态嵌入，并共享原来的最终 LayerNorm；课程 mask/blur
+仅作用于门打开的观测。不增加参数或网络层，也不修改学生结构、loss 或采样网格。
+
+```bash
+python sim_force_aware_dp_train.py \
+  --config-name=sim_force_aware_dp_train_20hz_lstm2_gripper_contact_gate
+```
+
+缺少新字段的旧配置继续使用 `legacy_rollout` 和关闭融合门控，旧权重可以严格加载。
+独立 wrench 预处理配置保存未来检测模式，教师目标缓存指纹区分模式、融合门和
+预处理版本。新模式改变教师输入与条件表示，需先微调或重训并验证动作性能，
+再生成对应的蒸馏目标；加载兼容不代表动作性能不变。教师门控本身不保证学生
+RGB 像素恒等，学生仍通过现有蒸馏目标学习渲染。
+
 连续强度场由 `render_net.high_attention_render.enabled` 控制，默认开启，
 `source=context`、`selection=soft`。教师监督与图 C 使用同一个原始量：
 `d = ||Z(W)-Z(W_raw-zero)||2`，在完整融合、FFN 和最终 LayerNorm 后按 image patch
@@ -258,7 +280,7 @@ wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`
 阈值在像素强度上应用，关闭位置严格保持原图。训练和推理使用同一规则；
 Region MSE 仍监督阈值处理前的预测场，因此关闭区域仍可通过区域监督恢复。
 渲染现有 checkpoint 时可给 `visualize_render_net_episode.py` 传入 `--threshold 0.1`。
-教师零 wrench 路径仍包含融合模块的 FFN 和 LayerNorm，未必等于学生的纯视觉路径；
+未启用上述融合门控时，教师零 wrench 路径仍包含融合模块的 FFN 和 LayerNorm，未必等于学生的纯视觉路径；
 因此即使保留原图，去噪 MSE 也可能包含这部分基础路径差异。
 默认总损失为 denoiser 蒸馏损失、patch 级 context 强度损失和强度场平滑项，
 `token_loss_weight=0`，token MSE 仅作诊断。前两轮只优化强度场，之后再联合 RGB 渲染；

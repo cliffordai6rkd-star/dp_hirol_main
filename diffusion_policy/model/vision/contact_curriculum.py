@@ -240,6 +240,16 @@ class HysteresisContactDetector(nn.Module):
             ))
         return torch.stack(states, dim=1)
 
+    def token_contact(self, raw_wrench: torch.Tensor) -> torch.Tensor:
+        """Threshold each physical-unit token independently at the entry threshold.
+
+        This deliberately has no hysteresis, debounce or initial state. It does
+        not change the historical state detection in ``forward`` or the legacy
+        future state scan in ``rollout_future``.
+        """
+        magnitude = self._per_token_magnitude(raw_wrench)
+        return magnitude > self.contact_threshold.to(magnitude)
+
     def _per_token_magnitude(self, raw_wrench: torch.Tensor) -> torch.Tensor:
         if raw_wrench.ndim != 4:
             raise ValueError(

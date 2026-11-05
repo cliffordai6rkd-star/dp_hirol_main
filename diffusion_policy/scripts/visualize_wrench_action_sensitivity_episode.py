@@ -1,6 +1,7 @@
 """Exact single-patch CA-update interventions on a frozen teacher's epsilon.
 
-For each observation/camera/patch, replace only U_p(W) by U_p(W_ref).
+For each observation/camera/patch, replace U_p(W) by U_p(W_ref). If the
+reference fusion gate is closed, use that patch's pure visual bypass instead.
 Replay residual, FFN and final LayerNorm, then the complete DiT condition
 encoder and action decoder at identical normal-trajectory (x_t, t) inputs.
 The video shows the mean of per-DDIM-step epsilon L2 differences. All step
@@ -50,10 +51,15 @@ def capture_fusion_pair(policy, obs, baseline):
         raise ValueError("Expected one image-query normalization per encoder call")
     torch.testing.assert_close(queries[0], queries[1], rtol=0, atol=0)
     query = queries[0]
-    normal = {key: value.to(device=query.device, dtype=query.dtype) for key, value in normal.items()}
-    reference = {key: value.to(device=query.device, dtype=query.dtype) for key, value in reference.items()}
+    normal = {key: value.to(device=query.device, dtype=torch.bool if key == "contact_gate" else query.dtype)
+              for key, value in normal.items()}
+    reference = {key: value.to(device=query.device, dtype=torch.bool if key == "contact_gate" else query.dtype)
+                 for key, value in reference.items()}
     for branch in (normal, reference):
-        replay = encoder.context_norm(encoder.finish_cross_attention(encoder, query, branch["ca_update"]))
+        replay = encoder.finish_cross_attention(encoder, query, branch["ca_update"])
+        if "contact_gate" in branch:
+            replay = torch.where(branch["contact_gate"][:, None, None], replay, query)
+        replay = encoder.context_norm(replay)
         torch.testing.assert_close(replay, branch["context"], rtol=1e-5, atol=1e-6)
     return query, normal, reference
 
@@ -66,6 +72,8 @@ def replacement_contexts(encoder, query, normal, reference, token_indices):
     act independently on each token. Recompute these layers at the changed
     token and reuse exact unchanged tokens; this equals a full encoder replay.
     The DiT condition encoder still recomputes ALL tokens after intervention.
+    A closed normal observation stays on its visual bypass. A closed reference
+    uses the corresponding pure visual token, including the bypass of its FFN.
     """
     channels = query.shape[-1]
     flat_query = query.reshape(-1, channels)
@@ -73,6 +81,12 @@ def replacement_contexts(encoder, query, normal, reference, token_indices):
     changed = encoder.finish_cross_attention(
         encoder, flat_query[token_indices, None], flat_reference[token_indices, None],
     )
+    if "contact_gate" in normal:
+        # A raw-zero reference may bypass the entire fusion, including FFN.
+        # Replaying its computed (discarded) CA update would be the wrong branch.
+        gate = normal["contact_gate"] & reference["contact_gate"]
+        gate = gate[:, None].expand(query.shape[:2]).reshape(-1)
+        changed = torch.where(gate[token_indices, None, None], changed, flat_query[token_indices, None])
     changed = encoder.context_norm(changed)[:, 0]
     context = normal["context"].reshape(1, -1, channels).expand(len(token_indices), -1, -1).clone()
     context[torch.arange(len(token_indices), device=context.device), token_indices] = changed
@@ -112,8 +126,13 @@ def patch_action_sensitivity(policy, obs, *, baseline="raw_zero", seed=42, batch
     context = normal["context"].reshape(1, steps * patches, channels)
     trace = normal_denoising_trace(policy, context, seed)
     result = torch.zeros((len(trace), steps * patches), dtype=torch.float32, device=context.device)
-    # Exactly unchanged U is a true no-op; avoid introducing batch-roundoff maps.
-    changed = (normal["ca_update"] != reference["ca_update"]).any(dim=-1).flatten().nonzero().flatten()
+    # Skip exact no-ops, including closed observations. With gates, compare
+    # final context too: identical computed U can still select different paths.
+    changed_mask = (normal["ca_update"] != reference["ca_update"]).any(dim=-1)
+    if "contact_gate" in normal:
+        changed_mask = (normal["context"] != reference["context"]).any(dim=-1)
+        changed_mask = changed_mask & normal["contact_gate"][:, None]
+    changed = changed_mask.flatten().nonzero().flatten()
     noop_max, batch_normal_max = 0., 0.
     for start in range(0, len(changed), batch_size):
         indices = changed[start:start + batch_size]
@@ -216,7 +235,7 @@ def run(args):
             "video_frames": len(anchors), "precision": "float32", "seed": args.seed,
             "batch_size": args.batch_size, "elapsed_seconds": time.monotonic() - started,
             "definition": "D_A(t,o,c,p)=L2(epsilon_normal(x_t,t)-epsilon_U[o,c,p]<-U_ref[o,c,p](x_t,t)); full action horizon and channels",
-            "intervention": "One observation slot, one camera, one patch per intervention; only its MHA output-projected U is replaced. RGB, all other U, query residual, raw normal phase/wrench and x_t/t are fixed.",
+            "intervention": "One observation slot, one camera, one patch per intervention. Replace its CA update and replay fusion; a closed reference uses its pure visual token. Closed normal observations remain unchanged. RGB, other context tokens and x_t/t are fixed.",
             "fusion_replay": "Exact tokenwise residual, FFN, output LayerNorm and context LayerNorm; full and reference replay checked against ordinary encoder outputs. Unchanged tokens are reused. Full DiT condition encoder and all decoder layers rerun for each intervention/timestep.",
             "trajectory": "All original DDIM timesteps from one normal policy rollout; each comparison uses the same normal x_t and t. Interventions do not advance a separate sampler trajectory.",
             "aggregation": "Arithmetic mean of per-timestep L2 norms; NOT L2 of timestep-averaged epsilon differences",
