@@ -57,7 +57,7 @@ def test_render_net_starts_as_identity_and_handles_different_image_sizes(backbon
     model = RenderNet(wrench_dim=6, base_channels=4, conditioning_dim=8, backbone=backbone,
                       conv_block=conv_block,
                       wrench_history_steps=7,
-                      transformer={"embed_dim": 16, "depth": 2, "patch_size": 8, "num_heads": 4},
+                      embed_dim=16, image_self_attn_layers=2, cross_attn_layers=2, patch_size=8, num_heads=4,
                       high_attention_render={"enabled": region_enabled})
     images = {"side": torch.rand(2, 2, 3, 17, 25), "wrist": torch.rand(2, 2, 3, 20, 28)}
     rendered = model(images, torch.randn(2, 2, 7, 6))
@@ -73,7 +73,7 @@ def test_teacher_lstm_initialization_preserves_all_temporal_outputs_without_shar
     ).eval().requires_grad_(False)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=16, wrench_history_steps=7, wrench_layers=2,
-        image_keys=["wrist"], transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        image_keys=["wrist"], embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
     ).eval()
     renderer.initialize_wrench_encoder(teacher)
     wrench = torch.randn(2, 2, 7, 6)
@@ -97,7 +97,7 @@ def test_patch_queries_read_full_wrench_sequence_and_backpropagate_to_early_time
     torch.manual_seed(12)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7, backbone=backbone,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
     )
     with torch.no_grad():
         renderer.output.weight.normal_(std=0.03)
@@ -125,7 +125,7 @@ def test_camera_identity_changes_rendering_without_depending_on_dictionary_order
     torch.manual_seed(13)
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
     ).eval()
     with torch.no_grad():
         renderer.output.weight.normal_(std=0.03)
@@ -179,7 +179,7 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
         renderer = RenderNet(wrench_dim=6, base_channels=4, conditioning_dim=16, backbone=backbone,
                              conv_block=conv_block,
                              wrench_history_steps=7,
-                             transformer={"embed_dim": 16, "depth": 2, "patch_size": 8, "num_heads": 4},
+                             embed_dim=16, image_self_attn_layers=2, cross_attn_layers=2, patch_size=8, num_heads=4,
                              high_attention_render={"enabled": region_enabled}).train()
         renderer.initialize_wrench_encoder(teacher.obs_encoder)
         optimizer = torch.optim.AdamW(renderer.parameters(), lr=1e-3)
@@ -219,7 +219,7 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     teacher.eval().requires_grad_(False)
     eager = RenderNet(
         6, base_channels=4, conditioning_dim=16, wrench_history_steps=7, conv_block="bottleneck",
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
         high_attention_render={"enabled": True},
     )
     with torch.no_grad():
@@ -259,7 +259,7 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
 @pytest.mark.parametrize("backbone", ["unet", "transformer"])
 def test_region_gate_scales_residual_and_can_be_disabled(backbone):
     model = RenderNet(6, base_channels=4, conditioning_dim=8, backbone=backbone,
-                      transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+                      embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
                       high_attention_render={"enabled": True}).eval()
     with torch.no_grad():
         model.output.bias.fill_(0.5)
@@ -377,7 +377,7 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
     workspace.teacher_policy = teacher
     workspace.device = torch.device("cpu")
     workspace.model = RenderNet(6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
-                               transformer={"embed_dim": 16, "depth": 1, "num_heads": 4},
+                               embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, num_heads=4,
                                high_attention_render=config)
     workspace.model.train(mode != "eval")
     workspace.attention_config = config

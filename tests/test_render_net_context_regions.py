@@ -147,7 +147,7 @@ def test_binary_student_gate_has_no_outside_rendering_and_keeps_region_gradients
     model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         rendering_mode=rendering_mode,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "selection": "binary_top_percentile", "percentile": 90},
     )
     with torch.no_grad():
@@ -176,7 +176,7 @@ def test_patch_residual_outputs_pixel_blocks_and_zero_strength_is_identity():
     model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         rendering_mode="patch_residual", patch_residual_refine=True,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "activation": "relu"},
     ).eval()
     image = torch.full((1, 2, 3, 32, 40), .3)
@@ -206,7 +206,7 @@ def test_context_region_supervision_integrates_with_cached_and_online_training(c
     workspace.cfg = OmegaConf.create({})
     workspace.model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         rendering_mode="gaussian_glow", high_attention_render=config,
     ).train()
     workspace.attention_config = config
@@ -238,7 +238,7 @@ def test_context_region_image_minmax_supervision_integrates_with_cached_and_onli
     workspace.cfg = OmegaConf.create({})
     workspace.model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         rendering_mode="gaussian_glow", high_attention_render=config,
     ).train()
     workspace.attention_config = config

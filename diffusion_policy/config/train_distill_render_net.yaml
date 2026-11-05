@@ -1,6 +1,6 @@
 name: train_distill_render_net
 _target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
-teacher_checkpoint: data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt
+teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
 
 # Stage 2 follows completed FDP training: freeze the teacher and train only RenderNet.
 distillation:
@@ -23,18 +23,25 @@ teacher_cache:
   only: false # To retain a precomputed cache, also set cleanup_on_exit=false.
 
 render_net:
-  architecture_version: 2
-  backbone: transformer # CNN + image/wrench attention; unet omits image self-attention.
-  rendering_mode: residual # Full-resolution skip decoder predicts pixel RGB residuals and intensity.
+  backbone:
+    image_encoder: cnn
+    wrench_encoder: lstm
+    image_self_attn_layers: 4
+    cross_attn_layers: 4
+    decoder_layers: 4
+    patch_size: 16
+    embed_dim: 128
+    num_heads: 4
+    mlp_ratio: 4.0
+    dropout: 0.0
+    base_channels: 16
+    conv_block: bottleneck
+  rendering_mode: residual
   patch_residual_refine: true # Used only by the optional patch_residual ablation.
-  base_channels: 16
-  conv_block: bottleneck # Narrow spatial convolutions in the image encoder.
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # Resolved from teacher when initialization is enabled.
   wrench_history_steps: 8 # Resolved from the teacher, as are observation steps and camera keys.
   max_obs_steps: 2
-  wrench_layers: 1
-  wrench_dropout: 0.0
   image_keys: [side, wrist]
   residual_scale: 1.0 # Maximum absolute per-channel RGB change before strength modulation and clipping.
   # Retained for gaussian_glow ablations; residual modes do not use these values.
@@ -44,13 +51,6 @@ render_net:
     sigma_max: 0.20
     max_intensity: 1.0
     initial_intensity: 0.05 # Weak positive light keeps geometry gradients available at initialization.
-  transformer:
-    patch_size: 16 # CNN downsampling factor; power of two, >= 2.
-    embed_dim: 128
-    depth: 4
-    num_heads: 4
-    mlp_ratio: 4.0
-    dropout: 0.0
   high_attention_render:
     enabled: true
     source: context # context is the continuous wrench-effect strength field.
@@ -66,7 +66,11 @@ render_net:
     # Used by noise_attention; legacy context uses this only when normalization and strength_scale are null.
     percentiles: [80.0, 99.0]
     # The selected teacher source supervises a student intensity head; rendering needs no teacher.
-    mask_loss_weight: 1.0
+    intensity_loss_weight: 1.0
+    context_patch_loss_weight: 1.0
+    pixel_loss_weight: 0.0
+    smoothness_loss_weight: 0.02
+    detach_for_rgb: true
     teacher_seed: 42
 
 # Inherit the teacher's dataset class/windows; hold out student validation episodes independently.
@@ -133,6 +137,7 @@ training:
     find_unused_parameters: false
     timeout_seconds: 86400 # Rank 0 may need hours to prepare teacher targets before training.
   num_epochs: 1000
+  intensity_warmup_epochs: 2
   # Optional step cap for smoke tests; normal training is limited by epochs.
   max_steps: null
   max_grad_norm: 1.0

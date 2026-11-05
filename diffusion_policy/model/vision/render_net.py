@@ -81,16 +81,34 @@ class BottleneckDecoderBlock(nn.Module):
         return F.silu(self.body(torch.cat([features, skip], dim=1)) + skip)
 
 
+class ImageSelfAttentionBlock(nn.Module):
+    """One image-token self-attention block."""
+
+    def __init__(self, embed_dim, num_heads, mlp_ratio, dropout):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim)
+        self.attention = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim), nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tokens):
+        query = self.norm(tokens)
+        update, _ = self.attention(query, query, query, need_weights=False)
+        tokens = tokens + self.dropout(update)
+        return tokens + self.ffn(self.output_norm(tokens))
+
+
 class WrenchCrossAttentionBlock(nn.Module):
     """Image queries read every LSTM timestep; residuals retain image features."""
 
-    def __init__(self, embed_dim, conditioning_dim, num_heads, mlp_ratio, dropout,
-                 self_attention=True):
+    def __init__(self, embed_dim, conditioning_dim, num_heads, mlp_ratio, dropout):
         super().__init__()
-        self.self_attention = (nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True,
-        ) if self_attention else None)
-        self.self_norm = nn.LayerNorm(embed_dim) if self_attention else None
         self.image_norm = nn.LayerNorm(embed_dim)
         self.wrench_norm = nn.LayerNorm(conditioning_dim)
         self.cross_attention = nn.MultiheadAttention(
@@ -105,10 +123,6 @@ class WrenchCrossAttentionBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, tokens, wrench_tokens):
-        if self.self_attention is not None:
-            query = self.self_norm(tokens)
-            update, _ = self.self_attention(query, query, query, need_weights=False)
-            tokens = tokens + self.dropout(update)
         update, _ = self.cross_attention(
             query=self.image_norm(tokens), key=self.wrench_norm(wrench_tokens),
             value=wrench_tokens, need_weights=False,
@@ -118,11 +132,12 @@ class WrenchCrossAttentionBlock(nn.Module):
 
 
 class ConvAttentionBackbone(nn.Module):
-    """Convolutional image pyramid, low-resolution attention, and skip decoder."""
+    """CNN image encoder with configurable image/fusion/decoder depth."""
 
     def __init__(self, base_channels, conditioning_dim, *, self_attention,
                  patch_size=16, embed_dim=128, depth=4, num_heads=4,
-                 mlp_ratio=4.0, dropout=0.0, conv_block="standard", decode=True):
+                 mlp_ratio=4.0, dropout=0.0, conv_block="standard", decode=True,
+                 image_self_attn_layers=None, cross_attn_layers=None, decoder_layers=None):
         super().__init__()
         if (patch_size < 2 or patch_size & (patch_size - 1) or depth < 1
                 or num_heads < 1 or embed_dim < 4 or embed_dim % 4
@@ -139,25 +154,41 @@ class ConvAttentionBackbone(nn.Module):
         levels = int(math.log2(patch_size))
         channels = [min(base_channels * 2 ** level, embed_dim) for level in range(levels)]
         channels.append(embed_dim)
-        self.feature_dim = channels[0] if self.decode else embed_dim
+        image_self_attn_layers = (depth if image_self_attn_layers is None
+                                  else int(image_self_attn_layers))
+        cross_attn_layers = (depth if cross_attn_layers is None
+                             else int(cross_attn_layers))
+        decoder_layers = (levels if decoder_layers is None else int(decoder_layers))
+        if min(image_self_attn_layers, cross_attn_layers, decoder_layers) < 0:
+            raise ValueError("attention and decoder layer counts must be non-negative")
+        if decoder_layers > levels:
+            raise ValueError("decoder_layers cannot exceed log2(patch_size) for the CNN encoder")
+        self.decoder_layers = decoder_layers
+        self.feature_dim = (channels[levels - decoder_layers]
+                            if self.decode and decoder_layers else embed_dim)
         self.stem = ResidualBlock(3, channels[0])
         self.encoders = nn.ModuleList([
             block_type(previous, current) for previous, current in zip(channels, channels[1:])
         ])
-        self.blocks = nn.ModuleList([
+        if not self_attention:
+            image_self_attn_layers = 0
+        self.image_self_attention = nn.ModuleList([
+            ImageSelfAttentionBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(image_self_attn_layers)
+        ])
+        self.cross_attention = nn.ModuleList([
             WrenchCrossAttentionBlock(embed_dim, conditioning_dim, num_heads, mlp_ratio,
-                                      dropout, self_attention=self_attention)
-            for _ in range(depth)
+                                      dropout)
+            for _ in range(cross_attn_layers)
         ])
         self.norm = nn.LayerNorm(embed_dim)
         self.decoders = nn.ModuleList([
             (ResidualBlock(channels[level + 1] + channels[level], channels[level])
              if conv_block == "standard" else
              BottleneckDecoderBlock(channels[level + 1], channels[level]))
-            for level in reversed(range(levels)) if self.decode
+            for level in reversed(range(levels - decoder_layers, levels)) if self.decode
         ])
-        if self.decode:
-            self.output = nn.Conv2d(channels[0], 3, 3, padding=1)
+        self.output = nn.Conv2d(self.feature_dim, 3, 3, padding=1)
 
     def _position(self, height, width, reference):
         y, x = torch.meshgrid(torch.arange(height, device=reference.device),
@@ -180,14 +211,16 @@ class ConvAttentionBackbone(nn.Module):
         gh, gw = features.shape[-2:]
         tokens = features.flatten(2).transpose(1, 2)
         tokens = tokens + self._position(gh, gw, tokens) + camera_embedding.to(tokens)
-        for block in self.blocks:
+        for block in self.image_self_attention:
+            tokens = block(tokens)
+        for block in self.cross_attention:
             tokens = block(tokens, wrench_tokens)
         features = self.norm(tokens).transpose(1, 2).reshape(image.shape[0], self.embed_dim, gh, gw)
         return features, skips, height, width
 
     def forward(self, image, wrench_tokens, camera_embedding):
         features, skips, height, width = self.encode(image, wrench_tokens, camera_embedding)
-        for decoder, skip in zip(self.decoders, reversed(skips)):
+        for decoder, skip in zip(self.decoders, reversed(skips[-self.decoder_layers:])):
             if self.conv_block == "bottleneck":
                 features = decoder(features, skip)
             else:
@@ -195,6 +228,8 @@ class ConvAttentionBackbone(nn.Module):
                     F.interpolate(features, size=skip.shape[-2:], mode="bilinear", align_corners=False),
                     skip,
                 ], dim=1))
+        if features.shape[-2:] != (height, width):
+            features = F.interpolate(features, size=(height, width), mode="bilinear", align_corners=False)
         features = features[:, :, :height, :width]
         return self.output(features), features
 
@@ -313,23 +348,25 @@ class GaussianGlowBackbone(ConvAttentionBackbone):
 
 
 class RenderNet(nn.Module):
-    architecture_version = 2
+    """Wrench-conditioned renderer with one structured backbone configuration."""
 
     def __init__(self, wrench_dim, base_channels=16, conditioning_dim=256, residual_scale=0.1,
-                 backbone="transformer", transformer=None, high_attention_render=None,
-                 architecture_version=2, wrench_history_steps=8, max_obs_steps=2,
-                 wrench_layers=1, wrench_dropout=0.0, image_keys=("side", "wrist"),
+                 image_encoder="cnn", wrench_encoder="lstm", image_self_attn_layers=4,
+                 cross_attn_layers=4, decoder_layers=4, patch_size=16, embed_dim=128,
+                 num_heads=4, mlp_ratio=4.0, dropout=0.0, high_attention_render=None,
+                 wrench_history_steps=8, max_obs_steps=2, wrench_layers=1,
+                 wrench_dropout=0.0, image_keys=("side", "wrist"),
                  initialize_wrench_from_teacher=True, conv_block="standard",
                  rendering_mode="residual", glow=None, patch_residual_refine=True):
         super().__init__()
-        if architecture_version != 2:
-            raise ValueError("Use build_render_net to load a version 1 checkpoint")
         if not math.isfinite(residual_scale) or residual_scale <= 0:
             raise ValueError("residual_scale must be positive and finite")
         if min(conditioning_dim, wrench_dim, wrench_history_steps, max_obs_steps, wrench_layers) < 1:
             raise ValueError("Wrench dimensions, sequence lengths and LSTM layers must be positive")
-        if backbone not in {"unet", "transformer"}:
-            raise ValueError("backbone must be 'unet' or 'transformer'")
+        if image_encoder != "cnn":
+            raise ValueError("The active RenderNet image_encoder is 'cnn'")
+        if wrench_encoder != "lstm":
+            raise ValueError("The active RenderNet wrench_encoder is 'lstm'")
         if rendering_mode not in {"residual", "patch_residual", "gaussian_glow"}:
             raise ValueError("rendering_mode must be residual, patch_residual or gaussian_glow")
         self.rendering_mode = rendering_mode
@@ -337,7 +374,8 @@ class RenderNet(nn.Module):
         if not self.image_keys or len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must be nonempty and unique")
         self.residual_scale = float(residual_scale)
-        self.backbone_name = str(backbone)
+        self.image_encoder_name = str(image_encoder)
+        self.wrench_encoder_name = str(wrench_encoder)
         self.conv_block = conv_block
         self.initialize_wrench_from_teacher = bool(initialize_wrench_from_teacher)
         self.wrench_history_steps = int(wrench_history_steps)
@@ -350,12 +388,20 @@ class RenderNet(nn.Module):
             conditioning_dim, conditioning_dim, num_layers=wrench_layers, batch_first=True,
             dropout=wrench_dropout if wrench_layers > 1 else 0.0,
         )
-        backbone_options = dict(transformer or {})
-        backbone_options.update(
+        backbone_options = dict(
             base_channels=base_channels,
             conditioning_dim=conditioning_dim,
-            self_attention=backbone == "transformer",
+            self_attention=True,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            depth=max(1, int(image_self_attn_layers), int(cross_attn_layers)),
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
             conv_block=conv_block,
+            image_self_attn_layers=int(image_self_attn_layers),
+            cross_attn_layers=int(cross_attn_layers),
+            decoder_layers=int(decoder_layers),
         )
         if rendering_mode == "gaussian_glow":
             self.backbone = GaussianGlowBackbone(glow=glow, **backbone_options)
@@ -377,6 +423,7 @@ class RenderNet(nn.Module):
         self.region_selection = region_config.get("selection", "soft")
         self.region_activation = str(region_config.get("activation", "sigmoid"))
         self.region_threshold = float(region_config.get("threshold", 0.0))
+        self.detach_intensity_for_rgb = bool(region_config.get("detach_for_rgb", True))
         if not math.isfinite(self.region_threshold) or not 0 <= self.region_threshold <= 1:
             raise ValueError("high_attention_render.threshold must be finite and between 0 and 1")
         self.region_percentile = float(region_config.get("percentile", 90.0))
@@ -395,12 +442,9 @@ class RenderNet(nn.Module):
                 initial_strength = float(region_config.get("initial_strength", 0.1))
                 if not math.isfinite(initial_strength) or not 0 < initial_strength < 1:
                     raise ValueError("Sigmoid region initial_strength must be finite and between 0 and 1")
-                # Region supervision trains this head even if the rendering
-                # threshold initially closes the weak positive strength field.
                 nn.init.zeros_(self.mask_head.weight)
                 nn.init.constant_(self.mask_head.bias, math.log(initial_strength / (1 - initial_strength)))
             else:
-                # Preserve the initialization used by explicit ReLU ablations.
                 nn.init.constant_(self.mask_head.bias, 0.1)
         self._compiled_backbone_forward = None
 
@@ -416,8 +460,8 @@ class RenderNet(nn.Module):
     @torch.no_grad()
     def initialize_wrench_encoder(self, teacher_encoder):
         """Copy the complete teacher force path without keeping a teacher reference."""
-        if not isinstance(teacher_encoder.force_encoder, nn.LSTM):
-            raise ValueError("Teacher wrench initialization requires an LSTM teacher")
+        if self.wrench_encoder_name != "lstm" or not isinstance(teacher_encoder.force_encoder, nn.LSTM):
+            raise ValueError("RenderNet and teacher wrench encoders must both be LSTM")
         self.wrench_projection.load_state_dict(teacher_encoder.wrench_projection.state_dict())
         self.wrench_encoder.load_state_dict(teacher_encoder.force_encoder.state_dict())
         for name in ("wrench_position", "obs_position", "force_modality"):
@@ -489,7 +533,8 @@ class RenderNet(nn.Module):
                     # Threshold after interpolation so closed pixels stay exactly unchanged.
                     # Region MSE uses the unthresholded mask, including closed regions.
                     gate = torch.where(mask > self.region_threshold, mask, torch.zeros_like(mask))
-                residual = residual * gate.reshape(batch, steps, 1, *image.shape[-2:])
+                render_gate = gate.detach() if self.detach_intensity_for_rgb else gate
+                residual = residual * render_gate.reshape(batch, steps, 1, *image.shape[-2:])
             if self.rendering_mode == "gaussian_glow":
                 # Positive optical exposure gives smooth bounded brightening without clamp saturation.
                 strength = -torch.expm1(-self.residual_scale * residual)
@@ -500,12 +545,4 @@ class RenderNet(nn.Module):
 
 
 def build_render_net(wrench_dim, config):
-    """Old saved configs have no version; preserve their GRU/FiLM state layout."""
-    options = dict(config)
-    version = int(options.get("architecture_version", 1))
-    if version == 1:
-        from diffusion_policy.model.vision.legacy_render_net import LegacyRenderNet
-
-        options.pop("architecture_version", None)
-        return LegacyRenderNet(wrench_dim=wrench_dim, **options)
-    return RenderNet(wrench_dim=wrench_dim, **options)
+    return RenderNet(wrench_dim=wrench_dim, **dict(config))

@@ -131,7 +131,7 @@ def _exercise_real_renderer(rank):
             wrench_history_steps=3, max_obs_steps=2,
             image_keys=("side", "wrist"), conv_block="bottleneck",
             rendering_mode=rendering_mode, glow={"num_blobs": 3},
-            transformer={"patch_size": 2, "embed_dim": 8, "depth": 1, "num_heads": 2},
+            patch_size=2, embed_dim=8, image_self_attn_layers=1, cross_attn_layers=1, num_heads=2,
             high_attention_render={"enabled": compile_backbone or rendering_mode == "gaussian_glow"},
         )
         encoder = nn.Conv2d(3, 4, 1).eval().requires_grad_(False)

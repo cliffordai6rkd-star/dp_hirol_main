@@ -11,7 +11,7 @@ from diffusion_policy.model.vision.render_net import GaussianGlowBackbone, Rende
 def make_renderer(**kwargs):
     return RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True}, rendering_mode="gaussian_glow",
         glow={"num_blobs": 3, "sigma_min": 0.04, "sigma_max": 0.2}, **kwargs,
     )

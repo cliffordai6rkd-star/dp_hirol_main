@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 name: train_distill_render_net_patch_context
-teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00200000.ckpt
+teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
 
 distillation:
   objective: denoiser_mse
@@ -12,7 +12,6 @@ distillation:
   demo_loss_weight: 0.0
 
 render_net:
-  backbone: transformer
   rendering_mode: residual
   residual_scale: 1.0 # Selected: RGB-channel change is bounded by predicted strength.
   high_attention_render:
@@ -21,11 +20,10 @@ render_net:
     selection: soft
     activation: sigmoid
     initial_strength: 0.1
-    threshold: 0.1 # Apply to pixel intensity; retain the original strength above this value.
+    threshold: 0.0
     baseline: raw_zero
     normalization: image_minmax
     strength_scale: null
-    mask_loss_weight: 1.0
 
 teacher_cache:
   precision: float32

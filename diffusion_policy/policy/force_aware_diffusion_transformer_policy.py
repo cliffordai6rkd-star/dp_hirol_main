@@ -90,7 +90,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
-        local_highres: Optional[dict] = None,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -212,7 +211,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 cross_attn_layers=cross_attn_layers,
                 cross_attn_query=cross_attn_query,
                 cross_attn_query_residual=cross_attn_query_residual,
-                local_highres=local_highres,
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))

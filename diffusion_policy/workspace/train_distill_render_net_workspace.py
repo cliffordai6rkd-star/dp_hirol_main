@@ -36,12 +36,13 @@ from diffusion_policy.dataset.image_result_cache import use_shared_ram_result_ca
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.vision.render_net import RenderNet, build_render_net
 from diffusion_policy.model.vision.render_net_attention import (
-    attention_regions, context_effect_regions, teacher_attention_targets,
-    teacher_context_effect_targets, validate_percentiles,
+    attention_regions, context_effect_patch_weights, context_effect_regions,
+    percentile_region, teacher_attention_targets, teacher_context_effect_targets,
+    validate_percentiles,
 )
 from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
-    instantiate_policy, load_checkpoint_payload,
+    instantiate_policy, load_checkpoint_payload, patch_grid,
 )
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
@@ -136,23 +137,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.cfg.wrench_preprocessing = self.wrench_preprocessor.get_config()
         wrench_dim = int(self.teacher_policy.obs_encoder.wrench_projection.in_features)
         render_config = OmegaConf.to_container(cfg.render_net, resolve=True)
-        if int(render_config.get("architecture_version", 1)) == 2:
-            encoder = self.teacher_policy.obs_encoder
+        backbone_config = dict(render_config.pop("backbone", {}))
+        encoder = self.teacher_policy.obs_encoder
+        render_config.update(
+            image_keys=list(encoder.image_keys),
+            wrench_history_steps=int(encoder.wrench_history_steps),
+            max_obs_steps=int(encoder.max_obs_steps),
+        )
+        if render_config.get("initialize_wrench_from_teacher", True):
+            if not isinstance(encoder.force_encoder, torch.nn.LSTM):
+                raise ValueError("RenderNet teacher wrench initialization requires an LSTM teacher")
             render_config.update(
-                image_keys=list(encoder.image_keys),
-                wrench_history_steps=int(encoder.wrench_history_steps),
-                max_obs_steps=int(encoder.max_obs_steps),
+                conditioning_dim=int(encoder.n_emb),
+                wrench_layers=int(encoder.force_encoder.num_layers),
+                wrench_dropout=float(encoder.force_encoder.dropout),
             )
-            if render_config.get("initialize_wrench_from_teacher", True):
-                if not isinstance(encoder.force_encoder, torch.nn.LSTM):
-                    raise ValueError("RenderNet teacher wrench initialization requires an LSTM teacher")
-                render_config.update(
-                    conditioning_dim=int(encoder.n_emb),
-                    wrench_layers=int(encoder.force_encoder.num_layers),
-                    wrench_dropout=float(encoder.force_encoder.dropout),
-                )
-            with open_dict(self.cfg):
-                self.cfg.render_net = OmegaConf.create(render_config)
+        render_config.update(backbone_config)
+        with open_dict(self.cfg):
+            self.cfg.render_net = OmegaConf.create(render_config)
         self.model = build_render_net(wrench_dim, render_config).to(self.device)
         if isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher:
             self.model.initialize_wrench_encoder(self.teacher_policy.obs_encoder)
@@ -162,7 +164,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.ema = EMAModel(self.ema_model, **dict(cfg.get("ema", {})))
         self.attention_config = cfg.render_net.get("high_attention_render", {})
         self.attention_enabled = bool(self.attention_config.get("enabled", False))
-        self.mask_loss_weight = float(self.attention_config.get("mask_loss_weight", 1.0))
+        self.intensity_loss_weight = float(
+            self.attention_config.get("intensity_loss_weight", 1.0)
+        )
+        self.context_patch_loss_weight = float(
+            self.attention_config.get("context_patch_loss_weight", 1.0)
+        )
+        self.smoothness_loss_weight = float(
+            self.attention_config.get("smoothness_loss_weight", 0.02)
+        )
         self.region_source = normalize_region_source(
             self.attention_config.get("source", "noise_attention")
         )
@@ -191,8 +201,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     )
             elif self.region_source == "noise_attention":
                 validate_percentiles(self.attention_config["percentiles"])
-            if not math.isfinite(self.mask_loss_weight) or self.mask_loss_weight <= 0:
-                raise ValueError("high_attention_render.mask_loss_weight must be positive and finite")
+            for name, value in (("intensity_loss_weight", self.intensity_loss_weight),
+                                ("context_patch_loss_weight", self.context_patch_loss_weight),
+                                ("smoothness_loss_weight", self.smoothness_loss_weight)):
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"high_attention_render.{name} must be finite and nonnegative")
         self.loss_metrics = {}
         self._student_image_encoder = None
         self._training_model = None
@@ -259,14 +272,17 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             log.info("Resuming RenderNet from %s: epoch=%d step=%d best_val_mse=%.8f",
                      resume_path, self.epoch, self.global_step, self.best_val_loss)
         self.num_epochs = int(cfg.training.num_epochs)
+        self.intensity_warmup_epochs = int(cfg.training.get("intensity_warmup_epochs", 2))
         self.max_steps = cfg.training.max_steps
         self.max_val_batches = cfg.training.max_val_batches
         self.early_stopping_enabled = bool(cfg.training.early_stopping.enabled)
         self.patience = int(cfg.training.early_stopping.patience)
         self.min_delta = float(cfg.training.early_stopping.min_delta)
-        if self.num_epochs < 1 or any(value is not None and int(value) < 1
-                                      for value in (self.max_steps, self.max_val_batches)):
-            raise ValueError("num_epochs must be positive; max_steps/max_val_batches must be positive or null")
+        if self.num_epochs < 1 or self.intensity_warmup_epochs < 0 or any(
+                value is not None and int(value) < 1
+                for value in (self.max_steps, self.max_val_batches)):
+            raise ValueError("num_epochs must be positive; intensity_warmup_epochs nonnegative; "
+                             "max_steps/max_val_batches must be positive or null")
         if self.patience < 1 or not math.isfinite(self.min_delta) or self.min_delta < 0:
             raise ValueError("early_stopping.patience must be positive; min_delta must be finite and nonnegative")
         log.info(f"Teacher: {checkpoint} ({self.teacher_state_key}), cross_attn_query=image")
@@ -278,11 +294,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      "reduce after %d non-improving epochs, threshold=%g, min_lr=%g",
                      self.metric_name, self.lr_scheduler.factor, self.lr_scheduler.patience + 1,
                      self.lr_scheduler.threshold, self.lr_scheduler.min_lrs[0])
-        log.info(f"Backbone={self.model.backbone_name}; high-attention rendering={self.attention_enabled}")
+        log.info(f"Image encoder={self.model.image_encoder_name}; wrench encoder={self.model.wrench_encoder_name}; "
+                 f"high-attention rendering={self.attention_enabled}")
         if isinstance(self.model, RenderNet):
-            log.info("RenderNet v2: full LSTM sequence [B*To,%d,%d], image-query cross-attention, "
-                     "conv_block=%s, rendering_mode=%s, cameras=%s; teacher wrench initialization=%s",
+            log.info("RenderNet: full LSTM sequence [B*To,%d,%d], image self-attn=%d, cross-attn=%d, "
+                     "decoder=%d, conv_block=%s, rendering_mode=%s, cameras=%s; "
+                     "teacher wrench initialization=%s",
                      self.model.wrench_history_steps, self.model.wrench_encoder.hidden_size,
+                     len(self.model.backbone.image_self_attention),
+                     len(self.model.backbone.cross_attention),
+                     self.model.backbone.decoder_layers,
                      self.model.conv_block, getattr(self.model, "rendering_mode", "residual"),
                      self.model.image_keys, self.model.initialize_wrench_from_teacher)
         if self.attention_enabled:
@@ -313,6 +334,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         log.info(f"Device={self.device}; AMP={self.amp_enabled} {self.amp_dtype}; "
               f"GPU={torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else 'CPU'}")
         log.info(f"Max epochs={self.num_epochs}; max steps={self.max_steps}; "
+                 f"intensity warmup={self.intensity_warmup_epochs} epochs; "
               f"validation={'all batches' if self.max_val_batches is None else self.max_val_batches}; "
               f"early stopping={self.early_stopping_enabled}, patience={self.patience} epochs, "
               f"min_delta={self.min_delta}")
@@ -457,7 +479,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                    "fullgraph": True, "dynamic": False}
         if config.get("render_backbone", True):
             if not isinstance(self.model, RenderNet):
-                raise ValueError("Compiling the RenderNet backbone requires architecture_version=2")
+                raise ValueError("Compiling requires the active RenderNet backbone")
             self.model.compile_backbone(**options)
         if config.get("student_dino", True):
             self._student_image_encoder = torch.compile(
@@ -523,18 +545,65 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             progress_callback=self._attention_progress, return_patch_attention=return_patch_attention,
         )
 
+    def _region_patch_targets(self, patches):
+        if self.region_source == "context":
+            return context_effect_patch_weights(
+                patches,
+                percentile=self.attention_config.get("percentile", 90.0),
+                percentiles=self.attention_config.get("percentiles", [80.0, 99.0]),
+                selection=self.attention_config.get("selection", "soft"),
+                strength_scale=self.attention_config.get("strength_scale"),
+                normalization=self.attention_config.get("normalization"),
+            )
+        return {
+            key: percentile_region(value, self.attention_config["percentiles"])
+            for key, value in patches.items()
+        }
+
+    def _patch_pool(self, masks):
+        pooled = {}
+        backbone = self.teacher_policy.obs_encoder.backbone
+        for key, mask in masks.items():
+            batch, steps, _, height, width = mask.shape
+            grid = patch_grid(
+                self.teacher_policy.obs_encoder.patch_counts[key], height, width, backbone,
+            )
+            pooled[key] = F.adaptive_avg_pool2d(
+                mask.reshape(batch * steps, 1, height, width), grid,
+            ).reshape(batch, steps, -1)
+        return pooled
+
+    @staticmethod
+    def _intensity_smoothness(masks):
+        values = []
+        for mask in masks.values():
+            values.append(mask[..., 1:, :].sub(mask[..., :-1, :]).abs().mean())
+            values.append(mask[..., :, 1:].sub(mask[..., :, :-1]).abs().mean())
+        return torch.stack(values).mean() if values else torch.zeros(())
+
+    def _joint_training_active(self):
+        return (not self.model.training) or self.epoch >= self.intensity_warmup_epochs
+
     def _loss(self, obs, cached_targets=None, *, action=None):
         # The student always uses its own region prediction. Spatial targets
         # are training-only; model selection excludes all auxiliary losses.
         supervise_regions = self.attention_enabled and self.model.training and torch.is_grad_enabled()
         with self._autocast():
             with torch.no_grad():
+                target_patches = None
                 if cached_targets is not None:
                     teacher_tokens = cached_targets["tokens"].to(self.device, non_blocking=True)
                     if supervise_regions:
-                        target_masks = self._region_masks(cached_targets["patch_attention"], obs)
+                        target_patches = {
+                            key: value.to(self.device, non_blocking=True)
+                            for key, value in cached_targets["patch_attention"].items()
+                        }
+                        target_masks = self._region_masks(target_patches, obs)
                 elif supervise_regions:
-                    teacher_tokens, target_masks = self._region_targets(obs)
+                    teacher_tokens, target_patches = self._region_targets(
+                        obs, return_patch_attention=True,
+                    )
+                    target_masks = self._region_masks(target_patches, obs)
                 else:
                     teacher_tokens = self.teacher_policy._encode_context(
                         obs, apply_curriculum_mask=False,
@@ -559,23 +628,52 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             mask_mse = (torch.stack([F.mse_loss(masks[key].float(), target_masks[key].float())
                                      for key in masks]).mean() if supervise_regions else
                         token_mse.new_zeros(()))
+            patch_mse = token_mse.new_zeros(())
+            smoothness = (self._intensity_smoothness(masks)
+                          if supervise_regions else token_mse.new_zeros(()))
+            if supervise_regions:
+                predicted_patches = self._patch_pool(masks)
+                target_patch_weights = self._region_patch_targets(target_patches)
+                patch_losses = []
+                for key in predicted_patches:
+                    target = target_patch_weights[key].to(
+                        predicted_patches[key].device, predicted_patches[key].dtype,
+                    )
+                    patch_losses.append(F.smooth_l1_loss(predicted_patches[key], target))
+                patch_mse = torch.stack(patch_losses).mean()
             denoiser_mse = demo_mse = token_mse.new_zeros(())
             if self.objective == "denoiser_mse":
                 denoiser_mse, demo_mse = self._denoiser_losses(
                     action, student_tokens, teacher_tokens.to(student_tokens.dtype),
                 )
-                loss = (denoiser_mse
+                active_denoiser = (denoiser_mse if self._joint_training_active()
+                                   else denoiser_mse.detach() * 0)
+                loss = (active_denoiser
                         + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
                         + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse)
             else:
                 loss = token_mse
             if supervise_regions:
-                loss = loss + self.mask_loss_weight * mask_mse
+                intensity_loss = (
+                    self.context_patch_loss_weight * patch_mse
+                    + self.intensity_loss_weight * mask_mse * float(
+                        self.attention_config.get("pixel_loss_weight", 0.0)
+                    )
+                    + self.smoothness_loss_weight * smoothness
+                )
+                loss = loss + intensity_loss
+            else:
+                intensity_loss = token_mse.new_zeros(())
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
                                  "denoiser_mse": float(denoiser_mse.detach()),
                                  "demo_mse": float(demo_mse.detach()),
-                                 "mask_mse": float(mask_mse.detach()), "loss": float(loss.detach()),
-                                 "mask_supervised": supervise_regions}
+                                 "mask_mse": float(mask_mse.detach()),
+                                 "context_patch_mse": float(patch_mse.detach()),
+                                 "intensity_smoothness": float(smoothness.detach()),
+                                 "intensity_loss": float(intensity_loss.detach()),
+                                 "loss": float(loss.detach()),
+                                 "mask_supervised": supervise_regions,
+                                 "joint_training": self._joint_training_active()}
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
@@ -922,6 +1020,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         summary = {
             "status": status, "global_step": self.global_step,
             "epoch": self.epoch, "max_epochs": self.num_epochs,
+            "intensity_warmup_epochs": self.intensity_warmup_epochs,
             "max_steps": self.max_steps, "stop_reason": self.stop_reason,
             "best_epoch": self.best_epoch, "best_step": self.best_step,
             "early_stopping": {"enabled": self.early_stopping_enabled,
@@ -1109,7 +1208,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     epoch_number = epoch_index + 1
                     epoch_total, epoch_samples = 0.0, 0
                     epoch_loss_total = epoch_mask_total = 0.0
-                    epoch_components = {key: 0.0 for key in ("token_mse", "denoiser_mse", "demo_mse")}
+                    epoch_components = {key: 0.0 for key in (
+                        "token_mse", "denoiser_mse", "demo_mse", "context_patch_mse",
+                        "intensity_smoothness", "intensity_loss",
+                    )}
                     epoch_started = previous_end = last_status = time.monotonic()
                     batches = len(train_loader)
                     if self.max_steps is not None:
@@ -1164,7 +1266,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         logger.log(metrics)
                         progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
                                              mse=f"{epoch_total / epoch_samples:.4f}",
-                                             field=f"{metrics['train_mask_mse']:.4f}", lr=f"{metrics['lr']:.2g}",
+                                             field=f"{metrics['train_intensity_loss']:.4f}", lr=f"{metrics['lr']:.2g}",
                                              refresh=False)
                         now = time.monotonic()
                         if (not self._progress_enabled() and self.is_main_process
@@ -1172,7 +1274,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                             log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f mse=%.5f field=%.5f lr=%.2g",
                                      epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
                                      metrics['train_loss'], epoch_total / epoch_samples,
-                                     metrics['train_mask_mse'], metrics['lr'])
+                                     metrics['train_intensity_loss'], metrics['lr'])
                             last_status = now
                         previous_end = time.monotonic()
                         if self.max_steps is not None and self.global_step >= int(self.max_steps):
@@ -1199,7 +1301,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         log.info("Epoch %d/%d | step=%d loss=%.6f train=%.6f field=%.6f%s elapsed=%.1fs",
                                  self.epoch, self.num_epochs, self.global_step,
                                  epoch_loss_total / epoch_samples, epoch_total / epoch_samples,
-                                 epoch_mask_total / epoch_samples, validation,
+                                 epoch_components["intensity_loss"] / epoch_samples, validation,
                                  time.monotonic() - epoch_started)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"

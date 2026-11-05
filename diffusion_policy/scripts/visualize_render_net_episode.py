@@ -269,7 +269,12 @@ def run(args):
             "wrench_preprocessing": OmegaConf.to_container(cfg.wrench_preprocessing, resolve=True),
             "wrench_preprocessing_observation_keys": list(preprocessor.required_keys),
             "residual_scale": model.residual_scale, "difference_gain": args.difference_gain,
-            "backbone": model.backbone_name, "high_attention_render_enabled": attention_enabled,
+            "image_encoder": model.image_encoder_name,
+            "wrench_encoder": model.wrench_encoder_name,
+            "image_self_attn_layers": len(model.backbone.image_self_attention),
+            "cross_attn_layers": len(model.backbone.cross_attention),
+            "decoder_layers": model.backbone.decoder_layers,
+            "high_attention_render_enabled": attention_enabled,
             "region_source": "student-predicted teacher region" if attention_enabled else "full image",
             "high_attention_render_config": OmegaConf.to_container(cfg.render_net.high_attention_render, resolve=True)
             if "high_attention_render" in cfg.render_net else None,

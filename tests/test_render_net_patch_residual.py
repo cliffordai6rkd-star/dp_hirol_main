@@ -12,7 +12,7 @@ def make_patch_renderer(**kwargs):
     return RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         backbone="transformer", rendering_mode="patch_residual", residual_scale=0.1,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "source": "context",
                                "selection": "soft", "activation": "relu"},
         **kwargs,
@@ -150,7 +150,7 @@ def test_patch_renderer_two_steps_reach_lstm_and_attention_through_frozen_dit():
     workspace.model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
         rendering_mode="patch_residual", backbone="transformer", residual_scale=0.1,
-        transformer={"patch_size": 8, "embed_dim": 16, "depth": 1, "num_heads": 4},
+        patch_size=8, embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, num_heads=4,
         high_attention_render={"enabled": True, "selection": "soft", "activation": "relu"},
     )
     with torch.no_grad():
@@ -189,7 +189,7 @@ def test_sigmoid_region_recovers_from_negative_logits_with_positive_supervision(
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         rendering_mode="patch_residual",
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
                                "threshold": .1},
     ).requires_grad_(False)
@@ -240,7 +240,7 @@ def test_sigmoid_region_and_zero_rgb_head_bootstrap_frozen_denoiser_gradients(in
     workspace.model = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
         rendering_mode="patch_residual", residual_scale=.1,
-        transformer={"patch_size": 8, "embed_dim": 16, "depth": 1, "num_heads": 4},
+        patch_size=8, embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, num_heads=4,
         high_attention_render=region_config,
     )
     workspace.attention_config = region_config
@@ -288,7 +288,7 @@ def test_strength_threshold_is_strict_and_preserves_open_intensity(strength):
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         rendering_mode="patch_residual", residual_scale=.1,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
                                "initial_strength": strength, "threshold": .5},
     )
@@ -319,7 +319,7 @@ def test_strength_threshold_runs_after_upsampling_without_edge_leakage(monkeypat
     renderer = RenderNet(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
         rendering_mode="patch_residual", residual_scale=.1,
-        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8, num_heads=4,
         high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
                                "threshold": .1},
     ).train(training)

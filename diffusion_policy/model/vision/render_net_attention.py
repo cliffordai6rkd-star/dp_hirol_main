@@ -85,13 +85,40 @@ def context_effect_regions(
     if normalization not in (None, "image_minmax"):
         raise ValueError(f"Unknown context normalization: {normalization!r}")
     masks = {}
+    weights_by_camera = context_effect_patch_weights(
+        patch_effect, selection=selection, percentile=percentile,
+        percentiles=percentiles, strength_scale=strength_scale,
+        normalization=normalization,
+    )
+    for key, values in weights_by_camera.items():
+        height, width = images[key].shape[-2:]
+        batch, steps, patches = values.shape
+        gh, gw = patch_grid(patches, height, width, backbone)
+        mode = "bilinear" if selection == "soft" else "nearest"
+        masks[key] = F.interpolate(
+            values.reshape(batch * steps, 1, gh, gw), size=(height, width),
+            mode=mode, align_corners=False if mode == "bilinear" else None,
+        ).reshape(batch, steps, 1, height, width).to(images[key].device)
+    return masks
+
+
+def context_effect_patch_weights(
+    patch_effect,
+    *,
+    percentile=90.0,
+    percentiles=(80.0, 99.0),
+    selection="binary_top_percentile",
+    strength_scale=None,
+    normalization=None,
+):
+    """Map raw patch context effects to continuous or binary patch weights."""
+    if normalization not in (None, "image_minmax"):
+        raise ValueError(f"Unknown context normalization: {normalization!r}")
+    weights_by_camera = {}
     for key, effect in patch_effect.items():
         values = effect.detach().float()
         if not torch.isfinite(values).all() or (values < 0).any():
             raise ValueError("Context effects must be finite and nonnegative")
-        batch, steps, patches = values.shape
-        height, width = images[key].shape[-2:]
-        gh, gw = patch_grid(patches, height, width, backbone)
         if selection == "soft":
             if normalization == "image_minmax":
                 lower = values.amin(dim=-1, keepdim=True)
@@ -108,14 +135,10 @@ def context_effect_regions(
             mode = "bilinear"
         elif selection == "binary_top_percentile":
             weights = top_percentile_mask(values, percentile)
-            mode = "nearest"
         else:
             raise ValueError(f"Unknown context region selection: {selection!r}")
-        masks[key] = F.interpolate(weights.reshape(batch * steps, 1, gh, gw),
-                                   size=(height, width), mode=mode,
-                                   align_corners=False if mode == "bilinear" else None).reshape(
-                                       batch, steps, 1, height, width).to(images[key].device)
-    return masks
+        weights_by_camera[key] = weights
+    return weights_by_camera
 
 
 @torch.no_grad()
