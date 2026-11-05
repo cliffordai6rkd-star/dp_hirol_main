@@ -91,7 +91,7 @@ def make_obs_encoder(
     )
 
 
-def make_normalizer(wrench_keys=("wrench_ext",)):
+def make_normalizer(wrench_keys=("wrench_ext",), action_dim=7):
     normalizer = LinearNormalizer()
     for wrench_key in wrench_keys:
         normalizer[wrench_key] = SingleFieldLinearNormalizer.create_fit(
@@ -99,7 +99,7 @@ def make_normalizer(wrench_keys=("wrench_ext",)):
             last_n_dims=1,
         )
     normalizer["action"] = SingleFieldLinearNormalizer.create_fit(
-        torch.linspace(-2.0, 2.0, 700).reshape(100, 7),
+        torch.linspace(-2.0, 2.0, 100 * action_dim).reshape(100, action_dim),
         last_n_dims=1,
     )
     return normalizer
@@ -112,13 +112,14 @@ def make_policy(
     future_phase=False,
     pre_cross_self_attn_layers=0,
     image_blur_schedule=None,
+    action_dim=7,
 ):
     encoder = make_obs_encoder(
         image_keys=image_keys, pre_cross_self_attn_layers=pre_cross_self_attn_layers
     )
     expert = ContextTransformerForDiffusion(
-        input_dim=7,
-        output_dim=7,
+        input_dim=action_dim,
+        output_dim=action_dim,
         horizon=9,
         n_emb=16,
         n_head=4,
@@ -161,7 +162,7 @@ def make_policy(
     policy = ForceAwareDiffusionTransformerPolicy(
         shape_meta={
             "obs": obs_meta,
-            "action": {"shape": [7]},
+            "action": {"shape": [action_dim]},
         },
         noise_scheduler=scheduler,
         horizon=9,
@@ -185,7 +186,7 @@ def make_policy(
         **policy_kwargs,
     )
     policy.set_normalizer(
-        make_normalizer(("wrench_ext", "future_wrench") if future_phase else ("wrench_ext",))
+        make_normalizer(("wrench_ext", "future_wrench") if future_phase else ("wrench_ext",), action_dim)
     )
     return policy
 
@@ -756,8 +757,9 @@ def test_policy_blur_uses_future_contact_and_preserves_free_rgb():
     assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0
 
 
-def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
-    policy = make_policy()
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_policy_prediction_is_unmasked_and_returns_eight_action_steps(action_dim):
+    policy = make_policy(action_dim=action_dim)
     policy.eval()
     obs = {
         "wrist": torch.rand(2, 2, 3, 16, 16),
@@ -765,8 +767,8 @@ def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
     }
     obs["wrench_ext"][:, -1, -1, 0] = 10.0
     result = policy.predict_action(obs, generator=torch.Generator().manual_seed(1))
-    assert result["action_pred"].shape == (2, 9, 7)
-    assert result["action"].shape == (2, 8, 7)
+    assert result["action_pred"].shape == (2, 9, action_dim)
+    assert result["action"].shape == (2, 8, action_dim)
     assert "action_target" not in result
     assert torch.allclose(
         torch.linalg.vector_norm(result["action"][..., 3:7], dim=-1),
@@ -776,14 +778,18 @@ def test_policy_prediction_is_unmasked_and_returns_eight_action_steps():
     assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0.0
 
 
-def test_pose_quaternion_normalization_has_identity_fallback():
-    action = torch.zeros(1, 2, 7)
+@pytest.mark.parametrize("action_dim", [7, 8])
+def test_pose_quaternion_normalization_has_identity_fallback(action_dim):
+    action = torch.zeros(1, 2, action_dim)
+    if action_dim == 8:
+        action[..., 7] = torch.tensor([-1.0, 1.0])
     action[0, 1, 3:7] = torch.tensor([0.0, 0.0, 0.0, 2.0])
     normalized = normalize_pose_quaternions(action)
     assert torch.allclose(
         normalized[..., 3:7],
         torch.tensor([[[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]]),
     )
+    torch.testing.assert_close(normalized[..., 7:], action[..., 7:])
 
 
 def test_relative_pose_round_trip_and_quaternion_sign_invariance():

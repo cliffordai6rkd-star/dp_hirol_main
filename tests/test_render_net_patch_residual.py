@@ -180,3 +180,172 @@ def test_patch_renderer_two_steps_reach_lstm_and_attention_through_frozen_dit():
         optimizer.step()
     for key, value in teacher.state_dict().items():
         torch.testing.assert_close(value, teacher_before[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+def test_sigmoid_region_recovers_from_negative_logits_with_positive_supervision(autocast):
+    """A missed positive region must still be able to turn rendering back on."""
+    torch.manual_seed(25)
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
+        rendering_mode="patch_residual",
+        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
+                               "threshold": .1},
+    ).requires_grad_(False)
+    with torch.no_grad():
+        renderer.mask_head.bias.fill_(-4.)
+        renderer.output.bias.fill_(.3)
+    renderer.mask_head.bias.requires_grad_(True)
+    optimizer = torch.optim.AdamW([renderer.mask_head.bias], lr=0.5, weight_decay=0.)
+    images = {"wrist": torch.full((1, 2, 3, 17, 25), .5)}
+    wrench = torch.randn(1, 2, 3, 6)
+    strengths, losses, rendered_deltas = [], [], []
+    # oneDNN BF16 backward is unavailable on some CPU instruction sets.
+    with torch.backends.mkldnn.flags(enabled=False):
+        for _ in range(6):
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
+                rendered, masks = renderer(images, wrench, return_aux=True)
+                field = masks["wrist"]
+                loss = (field - .7).square().mean()
+            assert field.dtype == torch.float32
+            strengths.append(float(field.detach().mean()))
+            losses.append(float(loss.detach()))
+            rendered_deltas.append(float((rendered["wrist"] - images["wrist"]).abs().max()))
+            loss.backward()
+            assert torch.isfinite(renderer.mask_head.bias.grad).all()
+            assert renderer.mask_head.bias.grad.item() < 0
+            optimizer.step()
+    assert strengths[-1] > 5 * strengths[0]
+    assert losses[-1] < losses[0]
+    assert rendered_deltas[0] == 0
+    assert rendered_deltas[-1] > 0
+
+
+@pytest.mark.parametrize("initial_strength, threshold", [(None, 0.), (.2, .1)])
+def test_sigmoid_region_and_zero_rgb_head_bootstrap_frozen_denoiser_gradients(initial_strength, threshold):
+    """The weak positive gate must train both heads before the shared backbone."""
+    from test_render_net_denoiser_distillation import make_workspace
+    from test_render_net_distillation import make_attention_teacher
+
+    workspace, _ = make_workspace()
+    teacher, obs, _ = make_attention_teacher()
+    teacher.normalizer.fit({"action": torch.randn(32, 7)})
+    workspace.teacher_policy = teacher.eval().requires_grad_(False)
+    region_config = {"enabled": True, "source": "context", "selection": "soft",
+                     "activation": "sigmoid", "strength_scale": 5., "threshold": threshold}
+    if initial_strength is not None:
+        region_config["initial_strength"] = initial_strength
+    workspace.model = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
+        rendering_mode="patch_residual", residual_scale=.1,
+        transformer={"patch_size": 8, "embed_dim": 16, "depth": 1, "num_heads": 4},
+        high_attention_render=region_config,
+    )
+    workspace.attention_config = region_config
+    workspace.attention_enabled = True
+    workspace.region_source = "context"
+    with torch.no_grad():
+        teacher_tokens = teacher._encode_context(obs, apply_curriculum_mask=False)
+        images, wrench, _, _ = teacher.prepare_context_inputs(obs)
+        rendered, fields = workspace.model(images, wrench, return_aux=True)
+        for key, image in images.items():
+            torch.testing.assert_close(rendered[key], image, rtol=0, atol=0)
+            torch.testing.assert_close(fields[key], torch.full_like(fields[key], initial_strength or .1))
+    teacher_before = {key: value.clone() for key, value in teacher.state_dict().items()}
+    batch = {"obs": obs, "action": torch.randn(2, 4, 7), "teacher_targets": {
+        "tokens": teacher_tokens,
+        "patch_attention": {key: torch.full((2, 2, patches), 5.)
+                            for key, patches in teacher.obs_encoder.patch_counts.items()},
+    }}
+    optimizer = torch.optim.AdamW(workspace.model.parameters(), lr=1e-3)
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        loss = workspace._batch_loss(batch)
+        assert torch.isfinite(loss)
+        loss.backward()
+        renderer = workspace.model
+        assert renderer.output.weight.grad.abs().sum() > 0
+        assert renderer.mask_head.weight.grad.abs().sum() > 0
+        if step:
+            for parameter in (renderer.wrench_encoder.weight_ih_l0,
+                              renderer.backbone.blocks[0].self_attention.out_proj.weight,
+                              renderer.backbone.blocks[0].cross_attention.out_proj.weight,
+                              renderer.camera_embedding.weight):
+                assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+                assert parameter.grad.abs().sum() > 0
+        assert all(not parameter.requires_grad and parameter.grad is None
+                   for parameter in teacher.parameters())
+        optimizer.step()
+    for key, value in teacher.state_dict().items():
+        torch.testing.assert_close(value, teacher_before[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("strength", [.25, .5, .75])
+def test_strength_threshold_is_strict_and_preserves_open_intensity(strength):
+    """An equal/below-threshold field must leave RGB exactly unchanged."""
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
+        rendering_mode="patch_residual", residual_scale=.1,
+        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
+                               "initial_strength": strength, "threshold": .5},
+    )
+    with torch.no_grad():
+        renderer.output.bias.fill_(.3)
+        renderer.backbone.refine.bias.fill_(.2)
+    images = {"wrist": torch.full((1, 2, 3, 17, 25), .5)}
+    wrench = torch.randn(1, 2, 3, 6)
+    rendered, masks = renderer(images, wrench, return_aux=True)
+    torch.testing.assert_close(masks["wrist"], torch.full_like(masks["wrist"], strength))
+    if strength <= .5:
+        torch.testing.assert_close(rendered["wrist"], images["wrist"], rtol=0, atol=0)
+    else:
+        expected_delta = strength * .1 * torch.tensor(.5).tanh()
+        torch.testing.assert_close(rendered["wrist"], images["wrist"] + expected_delta)
+    rendered["wrist"].sum().backward()
+    if strength <= .5:
+        assert renderer.output.bias.grad.count_nonzero() == 0
+        assert renderer.mask_head.bias.grad.count_nonzero() == 0
+    else:
+        assert renderer.output.bias.grad.abs().sum() > 0
+        assert renderer.mask_head.bias.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_strength_threshold_runs_after_upsampling_without_edge_leakage(monkeypatch, training):
+    """Thresholding patch scores before bilinear resize would leak at boundaries."""
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=8, wrench_history_steps=3,
+        rendering_mode="patch_residual", residual_scale=.1,
+        transformer={"embed_dim": 16, "depth": 1, "patch_size": 8, "num_heads": 4},
+        high_attention_render={"enabled": True, "selection": "soft", "activation": "sigmoid",
+                               "threshold": .1},
+    ).train(training)
+    with torch.no_grad():
+        renderer.output.bias.fill_(.3)
+        renderer.backbone.refine.bias.fill_(.2)
+
+    def mask_logits(features):
+        width = features.shape[-1]
+        values = torch.linspace(.02, .18, width, device=features.device)
+        return torch.logit(values).reshape(1, 1, 1, width).expand(
+            features.shape[0], 1, features.shape[-2], width)
+
+    monkeypatch.setattr(renderer.mask_head, "forward", mask_logits)
+    images = {"wrist": torch.full((1, 2, 3, 17, 25), .5)}
+    wrench = torch.randn(1, 2, 3, 6)
+    rendered, masks = renderer(images, wrench, return_aux=True)
+    mask = masks["wrist"].expand_as(images["wrist"])
+    closed, opened = mask <= .1, mask > .1
+    assert closed.any() and opened.any()
+    torch.testing.assert_close(rendered["wrist"][closed], images["wrist"][closed], rtol=0, atol=0)
+    expected = images["wrist"] + mask * .1 * torch.tensor(.5).tanh()
+    torch.testing.assert_close(rendered["wrist"][opened], expected[opened])
+
+
+@pytest.mark.parametrize("threshold", [-.1, 1.1, float("nan")])
+def test_invalid_strength_threshold_is_rejected(threshold):
+    with pytest.raises(ValueError, match="threshold"):
+        RenderNet(6, high_attention_render={"enabled": True, "threshold": threshold})

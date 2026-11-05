@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 
 from diffusion_policy.dataset.hirol_lerobot_v3_dataset import HirolLeRobotV3Dataset
@@ -49,6 +50,36 @@ def _shape_meta():
         },
         "action": {"shape": [7]},
     }
+
+
+@pytest.mark.parametrize("columns", [[6], [], [7], [-1], [6, 6], [True]])
+def test_absolute_pose_plus_gripper_action_uses_only_selected_command_column(monkeypatch, columns):
+    pose = np.arange(28, dtype=np.float32).reshape(4, 7)
+    source = _columns(pose)
+    commands = np.full((4, 7), 123.0, dtype=np.float32)
+    commands[:, 6] = [-1, -1, 1, 1]
+    source["action"] = commands
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", source)
+    monkeypatch.setattr(hirol_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    shapes = _shape_meta()
+    shapes["action"]["shape"] = [8]
+    kwargs = dict(
+        shape_meta=shapes, dataset_path="unused", horizon=2,
+        pad_before=1, pad_after=1, n_obs_steps=2, preload_images=False,
+        action_feature_fields=["action.ee_pose", "action"],
+        action_feature_columns={"action": columns},
+    )
+    if columns != [6] or columns == [True]:
+        with pytest.raises(ValueError, match="action_feature_columns"):
+            HirolLeRobotV3Dataset(**kwargs)
+        return
+    dataset = HirolLeRobotV3Dataset(**kwargs)
+    np.testing.assert_array_equal(dataset.action_data[:, :7], pose)
+    np.testing.assert_array_equal(dataset.action_data[:, 7], commands[:, 6])
+    assert dataset[0]["action"].shape == (2, 8)
+    normalizer = dataset.get_normalizer(mode="gaussian", last_n_dims=1)["action"]
+    values = torch.from_numpy(dataset.action_data)
+    torch.testing.assert_close(normalizer.unnormalize(normalizer.normalize(values)), values)
 
 
 class HirolLeRobotV3DatasetActionLayoutTest(unittest.TestCase):

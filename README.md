@@ -24,7 +24,7 @@ conda env create -p /opt/lcx/conda/envs/dp -f conda_environment.yaml
 ```bash
 conda activate fdp
 
-# 单独训练 DP：默认使用本次 20 Hz、LSTM 2 层、cross-attn 1 层配置。
+# 单独训练 DP：20 Hz、LSTM 2 层、cross-attn 1 层，动作包含夹爪命令。
 python train_pipeline.py dp --gpus 0
 
 # 默认先训练 FDP，再自动把教师检查点交给 RenderNet 蒸馏。
@@ -39,7 +39,9 @@ python train_pipeline.py distill \
 python train_pipeline.py --dry-run
 ```
 
-DP 默认参数为全部 50 条训练、batch 32、100,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。蒸馏使用 `train_distill_render_net.yaml` 的独立训练参数（batch 32、最多 1000 epoch），继承教师的数据与 normalizer，并单独按 episode 留出 10% 作为学生验证集；验证去噪 MSE 连续 30 个 epoch 没有至少 0.0001 的改善时自动停止。每轮保存 `latest.ckpt`，验证最优时保存 `best.ckpt`。设置 `dataset.val_ratio=0` 可选回全数据蒸馏，此时没有验证早停。
+DP 默认使用 `sim_force_aware_dp_train_20hz_lstm2_gripper.yaml`：50 条 episode 全部训练、batch 32、最多 200,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。教师不留出验证 episode，默认将最终 `latest.ckpt` 交给学生。动作顺序为 `[x,y,z,qx,qy,qz,qw,gripper]`：前七维读取 `observation.ee_pose`，最后一维只读取原始 OSC action 的第 6 列（零起始），保留 LIBERO 的 `-1/+1` 夹爪开合指令；不修改源数据。当前任务尚未配置闭环 env runner。
+
+蒸馏默认使用最新版 `train_distill_render_net_patch_context.yaml`：像素级 sigmoid 强度场（初值 0.1、渲染阈值 0.1）、像素级 RGB residual、Denoiser MSE + Region MSE，Token MSE 仅记录。教师 context 响应逐图 min–max 后插值为像素强度监督。batch 32、最多 1000 epoch，继承新教师的 8 维动作、normalizer 与数据字段，并保持学生原有的 10% episode 验证划分。验证去噪 MSE 连续 30 个 epoch 没有至少 0.0001 的改善时自动停止。每轮保存 `latest.ckpt`，验证最优时保存 `best.ckpt`。学生验证 episode 已参与教师训练，不能视为未见数据上的任务泛化评估。设置 `dataset.val_ratio=0` 可选回全数据蒸馏，此时没有验证早停。
 
 `--teacher-run` 默认优先使用 `best.ckpt`，没有则使用 `latest.ckpt`；可用 `--teacher-selection latest` 明确选择最新权重，或用 `--teacher-checkpoint /path/to/model.ckpt` 精确指定。`all` 模式始终使用刚完成的 DP 阶段作为教师，DP 阶段失败时不会启动蒸馏。
 
@@ -51,9 +53,9 @@ DP 默认参数为全部 50 条训练、batch 32、100,000 个优化步，500 �
 
 ```bash
 python train_pipeline.py all \
-  --dp-config diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2.yaml \
-  --distill-config diffusion_policy/config/train_distill_render_net.yaml \
-  --dp-override training.num_optimizer_steps=100000 \
+  --dp-config diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2_gripper.yaml \
+  --distill-config diffusion_policy/config/train_distill_render_net_patch_context.yaml \
+  --dp-override training.num_optimizer_steps=200000 \
   --distill-override training.num_epochs=500 \
   --distill-override dataloader.batch_size=32 \
   --output-dir data/outputs/my_dp_distill_run
@@ -62,6 +64,16 @@ python train_pipeline.py all --gpus 0,1,2,3 --nproc-per-node 4
 ```
 
 每个 `--dp-override` / `--distill-override` 后跟一个 `key=value`，可重复使用；多卡由入口内部启动 `torchrun`，batch 按全局大小分配。省略阶段参数等同于 `all`，仍支持 `dp` 或 `distill` 单独运行。
+
+局部高分辨率视觉消融使用全图 DINOv3 加 wrist crop CNN。局部分支经过投影和可学习门控后融合回原 wrist 的 DINO patch 网格，教师和学生的上下文长度保持一致。队列入口会读取当前蒸馏的 `student/training_summary.json`，在其完成或早停后才启动新的教师→学生流程：
+
+```bash
+HF_HOME=/tmp/codex_hf_home HF_DATASETS_CACHE=/tmp/codex_hf_datasets \
+  PYTHON_BIN=/home/lcy/miniconda3/envs/fdp/bin/python \
+  bash scripts/train_local_highres_after_current.sh --gpus 0
+```
+
+教师配置为 `sim_force_aware_dp_train_20hz_lstm2_gripper_local_highres.yaml`，学生配置为 `train_distill_render_net_local_highres.yaml`，输出仍按 `teacher/` 和 `student/` 分开保存。
 输出集中在一个新目录，教师和学生分别保存配置、`train.log`、指标和检查点：
 
 ```text
@@ -200,12 +212,14 @@ context MSE 和演示动作扩散损失；token MSE 始终记录为诊断指标�
 `unet` 使用同一 CNN 编码器和 wrench cross-attention，但省略图像 self-attention。
 各相机独立前向处理、共享网络参数，以独立相机 embedding 区分视角；这里没有
 跨相机图像 self-attention。
-默认 `rendering_mode=patch_residual`：CNN、图像 self-attention 和 wrench
-cross-attention 融合后，每个空间 token 通过线性层预测一个
-`3 × patch_size × patch_size` 的 RGB 残差块，默认即 `3 × 16 × 16`，
-再按空间位置拼回图像。它不预测 Gaussian 中心或渲染点。
-`patch_residual_refine=true` 可在拼接后增加一个 identity 初始化的可学习 3×3 RGB
-卷积，让相邻 patch 边界交换信息；该卷积不保证输出平滑，也不是平滑损失。
+默认 `rendering_mode=residual`：CNN、图像 self-attention 和 wrench
+cross-attention 融合后，通过逐级双线性上采样、卷积和多尺度 skip connection
+解码到原图分辨率。两个输出头都读取全分辨率特征：1×1 卷积加 sigmoid
+预测 `H×W` 强度场，3×3 卷积预测 `H×W×3` RGB 残差。
+教师 patch 响应先逐图归一化，再插值为像素级强度目标，Region MSE 逐像素监督。
+`rendering_mode=patch_residual` 保留作消融：每个 token 直接预测
+`3×patch_size×patch_size` 残差块并拼接，`patch_residual_refine=true`
+可增加可学习 3×3 RGB 卷积；该卷积不保证平滑。
 残差头零初始化，预测残差经 `tanh` 后乘以学生预测的连续强度场：
 `clamp(image + residual_scale * predicted_strength * tanh(residual), 0, 1)`。
 默认 `residual_scale=1.0`，每通道 RGB 修改幅度由预测强度场进一步限制，
@@ -213,7 +227,7 @@ cross-attention 融合后，每个空间 token 通过线性层预测一个
 `transformer.patch_size` 表示 CNN 下采样倍率，
 支持不小于 2 的 2 次幂；维度、层数、head 数仍可配置，并处理非整除图像尺寸。
 新训练默认 `render_net.conv_block=bottleneck`：保留原图 stem，编码层在较窄通道上
-执行空间卷积。`rendering_mode=residual` 可选回旧的逐像素 RGB 残差和 skip 解码器。
+执行空间卷积，解码层结合相应分辨率的 skip 特征恢复像素细节。
 `rendering_mode=gaussian_glow` 保留作消融：预测若干椭圆高斯的中心、半径、角度、颜色
 和强度，按 `1 - (1 - image) * exp(-residual_scale * predicted_strength * glow_field)`
 仅增亮；其 `residual_scale` 表示曝光强度。关闭区域头时 `predicted_strength=1`。
@@ -240,16 +254,19 @@ wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`
 取差向量的 L2 范数。真实条件与 `raw_zero` 参考条件各执行一次 FP32 encoder，
 无需采集 DiT attention；教师原始 `d` 缓存与 noise attention 缓存使用不同指纹。
 
-默认把原始幅度转换为 `target_strength = d / (d + strength_scale)`，再双线性
-上采样到 RGB 尺寸。这样 `d=0` 的监督严格为 0，并保留跨帧强弱关系；不再对每帧
-context 分别做分位数拉伸。`strength_scale=5.0` 是待实验校准的草案值，
-并非从数据拟合或已经验证的最优值：`d=5` 对应强度 0.5。
+默认使用 `normalization=image_minmax`，在每个样本、相机和观测帧内部，
+沿 patch 维度计算 `target_strength = (d - min(d)) / (max(d) - min(d))`，
+再双线性上采样到 RGB 尺寸。该目标表示图内相对强弱：patch 最小值为 0、
+最大值为 1。全零或其他完全恒定的响应图没有空间对比，统一输出全零场。
+教师缓存保存原始 `d`，读取缓存与在线计算均在训练时应用同一归一化。
 
-学生用 RGB+wrench 融合特征预测低分辨率强度场，默认
-`activation=relu` 后截到 `[0,1]`，再双线性上采样，逐像素调制 RGB 残差。
-负 logits 可以表示精确零强度。训练和推理都使用**学生预测的强度场**，
-不把教师场直接乘到渲染结果上。只有学生预测场为 0 的位置才严格保持原图；
-教师 `d=0` 提供零场监督，有限的 MSE 训练本身不能保证预测也精确为 0。
+学生从 RGB+wrench 融合后的全分辨率解码特征直接预测像素强度场，默认
+`activation=sigmoid`；学生强度头无需从 patch 网格插值。`render_net.high_attention_render.threshold`
+控制渲染阈值：`M > threshold` 保留原强度，其余位置置零后乘 RGB 残差。
+当前 patch-context 配置为 `0.1`；旧 checkpoint 未配置该字段时按 `0.0` 处理。
+阈值在像素强度上应用，关闭位置严格保持原图。训练和推理使用同一规则；
+Region MSE 仍监督阈值处理前的预测场，因此关闭区域仍可通过区域监督恢复。
+渲染现有 checkpoint 时可给 `visualize_render_net_episode.py` 传入 `--threshold 0.1`。
 教师零 wrench 路径仍包含融合模块的 FFN 和 LayerNorm，未必等于学生的纯视觉路径；
 因此即使保留原图，去噪 MSE 也可能包含这部分基础路径差异。
 默认总损失为 `denoiser_mse + mask_loss_weight * field_mse`，
@@ -261,8 +278,9 @@ action query 为执行动作段。它仍按每个相机／观测槽位的 `perce
 生成软区域，低于下界为 0、高于上界为 1、中间线性变化，随后双线性上采样。
 这是 DINO patch 层面的空间参考，不能解释为像素因果贡献。
 原始教师 token 由独立无 hook 前向计算，注意力捕获不替换监督目标。
-`context` 设 `strength_scale=null` 可恢复旧的逐图分位数方式，但全零 context
-仍生成全零场。旧名称 `attention`、`context_effect` 和
+旧 `context` 配置未指定 `normalization` 时，保留原有行为：正 `strength_scale`
+使用 `d/(d+strength_scale)`，`strength_scale=null` 使用逐图分位数方式。
+当前配置若需重现旧方式，显式设置 `normalization=null`。旧名称 `attention`、`context_effect` 和
 `binary_top_percentile` 模式保留用于历史实验。
 `teacher_cache.precision=float32` 可令对照实验两组的教师 token 都关闭 AMP 计算；
 `teacher_cache.dtype` 仍独立控制缓存存储精度。
@@ -365,14 +383,26 @@ python train_distill_render_net.py \
 控制，默认分别为 32、64。v2 原始卷积在 24 GiB RTX 5090 D v2 上实测
 训练 batch 64 显存不足；旧版渲染器的显存测量不适用于 v2。
 使用 AdamW、CUDA bfloat16 AMP、梯度裁剪 1.0，最多训练 1000 个
-epoch，每个 epoch 结束时验证并保存 `checkpoints/latest.ckpt`。验证 MSE 创历史
+epoch，每个 epoch 结束时验证并保存 `checkpoints/latest.ckpt`。学生默认启用
+`training.use_ema=true`：在线 RenderNet 参与反向更新，每次成功更新后维护 EMA；
+EMA 使用逐步增加的衰减率（`ema.power=0.75`，上限 `ema.max_value=0.999`），
+验证、最佳权重选择和渲染推理使用 EMA。验证 MSE 创历史
 最低时保存 `checkpoints/best.ckpt`；连续 30 个 epoch 无改善则早停，
 `training.early_stopping.min_delta` 默认 0.0001，可配置判定改善的最小幅度。best 始终
 按实际最低 MSE 保存，不受 min_delta 影响。初始未训练模型也参与 best 比较。
+默认学习率从 `3e-4` 开始，`training.lr_scheduler` 使用 ReduceLROnPlateau，
+监控与最佳权重选择相同的验证 MSE（当前为 EMA 的 denoiser MSE）。连续 3 轮
+没有超过 `1e-4` 的绝对改善，下一轮学习率减半，最低 `1e-5`。
+配置中的 `patience=2` 遵循 PyTorch 语义：容忍两轮无改善，第三轮触发衰减。
+可用 `training.lr_scheduler.enabled=false` 关闭；没有验证集时不调整学习率。
 默认 `training.max_val_batches=null`，使用完整验证集；`training.max_steps=null`，
 不会再按 10,000 步截断。smoke test 可单独设置这两个上限。
-默认创建新训练目录并从头训练；设置 `training.resume_from` 可恢复模型、优化器、
-epoch 和验证最优记录。默认关闭图像增强以保证两条路径输入一致。
+默认创建新训练目录并从头训练；设置 `training.resume_from` 可恢复在线模型、EMA
+及其累计步数、优化器、学习率调度状态、epoch 和验证最优记录。
+旧 checkpoint 启用 EMA 时从恢复后的在线权重开始平均，EMA warmup 从零开始；
+新增调度器沿用 checkpoint 的优化器学习率，以历史最佳验证值为基线重新累计平台轮数。
+缺少相关字段的旧配置保持原行为；使用当前默认配置并指定 `training.resume_from`
+即可为旧 checkpoint 启用两者。默认关闭图像增强以保证两条路径输入一致。
 该教师实际使用 `future_wrench`（每观测 8×6），学生保持同一数据时间窗口。
 
 RenderNet 支持单机多卡 DDP：**每张 GPU 各放一份完整模型**，各自处理一个 batch
@@ -461,7 +491,8 @@ RTX 5090 D v2，batch 32、两观测×双相机 192×256、BF16、区域监督�
 `teacher_config.yaml`、`teacher_cache.json`（缓存位置）、`logs.json.txt`、
 `training_summary.json` 和 checkpoint。
 Checkpoint 保存 RenderNet（含独立的 LSTM、projection、位置编码与相机 embedding）、
-normalizer、教师 wrench 预处理配置／状态、AdamW／AMP 状态及训练步数；完整教师
+EMA 权重及累计状态、normalizer、教师 wrench 预处理配置／状态、AdamW／AMP／
+学习率调度状态及训练步数；完整教师
 policy 继续引用 `teacher_checkpoint`，不重复打包。缺少 `architecture_version` 的旧
 checkpoint 会按原 GRU／FiLM 结构加载，可继续可视化；新结构需重新训练。
 运行时打印两条 token shape、相机／
@@ -525,7 +556,7 @@ python diffusion_policy/scripts/visualize_render_net_episode.py \
 在 CPU 上推理。
 主干和区域头从 checkpoint 配置自动恢复。区域头启用训练的模型，在推理命令中
 加 `--disable-high-attention-render` 可以临时改为整图渲染作对比；该选项不会修改
-checkpoint。修改 `strength_scale` 或分位数会改变教师场监督目标，需要重新训练；
+checkpoint。修改 `normalization`、旧配置的 `strength_scale` 或分位数会改变教师场监督目标，需要重新训练；
 推理时不重新运行教师差分／注意力，也不按新参数重算已有模型的预测场。
 使用原始 wrench 直接归一化的旧 checkpoint 不包含一致的预处理状态，推理脚本
 会提示重新训练，避免静默改变模型训练时的输入分布。旧错误训练产物已清理。

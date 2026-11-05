@@ -55,6 +55,8 @@ def parse_args(argv=None):
     parser.add_argument("--save-frames", action="store_true", help="Also save PNGs for every video frame.")
     parser.add_argument("--disable-high-attention-render", action="store_true",
                         help="Bypass a trained region head and apply the residual across the full image.")
+    parser.add_argument("--threshold", type=float,
+                        help="Override the soft-mask threshold: retain M only where M > threshold.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if args.episode < 0 or args.stride < 1 or (args.max_frames is not None and args.max_frames < 1):
@@ -63,12 +65,16 @@ def parse_args(argv=None):
         parser.error("--fps must be positive and finite")
     if not math.isfinite(args.difference_gain) or args.difference_gain <= 0:
         parser.error("--difference-gain must be positive and finite")
+    if args.threshold is not None and (not math.isfinite(args.threshold) or not 0 <= args.threshold <= 1):
+        parser.error("--threshold must be finite and between 0 and 1")
     return args
 
 
 def output_paths(checkpoint, args):
     directory = checkpoint.parent.parent / "attention_visualize"
     stem = f"render_net_episode_{args.episode}_{args.camera}"
+    if args.threshold is not None:
+        stem += f"_threshold_{args.threshold:g}"
     return {
         "comparison": directory / f"{stem}_comparison.mp4",
         "rendered": directory / f"{stem}_rendered.mp4",
@@ -98,13 +104,15 @@ def load_render_net(checkpoint, device=None):
     wrench_key = str(teacher_cfg.policy.wrench_key)
     wrench_dim = int(teacher_cfg.policy.shape_meta.obs[wrench_key].shape[-1])
     model = build_render_net(wrench_dim, OmegaConf.to_container(cfg.render_net, resolve=True))
-    model.load_state_dict(payload["state_dicts"]["model"], strict=True)
+    state_key = "ema_model" if "ema_model" in payload["state_dicts"] else "model"
+    model.load_state_dict(payload["state_dicts"][state_key], strict=True)
     model.to(device).eval().requires_grad_(False)
     preprocessor = WrenchPreprocessor.from_config(cfg.wrench_preprocessing)
     preprocessor.load_state_dict(payload["state_dicts"]["wrench_preprocessor"], strict=True)
     preprocessor.to(device).eval().requires_grad_(False)
     pickles = payload.get("pickles", {})
     info = {key: dill.loads(pickles[key]) for key in ("global_step", "best_val_loss") if key in pickles}
+    info["student_state_key"] = state_key
     return model, preprocessor, cfg, teacher_cfg, device, info
 
 
@@ -179,6 +187,13 @@ def _save_rgb(path, frame):
 def run(args):
     checkpoint = common.choose_checkpoint(args.checkpoint, None)
     model, preprocessor, cfg, teacher_cfg, device, checkpoint_info = load_render_net(checkpoint, args.device)
+    if args.threshold is not None:
+        if (not hasattr(model, "region_threshold") or not model.high_attention_enabled
+                or model.region_selection != "soft" or args.disable_high_attention_render):
+            raise ValueError("--threshold requires a RenderNet v2 checkpoint with a soft region mask")
+        model.region_threshold = args.threshold
+        with open_dict(cfg):
+            cfg.render_net.high_attention_render.threshold = args.threshold
     attention_enabled = model.high_attention_enabled and not args.disable_high_attention_render
     image_keys = sorted(key for key, spec in teacher_cfg.policy.shape_meta.obs.items() if spec.get("type") == "rgb")
     camera_keys = [key for key in ("wrist", "side") if key in image_keys]
@@ -198,7 +213,8 @@ def run(args):
     writers = {}
     amp_enabled = device.type == "cuda" and bool(cfg.training.amp.enabled)
     amp_dtype = resolve_amp_dtype(cfg.training.amp.dtype)
-    print(f"RenderNet: {checkpoint}; step={checkpoint_info.get('global_step')}\n"
+    print(f"RenderNet: {checkpoint}; step={checkpoint_info.get('global_step')}; "
+          f"weights={checkpoint_info['student_state_key']}\n"
           f"Device: {device}; cameras={image_keys}; displayed={camera_keys}; wrench={wrench_key}", flush=True)
     try:
         selected = common.episode_sample_indices(dataset, args.episode)[::args.stride]

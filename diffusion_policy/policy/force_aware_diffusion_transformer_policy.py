@@ -31,10 +31,10 @@ from diffusion_policy.model.vision.wrench_preprocessing import (
 
 
 def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if action.shape[-1] != 7:
+    if action.shape[-1] not in (7, 8):
         return action
     normalized = normalize_quaternion_xyzw(action[..., 3:7], eps=eps)
-    return torch.cat([action[..., :3], normalized], dim=-1)
+    return torch.cat([action[..., :3], normalized, action[..., 7:]], dim=-1)
 
 
 class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
@@ -90,6 +90,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
+        local_highres: Optional[dict] = None,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -211,6 +212,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 cross_attn_layers=cross_attn_layers,
                 cross_attn_query=cross_attn_query,
                 cross_attn_query_residual=cross_attn_query_residual,
+                local_highres=local_highres,
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))

@@ -72,16 +72,18 @@ def context_effect_regions(
     percentiles=(80.0, 99.0),
     selection="binary_top_percentile",
     strength_scale=None,
+    normalization=None,
 ):
     """Map final-context effects to either soft or binary RGB region targets.
 
-    With ``selection=soft`` and a positive ``strength_scale``, the raw
-    context-effect magnitude is converted to an absolute saturating strength
-    ``effect / (effect + strength_scale)``.  This keeps zero effects at zero
-    and preserves cross-frame magnitude differences.  If no scale is given,
-    the legacy per-image percentile ramp is used.  The binary mode remains
-    available for reproducing the earlier hard top-percentile experiment.
+    ``normalization=image_minmax`` maps the weakest/strongest patches to 0/1
+    independently for each sample, camera and observation. Constant maps have
+    no spatial contrast and produce zero strength. Normalization precedes
+    bilinear upsampling. With no normalization specified, preserve the saved
+    experiment's absolute strength_scale or percentile mapping.
     """
+    if normalization not in (None, "image_minmax"):
+        raise ValueError(f"Unknown context normalization: {normalization!r}")
     masks = {}
     for key, effect in patch_effect.items():
         values = effect.detach().float()
@@ -91,7 +93,12 @@ def context_effect_regions(
         height, width = images[key].shape[-2:]
         gh, gw = patch_grid(patches, height, width, backbone)
         if selection == "soft":
-            if strength_scale is not None:
+            if normalization == "image_minmax":
+                lower = values.amin(dim=-1, keepdim=True)
+                span = values.amax(dim=-1, keepdim=True) - lower
+                # A constant image has zero numerator; use a safe denominator.
+                weights = (values - lower) / torch.where(span > 0, span, torch.ones_like(span))
+            elif strength_scale is not None:
                 scale = float(strength_scale)
                 if not math.isfinite(scale) or scale <= 0:
                     raise ValueError("strength_scale must be positive and finite")

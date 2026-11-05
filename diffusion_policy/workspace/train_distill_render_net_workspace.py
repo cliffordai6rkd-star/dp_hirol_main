@@ -33,6 +33,7 @@ from diffusion_policy.dataset.render_net_teacher_cache import (
     CACHE_VERSION, CachedTeacherDataset, TeacherTargetCache, cache_key, dataset_source_signature,
 )
 from diffusion_policy.dataset.image_result_cache import use_shared_ram_result_cache
+from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.vision.render_net import RenderNet, build_render_net
 from diffusion_policy.model.vision.render_net_attention import (
     attention_regions, context_effect_regions, teacher_attention_targets,
@@ -155,6 +156,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.model = build_render_net(wrench_dim, render_config).to(self.device)
         if isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher:
             self.model.initialize_wrench_encoder(self.teacher_policy.obs_encoder)
+        self.ema_model = self.ema = None
+        if cfg.training.get("use_ema", False):
+            self.ema_model = copy.deepcopy(self.model)
+            self.ema = EMAModel(self.ema_model, **dict(cfg.get("ema", {})))
         self.attention_config = cfg.render_net.get("high_attention_render", {})
         self.attention_enabled = bool(self.attention_config.get("enabled", False))
         self.mask_loss_weight = float(self.attention_config.get("mask_loss_weight", 1.0))
@@ -167,11 +172,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if self.attention_config.get("baseline", "raw_zero") != "raw_zero":
                     raise ValueError("context supervision requires baseline=raw_zero")
                 if selection == "soft":
-                    validate_percentiles(self.attention_config.get("percentiles", [80.0, 99.0]))
-                    strength_scale = self.attention_config.get("strength_scale")
-                    if strength_scale is not None and (
-                            not math.isfinite(float(strength_scale)) or float(strength_scale) <= 0):
-                        raise ValueError("context strength_scale must be positive and finite")
+                    normalization = self.attention_config.get("normalization")
+                    if normalization not in (None, "image_minmax"):
+                        raise ValueError(f"Unknown context normalization: {normalization!r}")
+                    if normalization is None:
+                        validate_percentiles(self.attention_config.get("percentiles", [80.0, 99.0]))
+                        strength_scale = self.attention_config.get("strength_scale")
+                        if strength_scale is not None and (
+                                not math.isfinite(float(strength_scale)) or float(strength_scale) <= 0):
+                            raise ValueError("context strength_scale must be positive and finite")
                 elif selection == "binary_top_percentile":
                     percentile = float(self.attention_config.get("percentile", 90.0))
                     if not 0 <= percentile < 100:
@@ -188,6 +197,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self._student_image_encoder = None
         self._training_model = None
         self.optimizer = torch.optim.AdamW(self.model.parameters(), **OmegaConf.to_container(cfg.optimizer))
+        self.lr_scheduler = None
+        scheduler_config = cfg.training.get("lr_scheduler", {})
+        if scheduler_config.get("enabled", False):
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode="min", factor=float(scheduler_config.get("factor", 0.5)),
+                patience=int(scheduler_config.get("patience", 2)),
+                threshold=float(scheduler_config.get("threshold", 1e-4)), threshold_mode="abs",
+                min_lr=float(scheduler_config.get("min_lr", 1e-5)),
+            )
         self.grad_scaler = torch.amp.GradScaler(
             "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16,
         )
@@ -213,12 +231,27 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 raise FileNotFoundError(f"RenderNet resume checkpoint does not exist: {resume_path}")
             # Restore optimizer/model and the loop counters, while keeping the
             # current Hydra output directory so a resumed run can append logs.
-            restored = self.load_checkpoint(path=resume_path, include_keys=self.include_keys)
+            excluded = []
+            if self.lr_scheduler is None:
+                excluded.append("lr_scheduler")
+            if self.ema is None:
+                excluded.extend(("ema", "ema_model"))
+            restored = self.load_checkpoint(path=resume_path, include_keys=self.include_keys,
+                                            exclude_keys=excluded)
             saved_objective = restored["cfg"].get("distillation", {}).get("objective", "token_mse")
             if saved_objective != self.objective:
                 raise ValueError("Cannot resume with a different distillation objective: "
                                  f"checkpoint={saved_objective}, configured={self.objective}. "
                                  "Start a new run so checkpoint selection metrics remain comparable.")
+            if self.ema_model is not None and "ema_model" not in restored["state_dicts"]:
+                self.ema_model.load_state_dict(self.model.state_dict())
+                log.info("Checkpoint has no student EMA: initialize from restored RenderNet; "
+                         "EMA warmup starts at zero")
+            if self.lr_scheduler is not None and "lr_scheduler" not in restored["state_dicts"]:
+                if math.isfinite(self.best_val_loss):
+                    self.lr_scheduler.step(self.best_val_loss)
+                log.info("Checkpoint has no LR scheduler: retain optimizer LR, use saved best "
+                         "validation as baseline, and start plateau counting at zero")
             self.resume_from = str(resume_path)
             # A checkpoint may have been saved immediately before an orderly
             # stop; an explicit resume should always re-enter the epoch loop.
@@ -238,6 +271,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             raise ValueError("early_stopping.patience must be positive; min_delta must be finite and nonnegative")
         log.info(f"Teacher: {checkpoint} ({self.teacher_state_key}), cross_attn_query=image")
         log.info(f"Trainable parameters: teacher=0, RenderNet={sum(p.numel() for p in self.model.parameters()):,}")
+        log.info("Student validation/inference weights=%s; EMA updates=%d",
+                 self.evaluation_state_key, self.ema.optimization_step if self.ema is not None else 0)
+        if self.lr_scheduler is not None:
+            log.info("LR scheduler=ReduceLROnPlateau: monitor validation %s, factor=%g, "
+                     "reduce after %d non-improving epochs, threshold=%g, min_lr=%g",
+                     self.metric_name, self.lr_scheduler.factor, self.lr_scheduler.patience + 1,
+                     self.lr_scheduler.threshold, self.lr_scheduler.min_lrs[0])
         log.info(f"Backbone={self.model.backbone_name}; high-attention rendering={self.attention_enabled}")
         if isinstance(self.model, RenderNet):
             log.info("RenderNet v2: full LSTM sequence [B*To,%d,%d], image-query cross-attention, "
@@ -249,8 +289,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             if self.region_source == "context":
                 if self.attention_config.get("selection", "soft") == "soft":
                     scale = self.attention_config.get("strength_scale")
-                    mapping = (f"strength=d/(d+{float(scale):g})" if scale is not None else
-                               f"legacy percentiles={list(self.attention_config.get('percentiles', [80., 99.]))}")
+                    if self.attention_config.get("normalization") == "image_minmax":
+                        mapping = "per-image strength=(d-min)/(max-min); constant maps are zero"
+                    else:
+                        mapping = (f"strength=d/(d+{float(scale):g})" if scale is not None else
+                                   f"legacy percentiles={list(self.attention_config.get('percentiles', [80., 99.]))}")
                     log.info("Teacher context: FP32 L2(Z(W)-Z(raw_zero)); %s; zero effect stays zero; "
                              "student predicts the field during training and inference", mapping)
                 else:
@@ -286,6 +329,20 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     @property
     def metric_name(self):
         return "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
+
+    @property
+    def evaluation_state_key(self):
+        return "ema_model" if getattr(self, "ema_model", None) is not None else "model"
+
+    def _step_lr_scheduler(self, validation_mse):
+        if self.lr_scheduler is None:
+            return
+        previous_lr = self.optimizer.param_groups[0]["lr"]
+        self.lr_scheduler.step(validation_mse)
+        current_lr = self.optimizer.param_groups[0]["lr"]
+        if current_lr < previous_lr and self.is_main_process:
+            log.info("Learning rate reduced: %.6g -> %.6g at epoch %d; validation %s=%.8f",
+                     previous_lr, current_lr, self.epoch, self.metric_name, validation_mse)
 
     def _validate_distillation_config(self):
         if self.objective not in {"token_mse", "denoiser_mse"}:
@@ -446,7 +503,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                           percentiles=self.attention_config.get(
                                               "percentiles", [80.0, 99.0]),
                                           selection=self.attention_config.get("selection", "soft"),
-                                          strength_scale=self.attention_config.get("strength_scale"))
+                                          strength_scale=self.attention_config.get("strength_scale"),
+                                          normalization=self.attention_config.get("normalization"))
         return attention_regions(patches, obs, self.teacher_policy.obs_encoder.backbone,
                                  self.attention_config["percentiles"])
 
@@ -485,8 +543,14 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                 if self.model.training and torch.is_grad_enabled() else None)
             renderer = (getattr(self, "_training_model", None)
                         if self.model.training and torch.is_grad_enabled() else None)
+            if renderer is None:
+                renderer = self.model
+                if not (self.model.training and torch.is_grad_enabled()):
+                    renderer = getattr(self, "ema_model", None)
+                    if renderer is None:
+                        renderer = self.model
             student_tokens, masks = student_context_tokens(
-                self.teacher_policy, self.model if renderer is None else renderer, obs,
+                self.teacher_policy, renderer, obs,
                 return_aux=True, image_context_encoder=compiled_encoder,
             )
             if student_tokens.shape != teacher_tokens.shape:
@@ -865,6 +929,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                "epochs_without_improvement": self.epochs_without_improvement},
             "teacher_checkpoint": str(pathlib.Path(self.cfg.teacher_checkpoint).resolve()),
             "teacher_state_key": self.teacher_state_key, "cross_attn_query": "image",
+            "student_state_key": self.evaluation_state_key,
+            "ema": self.ema.state_dict() if self.ema is not None else None,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "lr_scheduler": (self.lr_scheduler.state_dict()
+                             if self.lr_scheduler is not None and self.validation_enabled else None),
             "wrench_preprocessing": OmegaConf.to_container(self.cfg.wrench_preprocessing, resolve=True),
             "render_net": OmegaConf.to_container(self.cfg.render_net, resolve=True),
             "validation_enabled": self.validation_enabled,
@@ -891,6 +960,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if loader is None:
             return False
         self.latest_val_loss = self._validate(loader)
+        self._step_lr_scheduler(self.latest_val_loss)
         improved = self.latest_val_loss < self.best_val_loss
         if self.latest_val_loss < self.early_stopping_best_loss - self.min_delta:
             self.early_stopping_best_loss = self.latest_val_loss
@@ -905,6 +975,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 self.save_checkpoint(tag="best", use_thread=False)
         metrics = {"global_step": self.global_step, "epoch": self.epoch,
                    "objective": self.objective,
+                   "student_state_key": self.evaluation_state_key,
+                   "lr": self.optimizer.param_groups[0]["lr"],
                    "val_mse": self.latest_val_loss, "best_val_mse": self.best_val_loss,
                    "epochs_without_improvement": self.epochs_without_improvement,
                    "val_seconds": getattr(self, "validation_seconds", 0.0),
@@ -959,7 +1031,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if not self.validation_enabled:
             self.early_stopping_enabled = False
             log.info("No validation split: train on all episodes until the epoch/step limit; "
-                     "validation, early stopping and best checkpoint selection are disabled. "
+                     "validation, LR scheduling, early stopping and best checkpoint selection are disabled. "
                      "Save latest.ckpt after each epoch.")
         log.info(f"Dataset: train={len(dataset)}, validation={len(validation_dataset)}; "
               "normalizer=teacher checkpoint (not refitted)")
@@ -1013,11 +1085,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         self.latest_val_loss = self.initial_val_mse
                         self.best_val_loss = self.initial_val_mse
                         self.early_stopping_best_loss = self.initial_val_mse
+                        self._step_lr_scheduler(self.initial_val_mse)
                         if self.is_main_process:
                             self.save_checkpoint(tag="best", use_thread=False)
                         log.info(f"Initial train_mse={self.initial_train_mse:.8f}, val_mse={self.initial_val_mse:.8f}")
                         logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
                                     "objective": self.objective,
+                                    "student_state_key": self.evaluation_state_key,
                                     "initial_val_mse": self.initial_val_mse,
                                     "val_seconds": getattr(self, "validation_seconds", 0.0),
                                     "val_samples_per_second": getattr(self, "validation_samples_per_second", 0.0),
@@ -1056,8 +1130,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), float(self.cfg.training.max_grad_norm), error_if_nonfinite=True,
                         )
+                        scale_before = self.grad_scaler.get_scale()
                         self.grad_scaler.step(self.optimizer)
                         self.grad_scaler.update()
+                        if self.ema is not None and self.grad_scaler.get_scale() >= scale_before:
+                            self.ema.step(self.model)
                         grad_norm_value = float(grad_norm)
                         step_seconds = time.monotonic() - step_started
                         self.global_step += 1

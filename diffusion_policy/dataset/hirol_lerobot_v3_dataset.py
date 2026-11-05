@@ -138,6 +138,7 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         lowdim_feature_groups: Optional[Mapping[str, Sequence[str]]] = None,
         windowed_lowdim_feature_groups: Optional[Mapping[str, Mapping]] = None,
         action_feature_fields: Optional[Sequence[str]] = None,
+        action_feature_columns: Optional[Mapping[str, Sequence[int]]] = None,
         action_layout: str = "per_step",
         relative_pose_actions: bool = False,
         action_reference_key: str = "action_reference",
@@ -306,6 +307,10 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 self.lowdim_feature_groups.setdefault(key, [f"observation.{key}"])
 
         self.action_feature_fields = list(action_feature_fields or ["action"])
+        self.action_feature_columns = dict(action_feature_columns or {})
+        unknown_action_fields = set(self.action_feature_columns) - set(self.action_feature_fields)
+        if unknown_action_fields:
+            raise ValueError(f"action_feature_columns contains unused fields: {sorted(unknown_action_fields)}")
 
         self.lerobot_dataset = LeRobotV3Dataset(
             self.dataset_path,
@@ -388,7 +393,18 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
                 self.lowdim_data[key] = self._concat_columns(
                     self.lowdim_feature_groups[key], dtype=np.float32
                 )
-        self.action_data = self._concat_columns(self.action_feature_fields, dtype=np.float32)
+        action_arrays = []
+        for field in self.action_feature_fields:
+            values = self._load_column(field, dtype=np.float32)
+            if field in self.action_feature_columns:
+                columns = list(self.action_feature_columns[field])
+                if (not columns or any(isinstance(index, bool) or not isinstance(index, (int, np.integer))
+                                       or index < 0 or index >= values.shape[-1] for index in columns)
+                        or len(set(columns)) != len(columns)):
+                    raise ValueError(f"action_feature_columns[{field!r}] must contain distinct column indices in [0, {values.shape[-1]})")
+                values = values[..., columns]
+            action_arrays.append(values)
+        self.action_data = np.concatenate(action_arrays, axis=-1)
 
         for key in self.lowdim_keys:
             expected = tuple(obs_shape_meta[key]["shape"])

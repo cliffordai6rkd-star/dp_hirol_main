@@ -1,0 +1,36 @@
+defaults:
+  - sim_force_aware_dp_train_20hz_lstm2
+  - _self_
+
+name: sim_force_aware_dp_train_20hz_lstm2_gripper
+
+# Absolute xyz + xyzw + LIBERO gripper command. The original action's first
+# six columns are OSC deltas and must not be appended to the absolute pose.
+task:
+  shape_meta:
+    action:
+      shape: [8]
+  dataset:
+    shape_meta: ${shape_meta}
+    action_feature_fields: [observation.ee_pose, action]
+    action_feature_columns:
+      action: [6]
+    val_ratio: 0.0
+
+training:
+  resume: false
+  num_optimizer_steps: 200000
+  validation_start_optimizer_step: 150000
+  checkpoint_every_optimizer_steps: 20000
+  val_every: 10
+
+checkpoint:
+  topk:
+    monitor_key: null
+    mode: min
+    k: 3
+    format_str: optimizer_step={optimizer_step:08d}.ckpt
+
+logging:
+  group: libero_20hz_lstm2_gripper
+  tags: [libero, 20hz, force-aware, future-wrench, dinov3, image-query, lstm2, gripper]

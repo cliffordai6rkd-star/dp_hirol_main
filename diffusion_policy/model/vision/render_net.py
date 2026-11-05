@@ -376,6 +376,9 @@ class RenderNet(nn.Module):
         region_config = high_attention_render or {}
         self.region_selection = region_config.get("selection", "soft")
         self.region_activation = str(region_config.get("activation", "sigmoid"))
+        self.region_threshold = float(region_config.get("threshold", 0.0))
+        if not math.isfinite(self.region_threshold) or not 0 <= self.region_threshold <= 1:
+            raise ValueError("high_attention_render.threshold must be finite and between 0 and 1")
         self.region_percentile = float(region_config.get("percentile", 90.0))
         self.region_prediction_threshold = float(region_config.get("prediction_threshold", 0.5))
         if self.region_selection not in {"soft", "binary_top_percentile"}:
@@ -387,10 +390,18 @@ class RenderNet(nn.Module):
                 raise ValueError("Invalid binary region percentile or prediction threshold")
         self.mask_head = (nn.Conv2d(self.backbone.feature_dim, 1, 1)
                           if self.high_attention_enabled else None)
-        if self.mask_head is not None and self.region_activation == "relu":
-            # Keep the first forward pass trainable while allowing negative
-            # logits to represent an exact zero-strength field.
-            nn.init.constant_(self.mask_head.bias, 0.1)
+        if self.mask_head is not None:
+            if self.region_activation == "sigmoid":
+                initial_strength = float(region_config.get("initial_strength", 0.1))
+                if not math.isfinite(initial_strength) or not 0 < initial_strength < 1:
+                    raise ValueError("Sigmoid region initial_strength must be finite and between 0 and 1")
+                # Region supervision trains this head even if the rendering
+                # threshold initially closes the weak positive strength field.
+                nn.init.zeros_(self.mask_head.weight)
+                nn.init.constant_(self.mask_head.bias, math.log(initial_strength / (1 - initial_strength)))
+            else:
+                # Preserve the initialization used by explicit ReLU ablations.
+                nn.init.constant_(self.mask_head.bias, 0.1)
         self._compiled_backbone_forward = None
 
     def compile_backbone(self, **kwargs):
@@ -452,7 +463,7 @@ class RenderNet(nn.Module):
                 if self.region_activation == "relu":
                     mask = F.relu(logits).clamp(max=1.0)
                 else:
-                    mask = (logits.float() if self.region_selection == "binary_top_percentile" else logits).sigmoid()
+                    mask = logits.float().sigmoid()
                 gate = mask
                 if self.region_selection == "binary_top_percentile":
                     height, width = image.shape[-2:]
@@ -475,7 +486,9 @@ class RenderNet(nn.Module):
                 mask = mask.reshape(batch, steps, 1, *image.shape[-2:])
                 masks[key] = mask
                 if self.region_selection == "soft":
-                    gate = mask
+                    # Threshold after interpolation so closed pixels stay exactly unchanged.
+                    # Region MSE uses the unthresholded mask, including closed regions.
+                    gate = torch.where(mask > self.region_threshold, mask, torch.zeros_like(mask))
                 residual = residual * gate.reshape(batch, steps, 1, *image.shape[-2:])
             if self.rendering_mode == "gaussian_glow":
                 # Positive optical exposure gives smooth bounded brightening without clamp saturation.

@@ -25,8 +25,8 @@ teacher_cache:
 render_net:
   architecture_version: 2
   backbone: transformer # CNN + image/wrench attention; unet omits image self-attention.
-  rendering_mode: patch_residual # Per-token 3x16x16 RGB residual; gaussian_glow remains an ablation.
-  patch_residual_refine: true # Small identity-initialized 3x3 RGB residual refinement across patch seams.
+  rendering_mode: residual # Full-resolution skip decoder predicts pixel RGB residuals and intensity.
+  patch_residual_refine: true # Used only by the optional patch_residual ablation.
   base_channels: 16
   conv_block: bottleneck # Narrow spatial convolutions in the image encoder.
   initialize_wrench_from_teacher: true
@@ -37,7 +37,7 @@ render_net:
   wrench_dropout: 0.0
   image_keys: [side, wrist]
   residual_scale: 1.0 # Maximum absolute per-channel RGB change before strength modulation and clipping.
-  # Retained for gaussian_glow ablations; patch_residual does not use these values.
+  # Retained for gaussian_glow ablations; residual modes do not use these values.
   glow:
     num_blobs: 8
     sigma_min: 0.03 # Gaussian radii in normalized image coordinates.
@@ -55,12 +55,15 @@ render_net:
     enabled: true
     source: context # context is the continuous wrench-effect strength field.
     selection: soft # Continuous region gate; binary_top_percentile remains available for ablations.
-    activation: relu # Negative logits represent exact zero rendering strength.
-    strength_scale: 5.0 # Absolute context effect scale: strength=D_Z/(D_Z+scale); zero stays zero.
+    activation: sigmoid # Smooth bounded strength keeps negative logits trainable.
+    initial_strength: 0.1 # Zero head weights and logit bias start every patch at this strength.
+    threshold: 0.0 # Soft field: retain M only where M > threshold, otherwise render no change.
+    normalization: image_minmax # Independently normalize patches in each image to [0,1]; constant maps -> 0.
+    strength_scale: null # Used only by legacy context configs with normalization=null.
     percentile: 90.0 # Used only by context + binary_top_percentile.
     prediction_threshold: 0.5 # Binary student gate may be empty when all scores are low.
     baseline: raw_zero # Reference used for context supervision.
-    # Used by noise_attention; context uses this legacy ramp only when strength_scale is null.
+    # Used by noise_attention; legacy context uses this only when normalization and strength_scale are null.
     percentiles: [80.0, 99.0]
     # The selected teacher source supervises a student intensity head; rendering needs no teacher.
     mask_loss_weight: 1.0
@@ -97,6 +100,13 @@ optimizer:
   weight_decay: 0.0001
   betas: [0.9, 0.999]
 
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.999
+
 logging:
   progress_bar: true # tqdm for decoding/teacher caching, training and validation
   progress_bar_non_tty: false # Redirected logs contain periodic summaries instead of carriage-return bars.
@@ -108,7 +118,14 @@ logging:
 training:
   seed: 42
   device: cuda:0
-  resume_from: null # Restore a single-GPU or DDP checkpoint, including optimizer and epoch.
+  resume_from: null # Restore model, optimizer, EMA, LR scheduler and epoch (single GPU or DDP).
+  use_ema: true # Optimize the online model; validate/select checkpoints/render with EMA.
+  lr_scheduler:
+    enabled: true # ReduceLROnPlateau on validation MSE; inactive without validation.
+    factor: 0.5
+    patience: 2 # PyTorch tolerates two bad epochs; the third reduces LR.
+    threshold: 0.0001 # Absolute improvement required to reset plateau counting.
+    min_lr: 0.00001
   distributed:
     enabled: false # Launch with torchrun and set true; one complete model replica per GPU.
     backend: nccl

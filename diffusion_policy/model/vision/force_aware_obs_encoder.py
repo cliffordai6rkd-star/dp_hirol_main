@@ -1,9 +1,76 @@
 import inspect
+import math
 from collections.abc import Mapping
 from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
+
+
+class LocalHighResolutionBranch(nn.Module):
+    """A small wrist crop encoder that adds detail to existing DINO patches.
+
+    The branch deliberately fuses back into the camera's existing patch grid.
+    This keeps the DiT context length and the RenderNet distillation contract
+    unchanged while allowing a crop to be resized before its fine spatial
+    features are extracted.
+    """
+
+    def __init__(self, n_emb: int, config: Mapping):
+        super().__init__()
+        self.camera_key = str(config.get("camera_key", "wrist"))
+        crop = config.get("crop", (0.25, 0.25, 0.5, 0.5))
+        if len(crop) != 4:
+            raise ValueError("local_highres.crop must be [top, left, height, width]")
+        self.crop = tuple(float(value) for value in crop)
+        if any(not math.isfinite(value) for value in self.crop):
+            raise ValueError("local_highres.crop values must be finite")
+        if not (0 <= self.crop[0] < 1 and 0 <= self.crop[1] < 1
+                and 0 < self.crop[2] <= 1 and 0 < self.crop[3] <= 1
+                and self.crop[0] + self.crop[2] <= 1
+                and self.crop[1] + self.crop[3] <= 1):
+            raise ValueError("local_highres.crop must be a normalized in-image rectangle")
+        resize = config.get("resize", (192, 256))
+        if len(resize) != 2 or any(int(value) < 1 for value in resize):
+            raise ValueError("local_highres.resize must be [height, width]")
+        self.resize = (int(resize[0]), int(resize[1]))
+        channels = tuple(int(value) for value in config.get("channels", (32, 64, 128)))
+        if not channels or any(value < 1 for value in channels):
+            raise ValueError("local_highres.channels must contain positive integers")
+        layers = []
+        in_channels = 3
+        for out_channels in channels:
+            layers.extend((
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(1, out_channels),
+                nn.GELU(),
+            ))
+            in_channels = out_channels
+        self.features = nn.Sequential(*layers)
+        self.projection = nn.Conv2d(in_channels, int(n_emb), kernel_size=1)
+        self.register_buffer("image_mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("image_std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1), persistent=False)
+        gate_init = float(config.get("gate_init", -2.0))
+        if not math.isfinite(gate_init):
+            raise ValueError("local_highres.gate_init must be finite")
+        self.gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
+
+    def forward(self, image: torch.Tensor, target_grid: tuple[int, int]) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        top, left, crop_height, crop_width = self.crop
+        y0 = min(height - 1, max(0, int(round(top * height))))
+        x0 = min(width - 1, max(0, int(round(left * width))))
+        y1 = min(height, max(y0 + 1, int(round((top + crop_height) * height))))
+        x1 = min(width, max(x0 + 1, int(round((left + crop_width) * width))))
+        crop = image[..., y0:y1, x0:x1]
+        crop = torch.nn.functional.interpolate(
+            crop, size=self.resize, mode="bilinear", align_corners=False,
+        )
+        crop = (crop - self.image_mean.to(crop)) / self.image_std.to(crop)
+        local = self.projection(self.features(crop))
+        local = torch.nn.functional.adaptive_avg_pool2d(local, target_grid)
+        local = local.flatten(2).transpose(1, 2)
+        return torch.sigmoid(self.gate).to(local.dtype) * local
 
 
 class _CrossAttentionBlock(nn.Module):
@@ -61,6 +128,7 @@ class ForceAwareObsEncoder(nn.Module):
         cross_attn_query: str = "wrench",
         image_shapes: Optional[Mapping[str, Sequence[int]]] = None,
         cross_attn_query_residual: bool = True,
+        local_highres: Optional[Mapping] = None,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -95,6 +163,20 @@ class ForceAwareObsEncoder(nn.Module):
         self.pre_cross_self_attn_layers = int(pre_cross_self_attn_layers)
         self.cross_attn_layers = int(cross_attn_layers)
         self.cross_attn_query = str(cross_attn_query)
+        local_highres = local_highres or {}
+        self.local_highres_enabled = bool(local_highres.get("enabled", False))
+        self.local_highres = (
+            LocalHighResolutionBranch(self.n_emb, local_highres)
+            if self.local_highres_enabled else None
+        )
+        self.local_highres_camera = (
+            self.local_highres.camera_key if self.local_highres is not None else None
+        )
+        if self.local_highres is not None and self.local_highres_camera not in self.image_keys:
+            raise ValueError(
+                f"local_highres.camera_key={self.local_highres_camera!r} is not one of "
+                f"configured image_keys={list(self.image_keys)}"
+            )
         # Old checkpoint configs omit this option and retain their query skip.
         self.cross_attn_query_residual = bool(cross_attn_query_residual)
         self.image_shapes = {
@@ -382,6 +464,22 @@ class ForceAwareObsEncoder(nn.Module):
             for key, patch_image in zip(grouped_keys, grouped_patches.split(flat_camera_batch)):
                 if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
                     raise ValueError(f"DINO patch count does not match configured camera {key!r}")
+                if self.local_highres is not None and key == self.local_highres_camera:
+                    patch_size = getattr(self.backbone.config, "patch_size", 16)
+                    if isinstance(patch_size, int):
+                        patch_h = patch_w = int(patch_size)
+                    else:
+                        patch_h, patch_w = map(int, patch_size)
+                    grid = (flat_images.shape[-2] // patch_h, flat_images.shape[-1] // patch_w)
+                    local = self.local_highres(
+                        images[key].reshape(-1, *images[key].shape[2:]), grid,
+                    )
+                    if local.shape[1] != patch_image.shape[1]:
+                        raise RuntimeError(
+                            "local_highres branch must produce the camera's DINO patch count; "
+                            f"local={tuple(local.shape)}, dino={tuple(patch_image.shape)}"
+                        )
+                    patch_image = patch_image + local
                 encoded_camera_patches[key] = patch_image.reshape(
                     batch_size, obs_steps, patch_image.shape[1], self.n_emb
                 )

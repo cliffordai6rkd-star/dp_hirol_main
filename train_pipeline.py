@@ -23,8 +23,8 @@ import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DP_CONFIG = "diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2.yaml"
-DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net.yaml"
+DEFAULT_DP_CONFIG = "diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2_gripper.yaml"
+DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_patch_context.yaml"
 
 
 def make_parser():

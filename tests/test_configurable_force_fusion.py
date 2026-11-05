@@ -353,3 +353,33 @@ def test_spatial_heatmap_rejects_incompatible_cross_attention(monkeypatch, query
     monkeypatch.setattr(visualization.hydra.utils, "instantiate", lambda cfg: policy)
     with pytest.raises(ValueError, match=message):
         visualization.instantiate_policy({}, SimpleNamespace(policy={}), torch.device("cpu"))
+
+
+def test_local_highres_wrist_branch_preserves_patch_grid_and_backpropagates():
+    torch.manual_seed(7)
+    encoder = make_encoder(
+        cross_attn_query="image",
+        local_highres={
+            "enabled": True,
+            "camera_key": "wrist",
+            "crop": [0.0, 0.0, 1.0, 1.0],
+            "resize": [32, 48],
+            "channels": [4, 8],
+            "gate_init": -1.0,
+        },
+    ).train()
+    obs = observations()
+    context = encoder(
+        images={key: obs[key] for key in IMAGE_SHAPES},
+        wrench_history=obs["wrench_ext"],
+    )
+    # DINO still contributes 2x2 side + 2x3 wrist patches per observation.
+    assert context.shape == (2, 2 * 10, 16)
+    assert encoder.context_tokens_per_observation == 10
+    (context.square().mean()).backward()
+    assert encoder.local_highres is not None
+    assert encoder.local_highres.projection.weight.grad is not None
+    assert encoder.local_highres.projection.weight.grad.abs().sum() > 0
+    assert encoder.local_highres.gate.grad is not None
+    assert encoder.local_highres.gate.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in encoder.backbone.parameters())

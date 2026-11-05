@@ -22,9 +22,9 @@ class ImageEncoder(nn.Module):
 
 
 class RecordingDenoiser(nn.Module):
-    def __init__(self):
+    def __init__(self, action_dim=3):
         super().__init__()
-        self.readout = nn.Linear(4, 3)
+        self.readout = nn.Linear(4, action_dim)
         self.calls = []
 
     def forward(self, action, timestep, context):
@@ -37,13 +37,13 @@ class RecordingDenoiser(nn.Module):
 
 
 class Teacher(nn.Module):
-    def __init__(self, prediction_type):
+    def __init__(self, prediction_type, action_dim=3):
         super().__init__()
         self.obs_encoder = ImageEncoder()
-        self.model = RecordingDenoiser()
+        self.model = RecordingDenoiser(action_dim)
         self.noise_scheduler = DDIMScheduler(num_train_timesteps=10, prediction_type=prediction_type)
         self.normalizer = LinearNormalizer()
-        self.normalizer.fit({"action": torch.randn(40, 3), "wrench": torch.randn(40, 6)})
+        self.normalizer.fit({"action": torch.randn(40, action_dim), "wrench": torch.randn(40, 6)})
 
     def prepare_context_inputs(self, obs):
         return {"side": obs["side"]}, obs["wrench"], None, None
@@ -64,14 +64,14 @@ class Renderer(nn.Module):
         return (result, {}) if return_aux else result
 
 
-def make_workspace(prediction_type="epsilon", **weights):
+def make_workspace(prediction_type="epsilon", action_dim=3, **weights):
     torch.manual_seed(73)
     workspace = object.__new__(TrainDistillRenderNetWorkspace)
     workspace.cfg = OmegaConf.create({"distillation": {"objective": "denoiser_mse",
                                        "validation_seed": 19, **weights},
                                      "logging": {"progress_bar": False}})
     workspace.device = torch.device("cpu")
-    workspace.teacher_policy = Teacher(prediction_type).eval().requires_grad_(False)
+    workspace.teacher_policy = Teacher(prediction_type, action_dim).eval().requires_grad_(False)
     workspace.model = Renderer()
     workspace.attention_enabled = False
     workspace.mask_loss_weight = 1.0
@@ -81,13 +81,14 @@ def make_workspace(prediction_type="epsilon", **weights):
     workspace.max_val_batches = None
     workspace.loss_metrics = {}
     batch = {"obs": {"side": torch.rand(3, 1, 3, 4, 5), "wrench": torch.randn(3, 1, 2, 6)},
-             "action": torch.randn(3, 4, 3)}
+             "action": torch.randn(3, 4, action_dim)}
     return workspace, batch
 
 
 @pytest.mark.parametrize("prediction_type", ["epsilon", "sample", "v_prediction"])
-def test_shared_noisy_actions_and_frozen_input_gradients(prediction_type):
-    workspace, batch = make_workspace(prediction_type)
+@pytest.mark.parametrize("action_dim", [3, 8])
+def test_shared_noisy_actions_and_frozen_input_gradients(prediction_type, action_dim):
+    workspace, batch = make_workspace(prediction_type, action_dim=action_dim)
     teacher = workspace.teacher_policy
     teacher_before = {key: value.clone() for key, value in teacher.state_dict().items()}
     renderer_before = {key: value.clone() for key, value in workspace.model.state_dict().items()}

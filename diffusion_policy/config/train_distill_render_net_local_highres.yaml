@@ -1,0 +1,16 @@
+defaults:
+  - train_distill_render_net_patch_context
+  - _self_
+
+name: train_distill_render_net_local_highres
+
+# The teacher checkpoint supplies the matching local_highres encoder config and
+# weights. RenderNet therefore receives the same fixed wrist-CNN visual path
+# through teacher.obs_encoder.encode_image_context during distillation.
+render_net:
+  high_attention_render:
+    source: context
+
+hydra:
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_distill_render_net_local_highres
