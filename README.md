@@ -1496,6 +1496,10 @@ export LD_LIBRARY_PATH="$NPP_LIB:${LD_LIBRARY_PATH:-}"
 `requirements/uv-common-py310-lerobot.txt`、`conda_environment.yaml` 和
 `docker/Dockerfile`。`pyproject.toml` 只定义 PEP 517 构建后端和 pytest 配置。
 
+需要把训练环境搬到服务器时，使用 [docker/DOCKER_CN.md](docker/DOCKER_CN.md) 构建并导出镜像，
+再通过 Compose 挂载数据、DINOv3 权重和 checkpoint。Compose 默认直接启动当前 RenderNet token MSE
+蒸馏，也可以用 `TRAIN_COMMAND` 覆盖为 FDP 或其他 Hydra 训练命令。
+
 ## DINOv3 权重
 
 推荐下载完整的 Hugging Face 格式目录：
@@ -1547,28 +1551,6 @@ python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
   --config-name=train_force_aware_diffusion_workspace \
   logging.mode=offline
 ```
-
-tar -xzf /path/to/diffusion-policy-bundle.tar.gz \
-    -C /path/to/diffusion_policy
-
-docker load -i docker/artifacts/diffusion-policy-train.tar
-
-docker compose -f docker/docker_compose.yaml up -d trainer
-
-
-CUDA_VISIBLE_DEVICES=0,1 torchrun \
-  --standalone \
-  --nproc_per_node=2 \
-  train.py \
-  --config-dir=diffusion_policy/config \
-  --config-name=train_dp_insert_usb_force_aware \
-  training.distributed.enabled=true
-
-mkdir -p docker/artifacts
-docker save -o docker/artifacts/diffusion-policy-train.tar diffusion-policy:train
-
-tar --exclude='.git' -czf ../diffusion-policy-bundle.tar.gz .
-
 
 ATTN_CKPT="data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt"
 

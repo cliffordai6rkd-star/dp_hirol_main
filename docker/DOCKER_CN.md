@@ -1,79 +1,77 @@
 # 训练 Docker
 
-Compose 已经配置好 GPU、共享内存、代码、数据、DINOv3 权重和输出目录。服务器不需要重新安装 Python、PyTorch 或 LeRobot；只需要 Docker Compose v2、NVIDIA 驱动和 NVIDIA Container Toolkit。
+镜像内包含项目源码、Python 3.10、CUDA 12.8 PyTorch、LeRobot 和 TorchCodec。服务器只需要 Docker Compose v2、NVIDIA 驱动和 NVIDIA Container Toolkit。数据、DINOv3 权重和 checkpoint 通过 Compose 挂载，不打进镜像。
 
-项目内目录保持如下：
-
-```text
-data/insert_usb_50hz_lerobot_v3/
-model/model/dinov3-vitb16-pretrain-lvd1689m/
-```
-
-## 本机构建并打包
+## 本机构建和打包
 
 在项目根目录执行：
 
 ```bash
-# 中国大陆网络建议使用镜像；APT_MIRROR 只填写域名，不要带 http:// 或路径。
 APT_MIRROR=mirrors.aliyun.com \
   docker compose -f docker/docker_compose.yaml build --progress=plain trainer
+
 mkdir -p docker/artifacts
 docker save -o docker/artifacts/diffusion-policy-train.tar diffusion-policy:train
-tar --exclude='.git' -czf ../diffusion-policy-bundle.tar.gz .
+cp docker/docker_compose.yaml docker/artifacts/docker_compose.yaml
 ```
 
-`diffusion-policy-bundle.tar.gz` 包含项目代码、数据、DINOv3 权重和预构建镜像。把这个压缩包复制到服务器即可。
+把 `docker/artifacts/diffusion-policy-train.tar` 和 `docker/artifacts/docker_compose.yaml` 复制到服务器。服务器不需要重新安装 Python、PyTorch 或项目依赖。
 
 ## 服务器启动
 
-解压后进入项目根目录：
-
-```bash
-tar -xzf diffusion-policy-bundle.tar.gz
-docker load -i docker/artifacts/diffusion-policy-train.tar
-docker compose -f docker/docker_compose.yaml up -d trainer
-```
-
-进入容器并启动四卡训练：
-
-```bash
-docker compose -f docker/docker_compose.yaml exec trainer bash
-
-# 以下命令在容器内执行
-NPROC_PER_NODE=$(nvidia-smi -L | wc -l)
-torchrun \
-  --standalone \
-  --nproc_per_node="${NPROC_PER_NODE}" \
-  train.py \
-  --config-dir=diffusion_policy/config \
-  --config-name=train_dp_insert_usb_force_aware \
-  training.distributed.enabled=true
-```
-
-覆盖双阈值时，在 `training.distributed.enabled=true` 后追加：
-
-```bash
-free_threshold=0.4 contact_threshold=1.2
-```
-
-默认配置读取容器内的：
+先把数据和模型放到服务器，例如：
 
 ```text
-/workspace/data/insert_usb_50hz_lerobot_v3
-/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
+/srv/dp/data/
+/srv/dp/model/model/dinov3-vitb16-pretrain-lvd1689m/
 ```
 
-## 共享内存
+创建 `.env`，路径是宿主机路径，训练命令中的路径是容器路径：
 
-你的服务器有约 100GB CPU 内存，Compose 默认给容器 64GB 的 `/dev/shm`，用于四卡训练时的 DataLoader 和共享图像缓存。它不占用 4090 显存。
+```dotenv
+DATA_DIR=/srv/dp/data
+MODEL_DIR=/srv/dp/model
+DATASET_PATH=/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
+DINOV3_MODEL_PATH=/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
+TEACHER_CHECKPOINT=/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
+```
 
-如果需要降低上限，可以在启动容器前设置：
+加载镜像并直接启动默认训练：
 
 ```bash
-SHM_SIZE=32gb docker compose -f docker/docker_compose.yaml up -d trainer
+docker load -i docker/artifacts/diffusion-policy-train.tar
+docker compose -f docker/docker_compose.yaml up trainer
 ```
 
-## 常用命令
+默认命令是当前结构化 RenderNet 的纯 token MSE 蒸馏，使用固定的 11/01 教师 checkpoint。默认日志在前台显示；后台运行时使用：
+
+```bash
+docker compose -f docker/docker_compose.yaml up -d trainer
+docker compose -f docker/docker_compose.yaml logs -f trainer
+```
+
+## 覆盖训练命令
+
+Compose 通过 `TRAIN_COMMAND` 控制容器启动后执行的命令。运行 FDP 四卡训练：
+
+```bash
+TRAIN_COMMAND='torchrun --standalone --nproc_per_node=4 train.py --config-dir=diffusion_policy/config --config-name=train_dp_insert_usb_force_aware training.distributed.enabled=true' \
+  docker compose -f docker/docker_compose.yaml up trainer
+```
+
+进入容器做诊断：
+
+```bash
+docker compose -f docker/docker_compose.yaml run --rm --entrypoint bash trainer
+```
+
+## 共享内存和常用命令
+
+默认 `/dev/shm` 为 64GB，供 DataLoader worker 和图像缓存使用。服务器内存较小时可以降低：
+
+```bash
+SHM_SIZE=32g docker compose -f docker/docker_compose.yaml up -d trainer
+```
 
 ```bash
 docker compose -f docker/docker_compose.yaml ps
@@ -81,7 +79,7 @@ docker compose -f docker/docker_compose.yaml logs -f trainer
 docker compose -f docker/docker_compose.yaml down
 ```
 
-服务器没有外网时也不影响 Python 依赖，因为镜像已经在本机构建完成。服务器仍需确认 GPU 容器运行时：
+服务器 GPU 容器运行时检查：
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 nvidia-smi

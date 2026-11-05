@@ -8,12 +8,16 @@ __pycache__
 .ruff_cache
 .venv
 venv
+.env
+.env.*
 data
 models
 model
 outputs
 wandb
 docker/artifacts
+*.tar
+*.tar.gz
 *.mp4
 *.mkv
 *.avi

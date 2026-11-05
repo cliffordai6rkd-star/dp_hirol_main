@@ -37,11 +37,11 @@ from diffusion_policy.scripts import visualize_image_query_cross_attention_episo
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import resolve_amp_dtype
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, checkpoint_required=True, episode_required=True):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=pathlib.Path, required=True,
+    parser.add_argument("--checkpoint", type=pathlib.Path, required=checkpoint_required,
                         help="RenderNet distillation checkpoint, e.g. checkpoints/best.ckpt.")
-    parser.add_argument("--episode", type=int, required=True)
+    parser.add_argument("--episode", type=int, required=episode_required)
     parser.add_argument("--camera", choices=("wrist", "side", "both"), default="both")
     parser.add_argument("--dataset-path", type=pathlib.Path)
     parser.add_argument("--video-backend", choices=("pyav", "torchcodec"), default="pyav")

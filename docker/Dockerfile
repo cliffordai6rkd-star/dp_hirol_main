@@ -13,7 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH=/opt/venv/bin:${PATH} \
-    LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/nvidia/npp/lib:${LD_LIBRARY_PATH}
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/nvidia/npp/lib:${LD_LIBRARY_PATH} \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    TOKENIZERS_PARALLELISM=false
 
 RUN set -eux; \
     for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*; do \
@@ -72,7 +75,8 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir \
     -r requirements/uv-common-py310-lerobot.txt \
     && python -m pip install --no-cache-dir --no-deps lerobot==0.4.0 \
-    && python -m pip install --no-cache-dir -e ".[training,test]"
+    && python -m pip install --no-cache-dir -e ".[training,test]" \
+    && python -m pip check
 
 WORKDIR /workspace
 COPY . /workspace
@@ -81,8 +85,8 @@ ENV PYTHONPATH=/workspace \
     WANDB_DIR=/workspace/data/wandb \
     MPLCONFIGDIR=/tmp/matplotlib \
     HF_HOME=/workspace/.cache/huggingface \
-    TOKENIZERS_PARALLELISM=false
+    TORCH_HOME=/workspace/.cache/torch
 
-# The compose service keeps the container open. Run torchrun through
-# `docker compose exec trainer bash` after the image is loaded on the server.
-CMD ["sleep", "infinity"]
+# Compose supplies the training command. Keeping a shell default makes the
+# image useful for one-off diagnostics with `docker run --rm -it ... bash`.
+CMD ["bash"]
