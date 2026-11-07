@@ -7,13 +7,15 @@ name: train_distill_render_net_patch_context
 teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
 
 distillation:
-  objective: denoiser_mse
-  token_loss_weight: 0.0 # Selected: token MSE is diagnostic only.
+  objective: token_mse
+  token_loss_weight: 0.0 # Kept for compatibility with older denoiser configs.
   demo_loss_weight: 0.0
 
 render_net:
   rendering_mode: residual
   residual_scale: 1.0 # Selected: RGB-channel change is bounded by predicted strength.
+  spatial_modulation:
+    enabled: true
   high_attention_render:
     enabled: true
     source: context

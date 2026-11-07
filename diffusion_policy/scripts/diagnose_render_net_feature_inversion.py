@@ -56,7 +56,7 @@ def parse_args(argv=None):
     parser.add_argument("--samples", type=int, default=12,
                         help="Total samples: half pre-contact and half persistent contact.")
     parser.add_argument("--steps", type=int, default=300,
-                        help="Optimization steps for each of A-D.")
+                        help="Optimization steps for each selected experiment.")
     parser.add_argument("--pixel-lr", type=float, default=0.05)
     parser.add_argument("--student-lr", type=float, default=3e-4)
     parser.add_argument("--chunk-size", type=int, default=2,
@@ -65,7 +65,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--a-loss", choices=("training", "token"), default="training",
                         help="A loss: existing token+region objective, or token MSE only.")
-    parser.add_argument("--experiments", nargs="+", choices=("A", "B", "C", "D"),
+    parser.add_argument(
+        "--experiments", nargs="+",
+        choices=("A", "A_dynamic", "A_fixed", "B", "B_fixed", "C", "D"),
                         default=("A", "B", "C", "D"))
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
@@ -209,7 +211,48 @@ def _render_with_gate(original, parameter, gate, budget):
     return (original + delta).clamp(0.0, 1.0), delta
 
 
-def _direct_pixel_inversion(name, teacher, original, target, gate, budget, args, output):
+def _render_with_fixed_gate(model, images, wrench_history, fixed_gate):
+    """Render with a detached, precomputed continuous gate.
+
+    This deliberately replaces the gate inside RenderNet's residual formula.
+    Applying a mask after rendering would test a different function because it
+    would leave the network's own gate in the RGB path.
+    """
+    if model.rendering_mode != "residual":
+        raise ValueError("Fixed-gate diagnostics currently require rendering_mode=residual")
+    wrench_tokens = model.encode_wrench_history(wrench_history)
+    rendered = {}
+    for key, image in images.items():
+        if key not in model.image_keys:
+            raise KeyError(f"Camera {key!r} is absent from configured image_keys {model.image_keys}")
+        camera = model.camera_embedding.weight[model.image_keys.index(key)].reshape(1, 1, -1)
+        backbone_forward = (
+            model._compiled_backbone_forward
+            if model._compiled_backbone_forward is not None
+            and model.training and torch.is_grad_enabled()
+            else model.backbone
+        )
+        raw_residual, _ = backbone_forward(
+            image.flatten(0, 1), wrench_tokens, camera,
+        )
+        residual = raw_residual.tanh().reshape_as(image)
+        gate = fixed_gate[key].to(device=image.device, dtype=residual.dtype)
+        expected_shape = tuple(image.shape[:2]) + (1,) + tuple(image.shape[-2:])
+        if tuple(gate.shape) != expected_shape:
+            raise ValueError(
+                f"Fixed gate for {key!r} has shape {tuple(gate.shape)}, "
+                f"expected {expected_shape}"
+            )
+        rendered[key] = (
+            image + model.residual_scale * residual * gate
+        ).clamp(0.0, 1.0)
+    return rendered
+
+
+def _direct_pixel_inversion(
+    name, teacher, original, target, gate, budget, args, output,
+    *, initial_raw_mse=None, initial_student_mse=None, gate_mode=None,
+):
     parameter = torch.nn.ParameterDict({
         key: torch.nn.Parameter(torch.zeros_like(value)) for key, value in original.items()
     })
@@ -251,7 +294,9 @@ def _direct_pixel_inversion(name, teacher, original, target, gate, budget, args,
                              for value in gate.values()], dim=1)
     result = {
         "name": name,
-        "initial_mse": float(_per_sample_mse(_encode_no_grad(teacher, original, args.chunk_size), target).mean()),
+        "initial_mse": (float(initial_raw_mse) if initial_raw_mse is not None else
+                         float(_per_sample_mse(_encode_no_grad(teacher, original, args.chunk_size), target).mean())),
+        "initial_student_mse": (None if initial_student_mse is None else float(initial_student_mse)),
         "final_mse": float(per_sample.mean()),
         "per_sample_final_mse": per_sample.cpu().tolist(),
         "curve": curve,
@@ -262,6 +307,7 @@ def _direct_pixel_inversion(name, teacher, original, target, gate, budget, args,
         "p95_abs_rgb_delta": float(torch.quantile(abs_values.flatten(), 0.95)),
         "max_abs_rgb_delta": float(abs_values.max()),
         "gate_support_fraction": float((gate_values > 0).float().mean()),
+        "gate_mode": gate_mode,
         "elapsed_seconds": time.monotonic() - start_time,
     }
     torch.save({"rendered": {key: value.cpu() for key, value in rendered.items()},
@@ -273,8 +319,13 @@ def _direct_pixel_inversion(name, teacher, original, target, gate, budget, args,
     return result
 
 
-def _student_overfit(teacher, student, preprocessor, batch_obs, original, target,
-                     target_patch_weights, args, output):
+def _student_overfit(
+    teacher, student, preprocessor, batch_obs, original, target,
+    target_patch_weights, args, output, *, fixed_gate=None, result_name=None,
+    artifact_name=None, initial_raw_mse=None,
+):
+    if fixed_gate is not None and args.a_loss != "token":
+        raise ValueError("A-fixed is defined only for the token-only objective")
     model = copy.deepcopy(student).to(next(iter(original.values())).device)
     # cuDNN RNN backward requires training mode.  Keep that mode for the
     # LSTM, but remove stochasticity from every dropout path for a deterministic
@@ -298,12 +349,19 @@ def _student_overfit(teacher, student, preprocessor, batch_obs, original, target
         for chunk in _chunks(n_samples, args.chunk_size):
             images = {key: value[chunk] for key, value in original.items()}
             wrench, _, _ = preprocessor({key: value[chunk] for key, value in batch_obs.items()})
-            rendered, masks = model(images, wrench, return_aux=True, use_attention_mask=True)
+            if fixed_gate is None:
+                rendered, masks = model(images, wrench, return_aux=True, use_attention_mask=True)
+            else:
+                masks = {}
+                rendered = _render_with_fixed_gate(
+                    model, images, wrench,
+                    {key: value[chunk] for key, value in fixed_gate.items()},
+                )
             prediction = _encode_image_context(teacher, rendered)
             token = F.mse_loss(prediction.float(), target[chunk].float())
             patch_losses = []
             smooth_losses = []
-            if args.a_loss == "training":
+            if args.a_loss == "training" and fixed_gate is None:
                 for key, mask in masks.items():
                     target_patch = target_patch_weights[key][chunk].to(mask)
                     batch_size, steps, _, height, width = mask.shape
@@ -337,18 +395,37 @@ def _student_overfit(teacher, student, preprocessor, batch_obs, original, target
         for chunk in _chunks(n_samples, args.chunk_size):
             images = {key: value[chunk] for key, value in original.items()}
             wrench, _, _ = preprocessor({key: value[chunk] for key, value in batch_obs.items()})
-            rendered, masks = model(images, wrench, return_aux=True, use_attention_mask=True)
+            if fixed_gate is None:
+                rendered, masks = model(images, wrench, return_aux=True, use_attention_mask=True)
+            else:
+                masks = {}
+                rendered = _render_with_fixed_gate(
+                    model, images, wrench,
+                    {key: value[chunk] for key, value in fixed_gate.items()},
+                )
             predictions.append(_encode_no_grad(teacher, rendered, args.chunk_size))
             for key in masks:
                 predicted_masks[key].append(masks[key].cpu())
         prediction = torch.cat(predictions, dim=0)
         per_sample = _per_sample_mse(prediction, target)
-    mask_values = torch.cat([torch.cat(values, dim=0).reshape(n_samples, -1)
-                             for values in predicted_masks.values()], dim=1)
-    threshold = float(model.region_threshold)
+    if fixed_gate is None:
+        mask_values = torch.cat([torch.cat(values, dim=0).reshape(n_samples, -1)
+                                 for values in predicted_masks.values()], dim=1)
+        threshold = float(model.region_threshold)
+    else:
+        mask_values = torch.cat([
+            value.detach().float().reshape(n_samples, -1)
+            for value in fixed_gate.values()
+        ], dim=1)
+        threshold = 0.0
+    result_name = result_name or f"A_student_overfit_{args.a_loss}"
     result = {
-        "name": f"A_student_overfit_{args.a_loss}",
-        "initial_mse": float(_per_sample_mse(_encode_no_grad(teacher, original, args.chunk_size), target).mean()),
+        "name": result_name,
+        "initial_mse": (float(initial_raw_mse) if initial_raw_mse is not None else
+                         float(_per_sample_mse(_encode_no_grad(teacher, original, args.chunk_size), target).mean())),
+        # curve[0] is measured before the first optimizer.step().  Keep this
+        # separate from initial_mse, which is the raw-image baseline.
+        "initial_student_mse": float(curve[0]["token_mse"]),
         "final_mse": float(per_sample.mean()),
         "per_sample_final_mse": per_sample.cpu().tolist(),
         "curve": curve,
@@ -357,10 +434,15 @@ def _student_overfit(teacher, student, preprocessor, batch_obs, original, target
         "residual_budget": float(model.residual_scale),
         "predicted_mask_mean": float(mask_values.mean()),
         "predicted_mask_gt_threshold_fraction": float((mask_values > threshold).float().mean()),
+        "gate_mode": "dynamic_model_gate" if fixed_gate is None else "fixed_initial_student_gate",
+        "fixed_gate_support_fraction": (
+            None if fixed_gate is None else float((mask_values > 0).float().mean())
+        ),
         "elapsed_seconds": time.monotonic() - start_time,
     }
+    artifact_name = artifact_name or "A_student_overfit_model"
     torch.save({"model": model.state_dict(), "per_sample_mse": per_sample.cpu()},
-               output / "A_student_overfit_model.pt")
+               output / f"{artifact_name}.pt")
     del model, optimizer, prediction
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return result
@@ -376,7 +458,7 @@ def _save_plot(results, path):
     for result in results:
         curve = result["curve"]
         values = ([item["token_mse"] for item in curve]
-                  if result["name"].startswith("A_student_overfit_") else curve)
+                  if curve and isinstance(curve[0], dict) else curve)
         plt.plot(np.arange(1, len(values) + 1), values, label=result["name"])
     plt.yscale("log")
     plt.xlabel("optimization step")
@@ -433,13 +515,55 @@ def main(args):
     )
     budget = float(student.residual_scale)
     original = {key: value.detach().clone() for key, value in images.items()}
+    # Keep both baselines explicit.  The raw image is the common reference for
+    # all experiments; the trained EMA student's output is the initialization
+    # reference for A and a useful scale for the fixed-gate comparison.
+    raw_prediction = _encode_no_grad(teacher, original, args.chunk_size)
+    raw_mse_per_sample = _per_sample_mse(raw_prediction, target)
+    with torch.no_grad():
+        student_rendered, _ = student(
+            original, wrench, return_aux=True, use_attention_mask=True,
+        )
+    student_prediction = _encode_no_grad(teacher, student_rendered, args.chunk_size)
+    student_mse_per_sample = _per_sample_mse(student_prediction, target)
+    raw_initial_mse = float(raw_mse_per_sample.mean())
+    student_initial_mse = float(student_mse_per_sample.mean())
+    fixed_gate = {
+        key: value.detach().float().clone() for key, value in student_gates.items()
+    }
+    if any(label in args.experiments for label in ("A_fixed", "B_fixed")):
+        torch.save(
+            {key: value.cpu() for key, value in fixed_gate.items()},
+            output / "fixed_initial_student_gate.pt",
+        )
     # A uses the same current student parameterization; its loss can be
     # restricted to token MSE for a like-for-like comparison with B-D.
     results = []
     if "A" in args.experiments:
         results.append(_student_overfit(
             teacher, student, preprocessor, obs, original, target, target_patch_weights,
-            args, output,
+            args, output, initial_raw_mse=raw_initial_mse,
+        ))
+    if "A_dynamic" in args.experiments:
+        results.append(_student_overfit(
+            teacher, student, preprocessor, obs, original, target, target_patch_weights,
+            args, output, result_name="A_dynamic_student_overfit_token",
+            artifact_name="A_dynamic_student_overfit_model",
+            initial_raw_mse=raw_initial_mse,
+        ))
+    if "A_fixed" in args.experiments:
+        results.append(_student_overfit(
+            teacher, student, preprocessor, obs, original, target, target_patch_weights,
+            args, output, fixed_gate=fixed_gate,
+            result_name="A_fixed_student_overfit_token",
+            artifact_name="A_fixed_student_overfit_model",
+            initial_raw_mse=raw_initial_mse,
+        ))
+    if "B_fixed" in args.experiments:
+        results.append(_direct_pixel_inversion(
+            "B_fixed_gate_pixels", teacher, original, target, fixed_gate, budget, args, output,
+            initial_raw_mse=raw_initial_mse, initial_student_mse=student_initial_mse,
+            gate_mode="fixed_initial_student_gate",
         ))
     for label, name, gate in (("B", "B_student_mask_pixels", student_gates),
                               ("C", "C_teacher_gt05_pixels", teacher_gates),
@@ -447,6 +571,12 @@ def main(args):
         if label in args.experiments:
             results.append(_direct_pixel_inversion(
                 name, teacher, original, target, gate, budget, args, output,
+                initial_raw_mse=raw_initial_mse, initial_student_mse=student_initial_mse,
+                gate_mode={
+                    "B": "fixed_initial_student_gate",
+                    "C": "fixed_teacher_gt05_gate",
+                    "D": "full_image",
+                }[label],
             ))
     report = {
         "teacher_checkpoint": str(teacher_checkpoint),
@@ -464,6 +594,24 @@ def main(args):
         "direct_pixel_residual_budget": budget,
         "student_mask_threshold": student_threshold,
         "teacher_mask_threshold": 0.5,
+        "initial_baselines": {
+            "raw_image_mse": raw_initial_mse,
+            "raw_image_per_sample_mse": raw_mse_per_sample.cpu().tolist(),
+            "student_checkpoint_mse": student_initial_mse,
+            "student_checkpoint_per_sample_mse": student_mse_per_sample.cpu().tolist(),
+            "student_state_key": student_info.get("student_state_key"),
+        },
+        "fixed_gate": {
+            "saved": any(label in args.experiments for label in ("A_fixed", "B_fixed")),
+            "source": "student checkpoint gate computed once before optimization",
+            "support_fraction": float(torch.cat([
+                value.expand(-1, -1, 3, -1, -1).reshape(value.shape[0], -1)
+                for value in fixed_gate.values()
+            ]).gt(0).float().mean()),
+            "mean": float(torch.cat([
+                value.reshape(value.shape[0], -1) for value in fixed_gate.values()
+            ]).mean()),
+        },
         "target": "teacher final context Z(W); direct RGB path uses frozen teacher obs_encoder.encode_image_context",
         "determinism": "teacher and student eval mode; dropout disabled; teacher weights frozen; FP32 target and loss",
         "results": results,
@@ -473,7 +621,8 @@ def main(args):
     print(f"Report: {output / 'report.json'}", flush=True)
     for result in results:
         print(f"{result['name']}: initial={result['initial_mse']:.8f} final={result['final_mse']:.8f} "
-              f"reduction={(1 - result['final_mse'] / result['initial_mse']):.2%}", flush=True)
+              f"raw_reduction={(1 - result['final_mse'] / result['initial_mse']):.2%} "
+              f"student_initial={result.get('initial_student_mse')}", flush=True)
 
 
 if __name__ == "__main__":

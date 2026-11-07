@@ -81,6 +81,34 @@ class BottleneckDecoderBlock(nn.Module):
         return F.silu(self.body(torch.cat([features, skip], dim=1)) + skip)
 
 
+class SpatialModulation(nn.Module):
+    """Condition one decoder feature map with the fused spatial context.
+
+    The last affine layer is zero initialized, so enabling this module starts
+    as an identity transform.  ``gate`` is supplied by the student region
+    head at the same input, rather than by a broadcast wrench vector.
+    """
+
+    def __init__(self, feature_channels, conditioning_channels):
+        super().__init__()
+        hidden = max(8, min(feature_channels, conditioning_channels))
+        self.affine = nn.Sequential(
+            nn.Conv2d(feature_channels + conditioning_channels, hidden, 1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 2 * feature_channels, 1),
+        )
+        nn.init.zeros_(self.affine[-1].weight)
+        nn.init.zeros_(self.affine[-1].bias)
+
+    def forward(self, feature, fused_feature, gate):
+        condition = F.interpolate(
+            fused_feature, size=feature.shape[-2:], mode="bilinear", align_corners=False,
+        )
+        gamma, beta = self.affine(torch.cat([feature, condition], dim=1)).chunk(2, dim=1)
+        gate = F.interpolate(gate, size=feature.shape[-2:], mode="bilinear", align_corners=False)
+        return feature + gate * (gamma * feature + beta)
+
+
 class ImageSelfAttentionBlock(nn.Module):
     """One image-token self-attention block."""
 
@@ -218,8 +246,10 @@ class ConvAttentionBackbone(nn.Module):
         features = self.norm(tokens).transpose(1, 2).reshape(image.shape[0], self.embed_dim, gh, gw)
         return features, skips, height, width
 
-    def forward(self, image, wrench_tokens, camera_embedding):
+    def forward(self, image, wrench_tokens, camera_embedding, *, return_decoder_features=False):
         features, skips, height, width = self.encode(image, wrench_tokens, camera_embedding)
+        fused_features = features
+        decoder_features = []
         for decoder, skip in zip(self.decoders, reversed(skips[-self.decoder_layers:])):
             if self.conv_block == "bottleneck":
                 features = decoder(features, skip)
@@ -228,10 +258,15 @@ class ConvAttentionBackbone(nn.Module):
                     F.interpolate(features, size=skip.shape[-2:], mode="bilinear", align_corners=False),
                     skip,
                 ], dim=1))
+            if return_decoder_features:
+                decoder_features.append(features)
         if features.shape[-2:] != (height, width):
             features = F.interpolate(features, size=(height, width), mode="bilinear", align_corners=False)
         features = features[:, :, :height, :width]
-        return self.output(features), features
+        result = (self.output(features), features)
+        if return_decoder_features:
+            return (*result, decoder_features, fused_features)
+        return result
 
 
 class PatchResidualBackbone(ConvAttentionBackbone):
@@ -357,7 +392,8 @@ class RenderNet(nn.Module):
                  wrench_history_steps=8, max_obs_steps=2, wrench_layers=1,
                  wrench_dropout=0.0, image_keys=("side", "wrist"),
                  initialize_wrench_from_teacher=True, conv_block="standard",
-                 rendering_mode="residual", glow=None, patch_residual_refine=True):
+                 rendering_mode="residual", glow=None, patch_residual_refine=True,
+                 spatial_modulation=None):
         super().__init__()
         if not math.isfinite(residual_scale) or residual_scale <= 0:
             raise ValueError("residual_scale must be positive and finite")
@@ -369,6 +405,15 @@ class RenderNet(nn.Module):
             raise ValueError("The active RenderNet wrench_encoder is 'lstm'")
         if rendering_mode not in {"residual", "patch_residual", "gaussian_glow"}:
             raise ValueError("rendering_mode must be residual, patch_residual or gaussian_glow")
+        spatial_config = dict(spatial_modulation or {})
+        unknown_spatial = set(spatial_config) - {"enabled"}
+        if unknown_spatial:
+            raise ValueError(f"Unknown spatial_modulation options: {sorted(unknown_spatial)}")
+        self.spatial_modulation_enabled = bool(spatial_config.get("enabled", False))
+        if self.spatial_modulation_enabled and rendering_mode != "residual":
+            raise ValueError("spatial_modulation is currently supported only for rendering_mode=residual")
+        if self.spatial_modulation_enabled and int(decoder_layers) < 2:
+            raise ValueError("spatial_modulation requires at least two decoder layers (/8 and /4)")
         self.rendering_mode = rendering_mode
         self.image_keys = tuple(sorted(str(key) for key in image_keys))
         if not self.image_keys or len(set(self.image_keys)) != len(self.image_keys):
@@ -446,12 +491,106 @@ class RenderNet(nn.Module):
                 nn.init.constant_(self.mask_head.bias, math.log(initial_strength / (1 - initial_strength)))
             else:
                 nn.init.constant_(self.mask_head.bias, 0.1)
+        # The backbone remains the complete gate path.  Its output head is
+        # retained as the independently trainable RGB branch; the gate path
+        # itself is frozen during the RGB stage by set_training_stage().
+        self.spatial_modulations = nn.ModuleList()
+        self.spatial_projections = nn.ModuleList()
+        if self.spatial_modulation_enabled:
+            decoder_channels = [module.body[-2].out_channels
+                                if isinstance(module, ResidualBlock)
+                                else module.body[-1].num_channels
+                                for module in self.backbone.decoders[:2]]
+            # The first two decoder outputs are /8 and /4 for patch_size=16.
+            for channels in decoder_channels:
+                self.spatial_modulations.append(
+                    SpatialModulation(channels, self.backbone.embed_dim)
+                )
+                self.spatial_projections.append(
+                    nn.Conv2d(channels, self.backbone.feature_dim, 1)
+                )
+                nn.init.zeros_(self.spatial_projections[-1].weight)
+                nn.init.zeros_(self.spatial_projections[-1].bias)
         self._compiled_backbone_forward = None
+        self.training_stage = "joint"
 
     def compile_backbone(self, **kwargs):
         # Compile only the image path. LSTM stays in cuDNN; state_dict keys stay
         # unchanged, and evaluation does not compile a second forward-only graph.
         self._compiled_backbone_forward = torch.compile(self.backbone.forward, **kwargs)
+
+    def _set_requires_grad(self, module, enabled):
+        if module is not None:
+            module.requires_grad_(bool(enabled))
+
+    def set_training_stage(self, stage):
+        """Freeze the complete gate path or expose only the RGB branch.
+
+        ``intensity`` trains the wrench/image fusion, decoder and mask head;
+        the RGB output and modulation modules are frozen.  ``rgb`` freezes
+        every parameter that can affect the gate and updates only the RGB
+        output/modulation path.  This is deliberately parameter based rather
+        than an output detach, so the gate cannot drift during RGB training.
+        """
+        stage = str(stage)
+        if stage not in {"intensity", "rgb", "joint"}:
+            raise ValueError("RenderNet stage must be intensity, rgb or joint")
+        self.training_stage = stage
+        self.requires_grad_(False)
+        if stage in {"intensity", "joint"}:
+            # The backbone feature path, wrench encoder and camera embeddings
+            # are the complete gate-producing path.
+            for module in (self.wrench_projection, self.wrench_position,
+                           self.obs_position, self.force_modality,
+                           self.wrench_encoder, self.backbone.stem,
+                           self.backbone.encoders, self.backbone.image_self_attention,
+                           self.backbone.cross_attention, self.backbone.norm,
+                           self.backbone.decoders, self.camera_embedding,
+                           self.mask_head):
+                self._set_requires_grad(module, True)
+            if stage == "joint":
+                self._set_requires_grad(self.backbone.output, True)
+                self._set_requires_grad(self.spatial_modulations, True)
+                self._set_requires_grad(self.spatial_projections, True)
+        if stage in {"rgb", "joint"}:
+            self._set_requires_grad(self.backbone.output, True)
+            self._set_requires_grad(self.spatial_modulations, True)
+            self._set_requires_grad(self.spatial_projections, True)
+
+    def set_stage_mode(self, training=True):
+        """Set train/eval mode while keeping a frozen RGB-stage gate deterministic."""
+        self.train(bool(training))
+        if training and self.training_stage == "rgb":
+            for module in (self.wrench_projection, self.wrench_encoder,
+                           self.backbone.stem, self.backbone.encoders,
+                           self.backbone.image_self_attention,
+                           self.backbone.cross_attention, self.backbone.norm,
+                           self.backbone.decoders, self.camera_embedding,
+                           self.mask_head):
+                self._set_requires_grad(module, False)
+                if module is not None:
+                    module.eval()
+
+    def gate_parameters(self):
+        """Return parameters whose updates can change the predicted gate."""
+        names = {"wrench_projection", "wrench_position", "obs_position", "force_modality",
+                 "wrench_encoder", "backbone", "camera_embedding", "mask_head"}
+        parameters = []
+        for name, parameter in self.named_parameters():
+            if name.startswith("spatial_modulations.") or name.startswith("spatial_projections."):
+                continue
+            if name == "backbone.output.weight" or name == "backbone.output.bias":
+                continue
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in names):
+                parameters.append(parameter)
+        return parameters
+
+    def rgb_parameters(self):
+        """Return parameters updated by the RGB stage."""
+        parameters = [self.backbone.output.weight, self.backbone.output.bias]
+        parameters.extend(self.spatial_modulations.parameters())
+        parameters.extend(self.spatial_projections.parameters())
+        return parameters
 
     @property
     def output(self):
@@ -482,7 +621,34 @@ class RenderNet(nn.Module):
         sequence, _ = self.wrench_encoder(force.reshape(batch * steps, history, -1))
         return sequence
 
-    def forward(self, images, wrench_history, *, return_aux=False, use_attention_mask=None):
+    def _predict_mask(self, features, use_mask):
+        if not use_mask:
+            return torch.ones(
+                features.shape[0], 1, features.shape[-2], features.shape[-1],
+                device=features.device, dtype=features.dtype,
+            )
+        logits = self.mask_head(features)
+        if self.region_activation == "relu":
+            mask = F.relu(logits).clamp(max=1.0)
+        else:
+            mask = logits.float().sigmoid()
+        return mask
+
+    def _rgb_residual(self, features, decoder_features, fused_features, gate):
+        if not self.spatial_modulation_enabled:
+            return self.output(features)
+        rgb_features = features
+        for modulation, projection, decoder_feature in zip(
+                self.spatial_modulations, self.spatial_projections, decoder_features[:2]):
+            modulated = modulation(decoder_feature, fused_features, gate)
+            rgb_features = rgb_features + F.interpolate(
+                projection(modulated), size=features.shape[-2:],
+                mode="bilinear", align_corners=False,
+            )
+        return self.output(rgb_features)
+
+    def forward(self, images, wrench_history, *, return_aux=False, use_attention_mask=None,
+                future_contact=None):
         """Output RGB only; downstream DINO receives no student token adapter."""
         use_mask = self.high_attention_enabled if use_attention_mask is None else bool(use_attention_mask)
         if use_mask and self.mask_head is None:
@@ -499,15 +665,31 @@ class RenderNet(nn.Module):
             backbone_forward = (self._compiled_backbone_forward
                                 if self._compiled_backbone_forward is not None
                                 and self.training and torch.is_grad_enabled() else self.backbone)
-            raw_residual, features = backbone_forward(image.flatten(0, 1), wrench_tokens, camera)
+            flat_image = image.flatten(0, 1)
+            need_decoder_features = self.spatial_modulation_enabled and self.rendering_mode == "residual"
+            if need_decoder_features:
+                raw_residual, features, decoder_features, fused_features = backbone_forward(
+                    flat_image, wrench_tokens, camera, return_decoder_features=True,
+                )
+            else:
+                raw_residual, features = backbone_forward(flat_image, wrench_tokens, camera)
             residual = (raw_residual if self.rendering_mode == "gaussian_glow"
                         else raw_residual.tanh()).reshape_as(image)
+            flat_mask = self._predict_mask(features, use_mask)
+            if self.rendering_mode == "residual":
+                # Recompute the RGB head from the frozen gate features.  The
+                # old backbone output is still the checkpoint-visible RGB
+                # head, while no RGB-stage parameter belongs to the gate path.
+                flat_gate = torch.where(
+                    flat_mask > self.region_threshold, flat_mask,
+                    torch.zeros_like(flat_mask),
+                ) if use_mask else flat_mask
+                residual = self._rgb_residual(
+                    features, decoder_features if need_decoder_features else (),
+                    fused_features if need_decoder_features else features, flat_gate,
+                ).tanh().reshape_as(image)
             if use_mask:
-                logits = self.mask_head(features)
-                if self.region_activation == "relu":
-                    mask = F.relu(logits).clamp(max=1.0)
-                else:
-                    mask = logits.float().sigmoid()
+                mask = flat_mask
                 gate = mask
                 if self.region_selection == "binary_top_percentile":
                     height, width = image.shape[-2:]
@@ -535,12 +717,29 @@ class RenderNet(nn.Module):
                     gate = torch.where(mask > self.region_threshold, mask, torch.zeros_like(mask))
                 render_gate = gate.detach() if self.detach_intensity_for_rgb else gate
                 residual = residual * render_gate.reshape(batch, steps, 1, *image.shape[-2:])
+            else:
+                render_gate = torch.ones_like(residual[:, :, :1])
+            if future_contact is None:
+                contact_gate = torch.ones(batch, steps, 1, 1, 1,
+                                          device=image.device, dtype=image.dtype)
+            else:
+                contact_gate = future_contact
+                if contact_gate.ndim == 3:
+                    contact_gate = contact_gate.any(dim=-1)
+                if contact_gate.ndim != 2 or contact_gate.shape != (batch, steps):
+                    raise ValueError("future_contact must have shape [B, To] or [B, To, K]")
+                contact_gate = contact_gate.to(device=image.device, dtype=image.dtype).reshape(
+                    batch, steps, 1, 1, 1,
+                )
+            residual = residual * contact_gate
             if self.rendering_mode == "gaussian_glow":
                 # Positive optical exposure gives smooth bounded brightening without clamp saturation.
                 strength = -torch.expm1(-self.residual_scale * residual)
                 rendered[key] = (image.float() + (1 - image.float()) * strength).to(image.dtype)
             else:
                 rendered[key] = (image + self.residual_scale * residual).clamp(0, 1)
+            if future_contact is not None:
+                rendered[key] = torch.where(contact_gate > 0, rendered[key], image)
         return (rendered, masks) if return_aux else rendered
 
 

@@ -119,8 +119,12 @@ def load_render_net(checkpoint, device=None):
 def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, use_attention_mask=None):
     """Use the same physical gating and normalization as teacher and student training."""
     images = {key: obs[key][:, :n_obs_steps] for key in image_keys}
-    wrench, _, _ = preprocessor(obs)
-    return images, model(images, wrench, use_attention_mask=use_attention_mask)
+    wrench, contact, future_contact = preprocessor(obs)
+    contact_gate = future_contact if future_contact is not None else contact
+    return images, model(
+        images, wrench, future_contact=contact_gate,
+        use_attention_mask=use_attention_mask,
+    )
 
 
 def _to_rgb(values):
@@ -282,7 +286,7 @@ def run(args):
             "rendered_rgb": (
                 "1 - (1 - original) * exp(-residual_scale * region_weight * Gaussian glow); no display amplification"
                 if getattr(model, "rendering_mode", "residual") == "gaussian_glow" else
-                "clamp(original + residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
+                "clamp(original + future_contact * residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
             ),
             "difference_rgb": "clip(0.5 + difference_gain * (rendered - original), 0, 1); signed RGB delta centered at gray, not attention",
             "stats_scope": "displayed cameras and latest observation; RGB units in [0,1], before video encoding",
