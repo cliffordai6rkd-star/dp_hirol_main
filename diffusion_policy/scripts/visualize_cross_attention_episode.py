@@ -691,6 +691,15 @@ def run(
                     obs_step=-1,
                     query_mode=args.attention_query,
                 )
+            # A gated teacher may compute CA for the full forward pass and
+            # discard it in the pure-visual bypass. Do not visualize the
+            # discarded attention as if it affected the returned context.
+            if getattr(policy, "contact_fusion_gate", False):
+                _, _, _, future_has_contact = policy.prepare_context_inputs(obs)
+                if future_has_contact is None:
+                    raise RuntimeError("Contact-gated visualization requires future contact data")
+                if not bool(future_has_contact[0, -1].item()):
+                    attention = {key: torch.zeros_like(value) for key, value in attention.items()}
             camera_records = []
             tau = sample["obs"].get("tau_ext")
             tau_value = float(tau[-1].abs().sum()) if tau is not None else float("nan")

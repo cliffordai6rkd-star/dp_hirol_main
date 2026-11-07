@@ -30,6 +30,8 @@ class TinyEncoder(nn.Module):
         self.backbone = nn.Conv2d(3, 4, 1)
         self.image_keys = ("side",)
         self.patch_counts = {"side": 4}
+        self.wrench_history_steps = 1
+        self.max_obs_steps = 1
 
     def encode_image_context(self, images, *, input_grad=False):
         image = images["side"][:, 0]
@@ -62,6 +64,8 @@ class TinyPreprocessor(nn.Module):
 
 class TinyRenderer(nn.Module):
     backbone_name = "test"
+    image_encoder_name = "test"
+    wrench_encoder_name = "test"
 
     def __init__(self):
         super().__init__()
@@ -108,7 +112,8 @@ def _config(root):
     cfg.training.compile.enabled = False
     cfg.training.num_epochs = 1
     cfg.training.max_grad_norm = 1e6
-    cfg.render_net.architecture_version = 1
+    # This fixture replaces both networks; its teacher has no LSTM to copy.
+    cfg.render_net.initialize_wrench_from_teacher = False
     cfg.render_net.high_attention_render.enabled = False
     cfg.logging.progress_bar = False
     cfg.logging.plot_every_steps = 0
@@ -132,6 +137,7 @@ def _exercise_real_renderer(rank):
             image_keys=("side", "wrist"), conv_block="bottleneck",
             rendering_mode=rendering_mode, glow={"num_blobs": 3},
             patch_size=2, embed_dim=8, image_self_attn_layers=1, cross_attn_layers=1, num_heads=2,
+            decoder_layers=1,
             high_attention_render={"enabled": compile_backbone or rendering_mode == "gaussian_glow"},
         )
         encoder = nn.Conv2d(3, 4, 1).eval().requires_grad_(False)

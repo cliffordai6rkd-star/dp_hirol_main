@@ -14,7 +14,8 @@ CPU tiny/mock DINO，无预训练模型下载或训练数据依赖。
 - 纯视觉旁路的 attention/残差重放：`diffusion_policy/scripts/` 下的
   `checkpoint_attention_capture.py`、`image_query_attention_capture.py`、
   `fusion_visual_attention_trace.py`、`visualize_wrench_effect_episode.py`、
-  `visualize_wrench_action_sensitivity_episode.py`。
+  `visualize_wrench_action_sensitivity_episode.py`、
+  `visualize_cross_attention_episode.py`。
 - 配置：`diffusion_policy/config/sim_force_aware_dp_train.yaml` 和新增
   `sim_force_aware_dp_train_20hz_lstm2_gripper_contact_gate.yaml`。
 - 测试：`tests/test_contact_fusion_gate.py`、`tests/test_contact_fusion_gate_integration.py`。

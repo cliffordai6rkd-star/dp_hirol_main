@@ -1,5 +1,7 @@
 # 训练 Docker
 
+通过 U 盘迁移当前源码、数据和本地 DINO，并在目标主机多卡训练新版教师及学生，使用 [U 盘迁移说明](PORTABLE_CN.md)。该入口会自动衔接两阶段。
+
 镜像内包含项目源码、Python 3.10、CUDA 12.8 PyTorch、LeRobot 和 TorchCodec。服务器只需要 Docker Compose v2、NVIDIA 驱动和 NVIDIA Container Toolkit。数据、DINOv3 权重和 checkpoint 通过 Compose 挂载，不打进镜像。
 
 ## 本机构建和打包

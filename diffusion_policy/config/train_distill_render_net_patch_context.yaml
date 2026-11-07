@@ -20,7 +20,7 @@ render_net:
     selection: soft
     activation: sigmoid
     initial_strength: 0.1
-    threshold: 0.0
+    threshold: 0.5
     baseline: raw_zero
     normalization: image_minmax
     strength_scale: null

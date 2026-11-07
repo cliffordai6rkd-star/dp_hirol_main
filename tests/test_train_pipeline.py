@@ -172,6 +172,43 @@ def test_dry_run_creates_nothing_and_builds_ddp_commands(repository, tmp_path, c
     assert str(output / "dp/checkpoints") not in printed
 
 
+def test_all_launches_two_real_torchrun_stages_and_hands_off_checkpoint(repository, tmp_path):
+    # Run real launchers and collectives; replace expensive training with a
+    # checkpoint marker to exercise the parent/worker boundary and stage order.
+    script = '''
+import json, os, sys
+from pathlib import Path
+import torch.distributed as dist
+dist.init_process_group('gloo')
+rank = dist.get_rank()
+def override(key):
+    return json.loads(next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith(key+'=')))
+output = Path(override('hydra.run.dir'))
+is_teacher = Path(__file__).name == 'sim_force_aware_dp_train.py'
+if not is_teacher:
+    checkpoint = Path(override('teacher_checkpoint'))
+    assert checkpoint.read_text() == 'teacher complete'
+if rank == 0:
+    (output/'checkpoints').mkdir()
+    (output/'checkpoints/latest.ckpt').write_text('teacher complete' if is_teacher else 'student complete')
+(output/f'rank{rank}.json').write_text(json.dumps({'rank': rank, 'world_size': dist.get_world_size()}))
+dist.barrier()
+dist.destroy_process_group()
+'''
+    for name in ("sim_force_aware_dp_train.py", "train_distill_render_net.py"):
+        (repository / name).write_text(script)
+    output = tmp_path / "two_rank_pipeline"
+    args = pipeline.make_parser().parse_args([
+        "all", "--nproc-per-node", "2", "--gpus", "0,1", "--output-dir", str(output),
+    ])
+    plan = pipeline.run_pipeline(args, repository)
+    assert plan["status"] == "completed"
+    for name in ("teacher", "student"):
+        for rank in range(2):
+            worker = json.loads((output / name / f"rank{rank}.json").read_text())
+            assert worker == {"rank": rank, "world_size": 2}
+
+
 @pytest.mark.parametrize("arguments,message", [
     (["distill"], "requires --teacher"),
     (["all", "--dp-override", "hydra.run.dir=elsewhere"], "--output-dir"),

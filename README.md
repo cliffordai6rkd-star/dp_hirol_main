@@ -231,10 +231,10 @@ wrench encoder 或融合 cross-attention，DINO 后也不添加学生专用的 t
 或 adapter。去噪输出蒸馏再将此 context 送入共享冻结 DiT。
 三种渲染骨干的输出头和权重布局不同，切换模式需新开训练。
 
-教师与 RenderNet 共享同一套 wrench 预处理：按 `tau_ext` 判定接触、沿
-`future_tau_ext` 进行未来接触状态推演、用首个接触 wrench 填充未来窗口的自由
-前缀，再使用教师 checkpoint 的 normalizer。整个未来窗口无接触时，归一化后的
-wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`，不再直接
+教师与 RenderNet 共享同一套 wrench 预处理：按 `tau_ext` 判定当前接触，按配置的
+`future_contact_mode` 从 `future_phase_wrench_key` 生成未来标签，用首个接触 wrench
+填充未来窗口的自由前缀，再使用教师 checkpoint 的 normalizer。整个未来窗口无接触时，
+归一化后的 wrench 严格置零。学生训练直接调用教师的 `prepare_context_inputs`，不再直接
 归一化原始 `future_wrench`。`tau_ext/future_tau_ext` 仅用于同教师一致的门控，
 不作为额外的可学习输入。教师的融合 token 监督目标保持不变。
 网络不额外按零 wrench 或接触标签硬切渲染，而是学习下述连续强度场。
@@ -276,7 +276,7 @@ RGB 像素恒等，学生仍通过现有蒸馏目标学习渲染。
 学生从 RGB+wrench 融合后的全分辨率解码特征直接预测像素强度场，默认
 `activation=sigmoid`；学生强度头无需从 patch 网格插值。`render_net.high_attention_render.threshold`
 控制渲染阈值：`M > threshold` 保留原强度，其余位置置零后乘 RGB 残差。
-当前 patch-context 配置为 `0.1`；旧 checkpoint 未配置该字段时按 `0.0` 处理。
+当前 patch-context 配置为 `0.5`；旧 checkpoint 未配置该字段时按 `0.0` 处理。
 阈值在像素强度上应用，关闭位置严格保持原图。训练和推理使用同一规则；
 Region MSE 仍监督阈值处理前的预测场，因此关闭区域仍可通过区域监督恢复。
 渲染现有 checkpoint 时可给 `visualize_render_net_episode.py` 传入 `--threshold 0.1`。
@@ -558,14 +558,14 @@ python diffusion_policy/scripts/visualize_render_net_episode.py \
 输出位于该训练目录的 `attention_visualize/`：
 
 - `render_net_episode_50_both_comparison.mp4`：每个相机一行，依次为原始 RGB、
-  叠加残差后的 RGB、RGB 差异（默认放大 5 倍，灰色表示零差异）。
+  叠加残差后的 RGB、RGB 差异（默认不放大，灰色表示零差异）。
 - `render_net_episode_50_both_rendered.mp4`：仅展示叠加后的真实 RGB，双相机横向拼接。
 - 同名前缀的预览 PNG、差异统计 NPZ 和记录 checkpoint／帧率／相机的 metadata JSON。
 
 默认逐帧处理完整 episode，以数据集原始帧率输出连续视频；只展示每个窗口的
 最后一帧观测。`--camera wrist` 或 `--camera side` 可选择展示的相机，推理仍输入
-所有相机。`--difference-gain 10` 仅调整差异栏的放大倍数，原图和渲染结果均不
-放大。`--save-frames` 可额外保存逐帧 PNG；`--stride 2` 可隔帧处理并自动按比例
+所有相机。`--difference-gain 5` 可将差异栏放大 5 倍，原图和渲染结果均不放大。
+`--save-frames` 可额外保存逐帧 PNG；`--stride 2` 可隔帧处理并自动按比例
 降低视频帧率，保持原始播放速度。默认视频后端为 `pyav`，可用 `--device cpu`
 在 CPU 上推理。
 主干和区域头从 checkpoint 配置自动恢复。区域头启用训练的模型，在推理命令中
@@ -1518,9 +1518,9 @@ export LD_LIBRARY_PATH="$NPP_LIB:${LD_LIBRARY_PATH:-}"
 `requirements/uv-common-py310-lerobot.txt`、`conda_environment.yaml` 和
 `docker/Dockerfile`。`pyproject.toml` 只定义 PEP 517 构建后端和 pytest 配置。
 
-需要把训练环境搬到服务器时，使用 [docker/DOCKER_CN.md](docker/DOCKER_CN.md) 构建并导出镜像，
-再通过 Compose 挂载数据、DINOv3 权重和 checkpoint。Compose 默认直接启动当前 RenderNet token MSE
-蒸馏，也可以用 `TRAIN_COMMAND` 覆盖为 FDP 或其他 Hydra 训练命令。
+需要通过 U 盘把当前源码、数据和本地 DINO 搬到多卡主机，按 [docker/PORTABLE_CN.md](docker/PORTABLE_CN.md)
+安装后执行 `bash docker/run_portable.sh check`，再执行 `bash docker/run_portable.sh all`，自动训练新版门控教师并蒸馏学生。
+镜像构建与手动挂载方式见 [docker/DOCKER_CN.md](docker/DOCKER_CN.md)。
 
 ## DINOv3 权重
 

@@ -50,8 +50,8 @@ def parse_args(argv=None, *, checkpoint_required=True, episode_required=True):
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--fps", type=float, help="Default: dataset FPS divided by stride.")
     parser.add_argument("--video-codec", choices=("h264", "av1", "mpeg4"), default="h264")
-    parser.add_argument("--difference-gain", type=float, default=5.0,
-                        help="Magnification for the signed RGB difference panel only (default: 5).")
+    parser.add_argument("--difference-gain", type=float, default=1.0,
+                        help="Magnification for the signed RGB difference panel only (default: 1).")
     parser.add_argument("--save-frames", action="store_true", help="Also save PNGs for every video frame.")
     parser.add_argument("--disable-high-attention-render", action="store_true",
                         help="Bypass a trained region head and apply the residual across the full image.")

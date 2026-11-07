@@ -1,0 +1,32 @@
+# Use the exported runtime image with the copied project, data and model files.
+services:
+  trainer:
+    image: diffusion-policy:train
+    pull_policy: never
+    working_dir: /workspace
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    init: true
+    ipc: host
+    gpus:
+      - driver: nvidia
+        count: all
+    stop_grace_period: 30s
+    environment:
+      PYTHONPATH: /workspace
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      HF_HOME: /workspace/.cache/huggingface
+      MPLCONFIGDIR: /tmp/matplotlib
+      WANDB_MODE: offline
+      WANDB_DIR: /workspace/data/wandb
+      DINOV3_MODEL_PATH: /workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
+      NPROC_PER_NODE: ${NPROC_PER_NODE:-}
+      TRAIN_GPUS: ${TRAIN_GPUS:-}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      - ..:/workspace
+    command: ["bash", "scripts/train_portable.sh", "all"]
