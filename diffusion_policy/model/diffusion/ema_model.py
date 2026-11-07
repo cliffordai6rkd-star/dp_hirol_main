@@ -52,6 +52,27 @@ class EMAModel:
         for key in self.state_dict():
             setattr(self, key, state_dict[key])
 
+    @torch.no_grad()
+    def sync_parameters(self, new_model, *, frozen_only=False):
+        """Copy parameters whose stage ownership just changed.
+
+        EMA intentionally skips parameters that are frozen in ``new_model``
+        during normal updates.  A staged model can freeze a branch after EMA
+        has accumulated a different historical value, though.  Synchronizing
+        that branch at the boundary keeps online and evaluation models on the
+        same gate snapshot.  ``frozen_only=False`` is useful when a stage
+        transition explicitly reinitializes the newly trainable branch.
+        """
+        for parameter, ema_parameter in zip(new_model.parameters(), self.averaged_model.parameters()):
+            if frozen_only and parameter.requires_grad:
+                continue
+            ema_parameter.copy_(parameter.to(dtype=ema_parameter.dtype))
+
+    @torch.no_grad()
+    def sync_frozen_parameters(self, new_model):
+        """Synchronize only parameters frozen in the online model."""
+        self.sync_parameters(new_model, frozen_only=True)
+
     def get_decay(self, optimization_step):
         """
         Compute the decay factor for the exponential moving average.

@@ -17,7 +17,9 @@ class MetricHistory:
     """Keep only plotted numbers; full records remain in the JSON log."""
 
     step_keys = ("train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
-                 "train_mask_mse", "train_loss", "grad_norm", "lr",
+                 "train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                 "train_contact_open_ratio", "train_open_token_mse", "train_closed_token_mse",
+                 "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
                  "initial_train_mse")
 
@@ -104,6 +106,12 @@ def save_training_plot(history, destination):
         curve(axes[2], "train_demo_mse", "Demonstration loss", linewidth=0.8, alpha=0.65)
     curve(axes[2], "train_mask_mse", "Region MSE", linewidth=0.9)
     curve(axes[2], "train_loss", "Total loss", linewidth=0.9)
+    curve(axes[2], "train_contact_open_ratio", "Contact open ratio", linewidth=0.8,
+          color="tab:orange", alpha=0.8)
+    curve(axes[2], "train_open_token_mse", "Open-window token MSE", linewidth=0.8,
+          color="tab:green", alpha=0.8)
+    curve(axes[2], "train_closed_token_mse", "Closed-window token MSE", linewidth=0.8,
+          color="tab:red", alpha=0.8)
     curve(axes[3], "grad_norm", "Gradient norm before clipping", color="tab:purple", linewidth=0.8)
     curve(axes[4], "lr", "Learning rate", color="tab:green")
     curve(axes[5], "gpu_allocated_mib", "GPU allocated", factor=1 / 1024, color="tab:blue")

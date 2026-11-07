@@ -37,6 +37,7 @@ render_net:
     base_channels: 32
     conv_block: bottleneck
   rendering_mode: residual
+  separate_gate_path: true # Keep the gate representation independent from the RGB encoder/decoder.
   spatial_modulation:
     enabled: true # RGB-only /8 and /4 spatial gamma/beta modulation.
   patch_residual_refine: true # Used only by the optional patch_residual ablation.
