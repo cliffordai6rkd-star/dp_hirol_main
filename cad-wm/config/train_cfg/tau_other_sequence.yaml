@@ -1,0 +1,208 @@
+deployment_contract:
+  version: tau_other_online_v1
+
+  controller:
+    firmware: V120
+    follower_kp: [4.0, 5.0, 2.0, 3.5, 2.0, 2.0, 3.0]
+    follower_kd: [0.1, 0.1, 0.25, 0.25, 0.1, 0.1, 0.1]
+
+  source_preprocessing:
+    source_sample_rate_hz: 100.0
+
+    filter:
+      contract: causal_variable_dt_butterworth_lowpass_v1
+      enabled: true
+      keys: [q, dq, tau, q_cmd]
+      cutoff_hz: 15.0
+      order: 2
+      discretization: trapezoidal_tustin
+      initialization: steady_first_sample
+
+    downsample:
+      mode: index_stride
+      stride: 2
+      phase: 0
+      output_sample_rate_hz: 50.0
+
+    derived_features:
+      delta_q: filtered_q_cmd-filtered_q
+
+  model:
+    horizon: 50
+    inputs: [q, dq, delta_q]
+    target: tau_other
+    target_formula: tau_other=tau_filtered-tau_id
+
+
+dataloader:
+  repo_id: bg_data_filted_a_lbv3
+  root: data/train_episode/bg_data_filted_a_lbv3
+  load_images: false
+  video_backend: torchcodec
+  filter_sample_rate_hz: 50
+
+  # The dual-phase B dataset is stored on a uniform 50 Hz LeRobot timeline.
+  horizon: 50
+  # NEXT-style samples contain 50 real frames; do not train on zero-padded starts.
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    # tau is the measured torque field used by tau_other target generation.
+    tau: observation.torque
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    - delta_q
+    - tau
+    - tau_other
+
+  # tau is observation.torque; tau_other uses it directly on the dataset's
+  # 50 Hz timeline.
+  filter_timestamp_key: timestamp
+  filter_timestamp_unit: s
+  filters:
+    q:
+      enabled: false
+      operations: []
+    dq:
+      enabled: false
+      operations: []
+    tau:
+      enabled: false
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+
+# Build supervision once from each complete episode before normalization and
+# mini-batch sampling. This resolved contract is also stored in every checkpoint.
+target_generation:
+  enabled: true
+  method: causal_rnea_residual_v1
+  target_key: tau_other
+  timestamp_key: timestamp
+  timestamp_unit: s
+  source_keys: {q: q, dq: dq, tau: tau}
+  dq_sign: [1, 1, 1, 1, 1, 1, 1]
+  torque_filter_key: tau
+  # Forward-only q/dq state estimator. Its causal ddq estimate is passed to
+  # Pinocchio RNEA; no future frames or RTS backward smoothing are used.
+  state_estimator:
+    position_std: 5.0e-4
+    velocity_std: 3.0e-2
+    jerk_std: 2.0
+    initial_position_std: 1.0e-2
+    initial_velocity_std: 2.0e-1
+    initial_acceleration_std: 5.0
+    max_gap_s: 0.1
+
+model:
+  # Every sample is an independent 50-frame q/dq/delta_q window.
+  history_mode: stateless_sliding_window
+  architecture: lstm
+  # tcn_kernel_size: 2
+  # tcn_dilations: [1, 2, 4, 8, 16, 18]
+
+  # Remove entries here to run input ablations without changing code.
+  inputs:
+    - q
+    - dq
+    - delta_q
+    - tau
+
+
+  input_dims:
+    q: 7
+    dq: 7 
+    tau: 7
+    delta_q: 7
+
+  output_dim: 7
+  target_key: tau_other
+  target_contract: causal_rnea_residual_v1
+
+
+  hidden_dim: 128
+  # Retained for backward-compatible recurrent ablations; ignored by the TCN.
+  num_layers: 2
+  # NEXT head: recurrent hidden 128 -> MLP hidden 256 -> 7 torques.
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+
+loss:
+  # Ordinary seven-axis MSE in normalized target space. The tau_other rollout below
+  # is visualization-only and does not add a wrench term to this training loss.
+  type: mse
+  # Optional per-joint weights, for example: [1, 1, 1, 1, 1, 1, 1].
+  joint_weights: [1, 1, 1, 1, 1, 1, 1]
+
+# Offline visualization replays observation.torque-tau_id before mapping tau_ext
+# to the gripper-frame wrench.
+rollout:
+  measured_tau_already_filtered: true
+
+physics:
+  wrench_damping: 0.02
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+train:
+  device: cuda:0
+  # The low-dimensional cache is device-resident; workers only emit indices.
+  batch_size: 512
+  num_workers: 2
+  # val_ratio: 0.1
+
+  # Random windows keep mixed motion regimes represented on both sides. This
+  # is an interpolation/checkpoint-ranking split, not an unbiased generalization test.
+  split_mode:  episode
+  val_episode_indices: [2]
+  seed: 42
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+
+  # Re-run the final epoch model in eval mode on the train split. This roughly
+  # doubles epoch inference work, but separates dropout noise from split bias.
+  train_eval:
+    enabled: true
+
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 5
+    min_lr: 1.0e-5
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 10
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_other_sequence/ep4
+  monitor_key: val_loss
+  top_k: 5
+
+  ema:
+    enabled: false
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+
+  wandb:
+    enabled: false
+    project: next
+    name: tau-other-tcn-h50-sample-mse
+    mode: online
+    log_every_steps: 10

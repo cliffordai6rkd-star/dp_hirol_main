@@ -1,0 +1,76 @@
+# RobotMotion + Franka automatic AprilTag calibration collection.
+# Edit this file instead of passing long command-line arguments.
+
+robot:
+  # This can be either a RobotMotion wrapper config or a raw MotionFactory config.
+  # This left-FR3 config contains the two cameras used for calibration.
+  motion_config: "factory/components/motion_configs/left_fr3_with_pika_ati_ik.yaml"
+
+  # Safety default: false means the robot will not physically move.
+  # Set true only after checking workspace, tag visibility, and emergency stop.
+  execute_hardware: true
+
+  # When execute_hardware is false, keep this false to avoid saving repeated dry-run samples.
+  # Set true only for debugging image/tag detection and JSON output.
+  dry_run_record: false
+
+  # model: RobotMotion FK pose, consistent with platform motion model.
+  # hardware: direct Panda get_pose() if available.
+  pose_source: "model"
+
+  # Keep false when an AprilTag is attached to the gripper.
+  # PikaGripper.initialize() opens the gripper to max width, so calibration disables it by default.
+  initialize_gripper: false
+
+camera:
+  # Must exactly match one name in motion_config sensor_dicts.cameras.
+  # Current left_fr3_with_pika_ati_ik.yaml examples: ee_cam, third_person_cam.
+  name: "third_person_cam"
+  # eye_in_hand: camera mounted on Franka end-effector, fixed AprilTag in scene.
+  # eye_to_hand: fixed external camera, AprilTag mounted on Franka end-effector.
+  cali_type: "eye_to_hand"
+  warmup: 1.0
+  display: true
+
+tag:
+  family: "tag36h11"
+  size: 0.1
+  # null means use the largest visible tag.
+  id: null
+
+workspace:
+  # Number of target poses in x/y/z. 3*3*2 = 18 poses by default.
+  grid_size: [4, 4, 3]
+
+  # Grid spacing in meters.
+  spacing: [0.02, 0.02, 0.02]
+
+  # null means use current TCP position as grid center.
+  # Example fixed center: [0.35, 0.0, 0.45]
+  center: null
+
+  # null means use current TCP orientation as base orientation.
+  # Otherwise set [roll, pitch, yaw] in degrees.
+  base_rpy_deg: null
+
+  # Random orientation perturbation around the base orientation, in degrees.
+  orientation_randomness: 12.0
+  seed: 0
+
+collection:
+  # Wait time after sending each target pose before capturing an image.
+  settle_time: 2.5
+
+  # If no AprilTag is detected at a target pose, retry after this interval.
+  # The pose is counted only after a valid detection is saved.
+  retry_interval: 0.2
+
+  # Key used in the OpenCV preview window to stop early.
+  stop_key: "q"
+
+output:
+  # null creates pointcloud/calibration_v2/robotmotion_runs/<timestamp>/
+  dir: pointcloud/calibration_v2/third_person_cam_d455/
+
+  # null writes data_<camera_name>.json.
+  json_name: null

@@ -1,0 +1,149 @@
+dataloader:
+  # Read the collection output directly. No LeRobot conversion, interpolation,
+  # reindexing, or second resampling is performed.
+  backend: h5
+  root: ../nero_ws/runs/next_data_raw
+
+  h5_patterns: ["*.h5", "*.hdf5"]
+  h5_timestamp_path: teleop/timestamp_us
+  h5_timestamp_output_key: timestamp
+  h5_timestamp_unit: us
+  h5_timestamp_output_unit: s
+
+  expected_fps: 100
+  max_cadence_error_s: 1.0e-6
+
+  contact_free: true
+  load_images: false
+
+  horizon: 50
+
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    tau: observation.torque
+
+  # Each output column is read at the exact same H5 row as timestamp_us.
+  # delta_q is computed pointwise; it has no independent alignment step.
+  h5_fields:
+    observation.joint: teleop/q_follower
+    observation.velocity: teleop/dq_follower
+    observation.delta_q:
+      operation: subtract
+      paths: [teleop/q_cmd, teleop/q_follower]
+    observation.torque: teleop/tau_follower
+
+  # Inputs and outputs stay normalized for conditioning and model numerics.
+  # The loss below explicitly denormalizes tau before computing seven-axis MSE.
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, dq, delta_q, tau]
+
+  # Purely causal, episode-local preprocessing. Operations run in listed order
+  # and are saved in the checkpoint for online replay.
+  filter_timestamp_key: timestamp
+  filters:
+    q:
+      enabled: false
+      operations: []
+    dq:
+      enabled: false
+      operations: []
+    delta_q:
+      enabled: false
+      operations: []
+    tau:
+      enabled: true
+      # next_data_raw predates raw collection and already contains the 10 Hz
+      # low-pass. Training applies only the remaining median stage; deployment
+      # replays the complete chain below on new raw torque.
+      dataset_preprocessed_operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+        - {type: median, window: 3}
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: lstm
+  inputs: [q, dq, delta_q]
+  input_dims:
+    q: 7
+    dq: 7
+    delta_q: 7
+  output_dim: 7
+  target_key: tau
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+loss:
+  type: mse
+  # Compute MSE_j in Nm^2 for each joint, then average the seven values.
+  # With joint_weights=null, an equal absolute Nm error has equal cost on all axes.
+  torque_loss_space: physical_nm
+  # Options: equal, mean_abs, max_abs, manual. Automatic modes use train split only.
+  joint_weight_mode: manual
+  joint_weights: [1, 2.5, 1, 2.5, 1, 1, 1]
+  # joint_weights: null
+  tau_weight: 1
+  wrench_weight: 0
+  force_scale_n: 1
+  moment_scale_nm: 1
+
+
+physics:
+  wrench_damping: 0.01
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+train:
+  device: cuda:0
+  batch_size: 1024
+  num_workers: 4
+  # Hold out the two lowest-speed trajectories explicitly. This overrides the
+  # random episode choice that val_ratio and seed would otherwise make.
+  # val_ratio: 0.2
+  split_mode: episode
+  val_episode_indices: [7, 8, 31, 32]
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 5
+    # This value is now in Nm^2 because the monitored metric is physical MSE.
+    min_delta: 1.0e-5
+
+  # Keep this 50 Hz A/B-aligned run separate from earlier incompatible runs.
+  output_dir: outputs/tau_free_sequence/final_v
+  monitor_key: val_tau_mse_nm2
+  scheduler_monitor_key: val_tau_mse_nm2
+  early_stopping_monitor_key: val_tau_mse_nm2
+  top_k: 5
+
+  ema:
+    enabled: false
+
+  wandb:
+    enabled: false

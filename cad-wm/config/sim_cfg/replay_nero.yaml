@@ -1,0 +1,31 @@
+# Nero joint trajectory replay.
+
+# MuJoCo model.
+model_path: sim_mesh/nero/nero_with_gripper.urdf
+show_sim: true
+print_info: false
+save_mjcf: false
+output_path: sim_mesh/nero/nero_with_gripper.compiled.xml
+sim_frequency: 500.0
+
+# Playback behavior. Set quick_replay to true to skip real-time frame delays.
+quick_replay: false
+pause_between_episodes: true
+arm_joint_names:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - joint5
+  - joint6
+  - joint7
+
+# Local LeRobot v3 dataset.
+root: data/train_episode/nero_master_slave_lerobotv3
+repo_id: nero_master_slave_lerobotv3
+video_backend: torchcodec
+q_key: observation.joint
+
+# Episode numbers are 1-based and both bounds are inclusive.
+episode_start: 1
+episode_end: 4

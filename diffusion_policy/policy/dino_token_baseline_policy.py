@@ -50,7 +50,7 @@ class DinoTokenBaselinePolicy(ForceAwareDiffusionTransformerPolicy):
                 obs_dict[self.wrench_key][:, :self.n_obs_steps]
             )
         self.last_curriculum_metrics = {
-            "curriculum/mask_probability": 0.0,
-            "curriculum/masked_image_fraction": 0.0,
+            "curriculum/blur_sigma": 0.0,
+            "curriculum/blurred_image_fraction": 0.0,
         }
         return self.obs_encoder(images=images, wrench_history=wrench)

@@ -1,0 +1,79 @@
+dataloader:
+  repo_id: xarm_bg_lbv3
+  root: data/train_episode/xarm_bg_lbv3
+  load_images: false
+  video_backend: torchcodec
+  contact_free: true
+  horizon: 50
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    tau: observation.torque
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, dq, delta_q, tau]
+  filter_timestamp_key: timestamp
+  filters:
+    q: {enabled: false, operations: []}
+    dq: {enabled: false, operations: []}
+    delta_q: {enabled: false, operations: []}
+    tau: {enabled: false, operations: []}
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: lstm
+  inputs: [q, dq, delta_q]
+  input_dims: {q: 7, dq: 7, delta_q: 7}
+  output_dim: 7
+  target_key: tau
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+
+loss:
+  type: mse
+  torque_loss_space: physical_nm
+  joint_weight_mode: equal
+  joint_weights: null
+  tau_weight: 1
+  wrench_weight: 0
+  force_scale_n: 1
+  moment_scale_nm: 1
+
+train:
+  device: cuda:0
+  batch_size: 512
+  num_workers: 4
+  # Episodes 2 and 3 are both arms from the second recording.
+  split_mode: episode
+  val_episode_indices: [2, 3]
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 5
+    min_delta: 1.0e-5
+  output_dir: outputs/tau_free_sequence/xarm_bg_lstm
+  monitor_key: val_tau_mse_nm2
+  scheduler_monitor_key: val_tau_mse_nm2
+  early_stopping_monitor_key: val_tau_mse_nm2
+  top_k: 5
+  ema: {enabled: false}
+  wandb: {enabled: false}

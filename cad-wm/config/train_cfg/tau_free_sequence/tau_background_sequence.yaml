@@ -1,0 +1,153 @@
+dataloader:
+  repo_id: bg_data_filted_a_lbv3
+  root: data/train_episode/bg_data_filted_a_lbv3
+  load_images: false
+  video_backend: torchcodec
+
+  # Raw-index data is nominally 99 Hz, so 50 steps cover about 0.5 seconds.
+  horizon: 25
+  # Skip the first 49 targets so every sample has 50 real history frames.
+  pad_history: false
+
+  contact_free: true
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    ddq: observation.ddq
+    delta_q: observation.delta_q
+    # tau_id: observation.tau_id
+    # tau_other: observation.tau_other
+    tau: observation.torque
+
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    # - ddq
+    # - tau_id
+    - delta_q
+    # - tau_other
+    - tau
+
+  # Purely causal, episode-local preprocessing. Operations run in listed order
+  # and are saved in the checkpoint for online replay.
+  filter_timestamp_key: timestamp
+  filters:
+    q:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    dq:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    delta_q:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    tau:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: lstm
+  inputs: [
+    q, 
+    dq, 
+    # ddq, 
+    delta_q,
+    # tau_id,
+    # tau_other
+    ]
+  input_dims:
+    q: 7
+    dq: 7
+    # ddq: 7
+    # tau_id: 7
+    # tau_other: 7
+    delta_q: 7
+  output_dim: 7
+  target_key: tau
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+loss:
+  type: mse
+  # Compute MSE_j in Nm^2 for each joint, then average the seven values.
+  # With joint_weights=null, an equal absolute Nm error has equal cost on all axes.
+  torque_loss_space: physical_nm
+  # Options: equal, mean_abs, max_abs, manual. Automatic modes use train split only.
+  joint_weight_mode: equal
+  # joint_weights: [5, 10, 5, 7.5, 1, 1, 1]
+  joint_weights: null
+  tau_weight: 1
+  wrench_weight: 0
+  force_scale_n: 1
+  moment_scale_nm: 1
+
+
+physics:
+  wrench_damping: 0.01
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+train:
+  device: cuda:0
+  batch_size: 256
+  num_workers: 1
+  # Hold out three independent, gap-free source recordings whose aggregate
+  # input/target statistics best match the remaining training episodes.
+  # val_ratio: 0.2
+  split_mode: episode
+  val_episode_indices: [2]
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 5
+    # This value is now in Nm^2 because the monitored metric is physical MSE.
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_free_sequence/pure_teleop_1
+  monitor_key: val_tau_mse_nm2
+  scheduler_monitor_key: val_tau_mse_nm2
+  early_stopping_monitor_key: val_tau_mse_nm2
+  top_k: 2
+
+  ema:
+    enabled: false
+
+  wandb:
+    enabled: false

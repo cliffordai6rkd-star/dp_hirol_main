@@ -49,8 +49,6 @@ def make_policy(mode, *, force_temporal_encoder="none", force_encoder_layers=0, 
         p_drop_attn=0.0, dino_model_name_or_path="unused",
         force_temporal_encoder=force_temporal_encoder,
         force_encoder_layers=force_encoder_layers,
-        # Even a nonzero inherited curriculum must never mask baseline images.
-        mask_schedule={"schedule_type": "constant", "start_probability": 1.0},
     )
     normalizer = LinearNormalizer()
     normalizer.fit({"action": torch.randn(64, 7), "future_wrench": torch.randn(64, 6) + 2})
@@ -78,7 +76,7 @@ def test_visual_baseline_preserves_patches_and_never_reads_force(mode):
     assert first.shape == (2, 24, 16)  # 2 observations x 2 cameras x 6 patches
     torch.testing.assert_close(first, second, rtol=0, atol=0)
     assert not hasattr(policy.obs_encoder, "wrench_projection")
-    assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0
+    assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0
     prediction = policy.predict_action(only_images)
     assert prediction["action"].shape == (2, 8, 7)
 
@@ -221,8 +219,7 @@ def test_baseline_configs_inherit_corrected_data_and_separate_run_names():
             config = compose(config_name=f"baseline_train/train_dp_{name}_insert_usb")
             assert config.name == f"train_dp_{name}_insert_usb"
             assert config.policy.baseline_mode == mode
-            assert config.policy.mask_schedule.start_probability == 0
-            assert config.policy.mask_schedule.end_probability == 0
+            assert config.policy.image_blur_schedule is None
             assert OmegaConf.to_container(config.task.dataset) == OmegaConf.to_container(original.task.dataset)
             assert config.training.num_optimizer_steps > 0
             assert config.training.num_epochs is None

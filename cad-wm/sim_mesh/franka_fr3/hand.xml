@@ -1,0 +1,109 @@
+<mujoco model="franka_hand">
+  <compiler angle="radian" meshdir="assets" autolimits="true"/>
+
+  <default>
+    <default class="hand">
+      <material specular="0.5" shininess="0.25"/>
+      <joint damping="0.3" frictionloss="0.1" armature="0.001"/>
+      <position kp="2000" kv="200"/>
+      <default class="finger">
+        <joint axis="0 1 0" type="slide" range="0 0.04"/>
+      </default>
+      <default class="visual">
+        <geom type="mesh" group="2" contype="0" conaffinity="0"/>
+      </default>
+      <default class="collision">
+        <geom type="mesh" group="3"/>
+        <default class="fingertip_pad_collision">
+          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"/>
+        </default>
+      </default>
+    </default>
+  </default>
+
+  <asset>
+    <material name="white" rgba="1 1 1 1"/>
+    <material name="off_white" rgba="0.901961 0.921569 0.929412 1"/>
+    <material name="black" rgba="0.25 0.25 0.25 1"/>
+
+    <!-- Collision meshes -->
+    <mesh name="hand_c" file="hand.stl"/>
+
+    <!-- Visual meshes -->
+    <mesh file="hand_0.obj"/>
+    <mesh file="hand_1.obj"/>
+    <mesh file="hand_2.obj"/>
+    <mesh file="hand_3.obj"/>
+    <mesh file="hand_4.obj"/>
+    <mesh file="finger_0.obj"/>
+    <mesh file="finger_1.obj"/>
+  </asset>
+
+  <worldbody>
+    <body name="hand_base" quat="0 0 0 1" pos="0 0 0.107">
+      <inertial pos="-0.0000376 0.0119128 0.0207260" 
+                quat="1 0 0 0" 
+                mass="0.6544" 
+                diaginertia="0.00186 0.0003 0.00174"/>
+      
+      <!-- Hand base geometry -->
+      <geom mesh="hand_0" material="off_white" class="visual"/>
+      <geom mesh="hand_1" material="black" class="visual"/>
+      <geom mesh="hand_2" material="black" class="visual"/>
+      <geom mesh="hand_3" material="white" class="visual"/>
+      <geom mesh="hand_4" material="off_white" class="visual"/>
+      <geom mesh="hand_c" class="collision"/>
+      
+      <!-- TCP frame -->
+      <site name="tcp" pos="0 0 0.1034" size="0.005" rgba="1 0 0 0.5"/>
+      
+      <!-- Left finger -->
+      <body name="left_finger" pos="0 0 0.0584">
+        <inertial pos="0 0.0152850 0.0219675" 
+                  quat="1 0 0 0" 
+                  mass="0.0291" 
+                  diaginertia="8.49e-06 8.53e-06 1.77e-06"/>
+        
+        <joint name="finger_joint1" class="finger"/>
+        
+        <!-- Finger visual and collision -->
+        <geom mesh="finger_0" material="off_white" class="visual"/>
+        <geom mesh="finger_1" material="black" class="visual"/>
+        <geom mesh="finger_0" class="collision"/>
+        <geom class="fingertip_pad_collision"/>
+      </body>
+      
+      <!-- Right finger -->
+      <body name="right_finger" pos="0 0 0.0584" euler="0 0 3.141592653589793">
+        <inertial pos="0 0.0152850 0.0219675" 
+                  quat="1 0 0 0" 
+                  mass="0.0291" 
+                  diaginertia="8.49e-06 8.53e-06 1.77e-06"/>
+        
+        <joint name="finger_joint2" class="finger"/>
+        
+        <!-- Finger visual and collision -->
+        <geom mesh="finger_0" material="off_white" class="visual"/>
+        <geom mesh="finger_1" material="black" class="visual"/>
+        <geom mesh="finger_0" class="collision"/>
+        <geom class="fingertip_pad_collision"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <contact>
+    <exclude body1="hand_base" body2="left_finger"/>
+    <exclude body1="hand_base" body2="right_finger"/>
+  </contact>
+
+  <actuator>
+    <position name="finger1" joint="finger_joint1" ctrlrange="0.0 0.04" kp="200" kv="20"/>
+    <position name="finger2" joint="finger_joint2" ctrlrange="0.0 0.04" kp="200" kv="20"/>
+  </actuator>
+
+  <keyframe>
+    <key name="gripper_open" qpos="0.04 0.04" ctrl="0.04 0.04"/>
+    <key name="gripper_closed" qpos="0.0 0.0" ctrl="0.0 0.0"/>
+    <key name="gripper_home" qpos="0.02 0.02" ctrl="0.02 0.02"/>
+  </keyframe>
+</mujoco>

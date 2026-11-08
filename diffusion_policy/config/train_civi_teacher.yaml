@@ -1,0 +1,391 @@
+name: train_civi_teacher
+_target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
+dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
+dino_model_path: model/model/dinov3-vitb16-pretrain-lvd1689m
+task_name: libero_open_top_drawer_put_bowl_20hz_force_aware
+shape_meta:
+  obs:
+    wrist:
+      shape:
+      - 3
+      - 192
+      - 256
+      type: rgb
+    side:
+      shape:
+      - 3
+      - 192
+      - 256
+      type: rgb
+    wrench:
+      shape:
+      - 8
+      - 6
+      type: low_dim
+    future_wrench:
+      shape:
+      - 8
+      - 6
+      type: low_dim
+  action:
+  # xyz + quaternion + gripper
+    shape:
+    - 8
+exp_name: train_civi_teacher
+horizon: 9
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: 2
+free_threshold: 8.0
+contact_threshold: 10.0
+contact_norm: l2
+phase_resampling:
+  enabled: true
+  precontact_seconds: 1.0
+  weights:
+    free: 1.0
+    precontact: 1.0
+    contact: 5.0
+freeze_dino_backbone: true
+freeze_modules: []
+policy:
+  _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
+  shape_meta:
+    obs:
+      wrist:
+        shape:
+        - 3
+        - 192
+        - 256
+        type: rgb
+      side:
+        shape:
+        - 3
+        - 192
+        - 256
+        type: rgb
+      wrench:
+        shape:
+        - 8
+        - 6
+        type: low_dim
+      future_wrench:
+        shape:
+        - 8
+        - 6
+        type: low_dim
+    action:
+      shape:
+      - 8
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  horizon: 9
+  n_action_steps: 8
+  n_obs_steps: 2
+  wrench_key: future_wrench
+  phase_wrench_key: wrench
+  future_phase_wrench_key: future_wrench
+  future_contact_mode: legacy_rollout
+  contact_fusion_gate: false
+  wrench_history_steps: 8
+  relative_pose_actions: false
+  action_reference_key: action_reference
+  num_inference_steps: 8
+  dino_model_name_or_path: model/model/dinov3-vitb16-pretrain-lvd1689m
+  dino_local_files_only: true
+  freeze_dino_backbone: true
+  freeze_modules: []
+  force_temporal_encoder: lstm
+  force_encoder_layers: 2
+  pre_cross_self_attn_layers: 0
+  cross_attn_query: image
+  cross_attn_layers: 2
+  cross_attn_query_residual: true
+  camera_attention_mode: joint
+  n_emb: 256
+  n_head: 4
+  n_layer: 8
+  n_cond_layers: 1
+  p_drop_emb: 0.0
+  p_drop_attn: 0.1
+  causal_attn: false
+  free_threshold: 8.0
+  contact_threshold: 8.0
+  contact_enter_frames: 5
+  contact_exit_frames: 5
+  contact_force_dims:
+  - 0
+  - 1
+  - 2
+  contact_history_reducer: max
+  contact_norm: l2
+  input_gate_enabled: false
+  image_blur_scope: full_context
+  image_blur_schedule:
+    schedule_type: linear
+    total_steps: 200000
+    start_sigma: 5.0
+    end_sigma: 0.0
+    start_fraction: 0.25
+    end_fraction: 0.75
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+val_dataloader:
+  batch_size: 32
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: null
+optimizer:
+  learning_rate: 0.0001
+  action_expert_weight_decay: 0.001
+  fusion_weight_decay: 1.0e-06
+  betas:
+  - 0.9
+  - 0.95
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: false
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  distributed:
+    enabled: true
+    backend: nccl
+    batch_size_is_global: true
+    find_unused_parameters: false
+    run_rank0_eval: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: null
+  num_optimizer_steps: 200000
+  gradient_accumulate_every: 1
+  max_grad_norm: 1.0
+  use_ema: true
+  rollout_every: 100
+  checkpoint_every: 2000
+  checkpoint_every_optimizer_steps: 20000
+  validation_start_optimizer_step: 150000
+  val_every: 10
+  sample_every: 10
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+logging:
+  project: nero_force_aware_diffusion
+  resume: false
+  mode: disabled
+  name: 2026.11.08-15.45.34_train_civi_teacher_libero_open_top_drawer_put_bowl_20hz_force_aware
+  tags:
+  - libero
+  - 20hz
+  - force-aware
+  - future-wrench
+  - dinov3
+  - image-query
+  - lstm2
+  - gripper
+  id: null
+  group: libero_20hz_lstm2_gripper
+checkpoint:
+  topk:
+    monitor_key: checkpoint_action_mse
+    mode: min
+    k: 3
+    format_str: optimizer_step={optimizer_step:08d}-action_mse={checkpoint_action_mse:.8f}.ckpt
+  save_last_ckpt: true
+  save_last_snapshot: false
+  action_mse:
+    enabled: true
+    num_episodes: 2
+    batch_size: 16
+task:
+  name: libero_open_top_drawer_put_bowl_20hz_force_aware
+  wrench_key: future_wrench
+  phase_wrench_key: wrench
+  future_phase_wrench_key: future_wrench
+  wrench_history_steps: 8
+  future_wrench_steps: 8
+  future_wrench_start_offset: 1
+  future_wrench_stride: 1
+  phase_wrench_steps: 8
+  phase_wrench_stride: 1
+  free_threshold: 8.0
+  contact_threshold: 8.0
+  contact_enter_frames: 5
+  contact_exit_frames: 5
+  contact_force_dims:
+  - 0
+  - 1
+  - 2
+  contact_history_reducer: max
+  contact_norm: l2
+  phase_source_key: observation.wrench
+  input_gate_enabled: false
+  relative_pose_actions: false
+  action_reference_key: action_reference
+  image_shape:
+  - 3
+  - 192
+  - 256
+  shape_meta:
+    obs:
+      wrist:
+        shape:
+        - 3
+        - 192
+        - 256
+        type: rgb
+      side:
+        shape:
+        - 3
+        - 192
+        - 256
+        type: rgb
+      wrench:
+        shape:
+        - 8
+        - 6
+        type: low_dim
+      future_wrench:
+        shape:
+        - 8
+        - 6
+        type: low_dim
+    action:
+      shape:
+      - 8
+  env_runner: null
+  normalizer:
+    mode: gaussian
+    last_n_dims: 1
+  dataset:
+    _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+    shape_meta:
+      obs:
+        wrist:
+          shape:
+          - 3
+          - 192
+          - 256
+          type: rgb
+        side:
+          shape:
+          - 3
+          - 192
+          - 256
+          type: rgb
+        wrench:
+          shape:
+          - 8
+          - 6
+          type: low_dim
+        future_wrench:
+          shape:
+          - 8
+          - 6
+          type: low_dim
+      action:
+        shape:
+        - 8
+    dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
+    horizon: 9
+    pad_before: 1
+    pad_after: 0
+    n_obs_steps: 2
+    n_latency_steps: 0
+    seed: 42
+    val_ratio: 0.0
+    window_sampling_strategy: timestamp
+    image_feature_map:
+      wrist: observation.images.wrist
+      side: observation.images.side
+    windowed_lowdim_feature_groups:
+      wrench:
+        source_key: observation.wrench
+        steps: 8
+        start_offset: -7
+        stride: 1
+      future_wrench:
+        source_key: observation.wrench
+        steps: 8
+        start_offset: 1
+        stride: 1
+        anchor_timestamp_key: timing.camera_timestamp_ns
+        source_timestamp_key: timing.state_timestamp_ns
+        offsets_sec:
+        - 0.05
+        - 0.1
+        - 0.15
+        - 0.2
+        - 0.25
+        - 0.3
+        - 0.35
+        - 0.4
+    action_feature_fields:
+    - observation.ee_pose
+    - action
+    action_layout: per_step
+    relative_pose_actions: false
+    timestamp_key: timestamp
+    timestamp_step_sec: 0.05
+    timestamp_tolerance_sec: null
+    observation_validity_key: timing.camera_valid
+    local_files_only: true
+    video_backend: pyav
+    video_decode_device: auto
+    preload_images: true
+    load_result_add: ram
+    image_cache_dtype: uint8
+    image_cache_chunk_frames: 64
+    phase_resampling_enabled: true
+    phase_source_key: observation.wrench
+    contact_threshold: 8.0
+    contact_enter_frames: 5
+    contact_exit_frames: 5
+    contact_force_dims:
+    - 0
+    - 1
+    - 2
+    contact_norm: l2
+    precontact_seconds: 1.0
+    image_randomer_config:
+      shared_across_sequence: true
+      resize: false
+      random_crop: false
+      rotation: false
+      color_jitter: true
+      color_jitter_params:
+        brightness: 0.1
+        contrast: 0.15
+        saturation: 0.1
+        hue: 0.03
+    action_feature_columns:
+      action:
+      - 6
+output_dir: data/outputs/civi/teacher

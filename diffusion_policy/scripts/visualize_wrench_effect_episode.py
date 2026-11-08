@@ -587,7 +587,7 @@ def run(args):
             "wrench_key": policy.wrench_key, "phase_wrench_key": policy.phase_wrench_key,
             "future_phase_wrench_key": policy.future_phase_wrench_key,
             "model_wrench_offsets_sec": None if offsets is None else [float(value) for value in offsets],
-            "same_rgb": True, "curriculum_mask": False,
+            "same_rgb": True, "curriculum_blur": False,
             "all_camera_keys": list(all_keys), "display_camera_keys": camera_keys, "raw_camera_keys": raw_camera_keys,
             "observation_display": args.observation,
             "camera_patch_grids": {key: list(records[0]["cameras"][key]["grid"]) for key in raw_camera_keys},

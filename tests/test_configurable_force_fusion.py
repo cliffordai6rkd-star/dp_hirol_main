@@ -52,7 +52,7 @@ def make_policy(monkeypatch, **kwargs):
         noise_scheduler=DDIMScheduler(num_train_timesteps=10, prediction_type="epsilon"),
         horizon=9, n_obs_steps=2, n_action_steps=8, num_inference_steps=2,
         dino_model_name_or_path="unused", n_emb=16, n_head=4, n_layer=1,
-        p_drop_attn=0.0, mask_schedule={"schedule_type": "constant", "start_probability": 0.0},
+        p_drop_attn=0.0,
         **kwargs,
     )
     normalizer = LinearNormalizer()
@@ -75,7 +75,6 @@ def test_fusion_combinations_preserve_tokens_and_backpropagate(temporal, sa_laye
     obs = observations()
     context = encoder(
         images={key: obs[key] for key in IMAGE_SHAPES}, wrench_history=obs["wrench_ext"],
-        image_token_mask=torch.tensor([[False, True], [False, False]]),
     )
     per_obs = 18 if ca_layers == 0 else (8 if query == "wrench" else 10)
     assert encoder.context_tokens_per_observation == per_obs
@@ -177,7 +176,7 @@ def test_legacy_image_query_keeps_visual_residual_and_reads_wrench():
 
 @pytest.mark.parametrize("camera_mode", ["joint", "per_camera"])
 @pytest.mark.parametrize("ca_layers", [1, 2])
-def test_image_query_without_residual_has_no_image_skip_and_preserves_mask(camera_mode, ca_layers):
+def test_image_query_without_residual_has_no_image_skip(camera_mode, ca_layers):
     encoder = make_encoder(
         force_temporal_encoder="lstm", cross_attn_query="image",
         cross_attn_layers=ca_layers, camera_attention_mode=camera_mode,
@@ -186,21 +185,16 @@ def test_image_query_without_residual_has_no_image_skip_and_preserves_mask(camer
     obs = observations()
     images = {key: obs[key] for key in IMAGE_SHAPES}
     changed_images = {key: torch.rand_like(value) for key, value in images.items()}
-    mask = torch.ones(2, 2, dtype=torch.bool)
     with torch.no_grad():
         first = encoder(images=images, wrench_history=obs["wrench_ext"])
         changed = encoder(images=images, wrench_history=obs["wrench_ext"] + 3)
-        assert not torch.allclose(first, changed)
-        masked = encoder(images=images, wrench_history=obs["wrench_ext"], image_token_mask=mask)
-        changed_masked = encoder(
-            images=changed_images, wrench_history=obs["wrench_ext"], image_token_mask=mask,
-        )
-    torch.testing.assert_close(masked, changed_masked, rtol=0, atol=0)
+        changed_visual = encoder(images=changed_images, wrench_history=obs["wrench_ext"])
+    assert not torch.allclose(first, changed)
+    assert not torch.allclose(first, changed_visual)
 
     encoder.train()
-    masked = encoder(images=images, wrench_history=obs["wrench_ext"], image_token_mask=mask)
-    (masked * torch.randn_like(masked)).mean().backward()
-    assert encoder.image_mask_token.grad.abs().sum() > 0
+    output = encoder(images=images, wrench_history=obs["wrench_ext"])
+    (output * torch.randn_like(output)).mean().backward()
     assert encoder.force_encoder.weight_ih_l0.grad.abs().sum() > 0
     encoder.eval()
 
@@ -277,7 +271,7 @@ def test_training_config_accepts_fusion_overrides():
 
 @pytest.mark.parametrize("name", [
     "train_dp_image_query_lstm_insert_usb",
-    "train_dp_image_query_lstm_contact_mask_insert_usb",
+    "train_dp_image_query_lstm_contact_blur_insert_usb",
 ])
 def test_image_query_training_configs_omit_visual_query_residual(name):
     root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
@@ -295,8 +289,11 @@ def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
     policy = make_policy(
         monkeypatch, cross_attn_query="image", cross_attn_query_residual=False,
         pre_cross_self_attn_layers=sa_layers, cross_attn_layers=ca_layers,
-        image_mask_scope=scope,
-        image_blur_schedule={"schedule_type": "linear", "start_sigma": 3, "end_sigma": 0, "end_step": 100},
+        image_blur_scope=scope,
+        image_blur_schedule={
+            "total_steps": 100, "start_sigma": 3, "end_sigma": 0,
+            "start_fraction": 0.25, "end_fraction": 0.75,
+        },
     ).train()
     obs = observations()
     obs["wrench_ext"].zero_()
@@ -304,10 +301,9 @@ def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
     originals = {key: obs[key].clone() for key in IMAGE_SHAPES}
     captured = []
     def capture(module, args, kwargs):
-        captured.append((
-            {key: value.detach().clone() for key, value in kwargs["images"].items()},
-            kwargs["image_token_mask"].clone(),
-        ))
+        captured.append({
+            key: value.detach().clone() for key, value in kwargs["images"].items()
+        })
     handle = policy.obs_encoder.register_forward_pre_hook(capture, with_kwargs=True)
     try:
         loss = policy.compute_loss({"obs": obs, "action": torch.randn(2, 9, 7)}, optimizer_step=0)
@@ -315,28 +311,27 @@ def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
         loss.backward()
         assert policy.obs_encoder.wrench_projection.weight.grad is not None
         assert policy.last_curriculum_metrics["curriculum/blur_sigma"] == 3
-        assert policy.last_curriculum_metrics["curriculum/masked_image_fraction"] == 0
-        assert not captured[0][1].any()
+        assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0.5
         for key in IMAGE_SHAPES:
-            assert not torch.equal(captured[0][0][key][0, -1], originals[key][0, -1])
-            torch.testing.assert_close(captured[0][0][key][1], originals[key][1], rtol=0, atol=0)
+            assert not torch.equal(captured[0][key][0, -1], originals[key][0, -1])
+            torch.testing.assert_close(captured[0][key][1], originals[key][1], rtol=0, atol=0)
             if scope == "current_observation":
-                torch.testing.assert_close(captured[0][0][key][0, 0], originals[key][0, 0], rtol=0, atol=0)
+                torch.testing.assert_close(captured[0][key][0, 0], originals[key][0, 0], rtol=0, atol=0)
             torch.testing.assert_close(obs[key], originals[key], rtol=0, atol=0)
         policy.set_optimizer_step(50)
         policy._encode_context(obs, apply_curriculum_mask=True)
         assert policy.last_curriculum_metrics["curriculum/blur_sigma"] == 1.5
         policy._encode_context(obs, apply_curriculum_mask=True)
         for key in IMAGE_SHAPES:
-            # No Bernoulli mask selection: the same step produces the same RGB.
-            torch.testing.assert_close(captured[-1][0][key], captured[-2][0][key], rtol=0, atol=0)
+            # The blur selection is deterministic: the same step produces the same RGB.
+            torch.testing.assert_close(captured[-1][key], captured[-2][key], rtol=0, atol=0)
         policy._encode_context(obs, apply_curriculum_mask=False)
         for key in IMAGE_SHAPES:
-            torch.testing.assert_close(captured[-1][0][key], originals[key], rtol=0, atol=0)
+            torch.testing.assert_close(captured[-1][key], originals[key], rtol=0, atol=0)
         policy.set_optimizer_step(100)
         policy._encode_context(obs, apply_curriculum_mask=True)
         for key in IMAGE_SHAPES:
-            torch.testing.assert_close(captured[-1][0][key], originals[key], rtol=0, atol=0)
+            torch.testing.assert_close(captured[-1][key], originals[key], rtol=0, atol=0)
         assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0
     finally:
         handle.remove()

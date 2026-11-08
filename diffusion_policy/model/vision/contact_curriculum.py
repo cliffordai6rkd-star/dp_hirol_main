@@ -1,4 +1,3 @@
-import bisect
 import math
 from typing import Optional, Sequence
 
@@ -308,235 +307,124 @@ class VectorThresholdGate(nn.Module):
         return torch.where(keep.unsqueeze(-1), values, torch.zeros_like(values))
 
 
-class MaskProbabilityScheduler(nn.Module):
-    """Map optimizer update steps to contact-image masking probability."""
+class FactrBlurScheduler(nn.Module):
+    """FACTR's pixel blur curriculum with the project's three fixed phases.
+
+    FACTR keeps a large Gaussian scale for an initial portion of training and
+    linearly reduces it to zero over the remaining curriculum window.  This
+    implementation makes the requested boundaries explicit: the first 25%
+    holds ``start_sigma``, the middle 50% is linear, and the final 25% is
+    exactly clear.  Optimizer steps outside the configured range are clamped,
+    which keeps resumed runs deterministic after the last scheduled update.
+    """
 
     def __init__(
         self,
-        schedule_type: str = "cosine",
-        start_step: int = 0,
-        end_step: int = 50_000,
-        start_probability: float = 1.0,
-        end_probability: float = 0.0,
-        exponential_rate: float = 5.0,
-        piecewise_steps: Optional[Sequence[int]] = None,
-        piecewise_probabilities: Optional[Sequence[float]] = None,
-        piecewise_interpolation: str = "linear",
-        total_steps: Optional[int] = None,
-        piecewise_fractions: Optional[Sequence[float]] = None,
-    ) -> None:
-        super().__init__()
-        supported = {"constant", "linear", "cosine", "exponential", "piecewise"}
-        if schedule_type not in supported:
-            raise ValueError(
-                f"Unsupported schedule_type={schedule_type!r}; expected one of {sorted(supported)}"
-            )
-        if end_step < start_step:
-            raise ValueError("end_step must be greater than or equal to start_step")
-        for value in (start_probability, end_probability):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError("mask probabilities must be in [0, 1]")
-        if exponential_rate <= 0:
-            raise ValueError("exponential_rate must be positive")
-        if piecewise_interpolation not in {"linear", "hold"}:
-            raise ValueError("piecewise_interpolation must be 'linear' or 'hold'")
-
-        self.schedule_type = schedule_type
-        self.start_step = int(start_step)
-        self.end_step = int(end_step)
-        self.start_probability = float(start_probability)
-        self.end_probability = float(end_probability)
-        self.exponential_rate = float(exponential_rate)
-        self.piecewise_interpolation = piecewise_interpolation
-
-        if piecewise_fractions is not None:
-            if piecewise_steps:
-                raise ValueError(
-                    "provide either piecewise_steps or piecewise_fractions, not both"
-                )
-            if total_steps is None or int(total_steps) < 1:
-                raise ValueError(
-                    "piecewise_fractions requires a positive total_steps"
-                )
-            fractions = tuple(float(value) for value in piecewise_fractions)
-            if (
-                len(fractions) < 1
-                or any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions)
-                or tuple(sorted(fractions)) != fractions
-            ):
-                raise ValueError(
-                    "piecewise_fractions must be sorted finite values in [0, 1]"
-                )
-            piecewise_steps = tuple(
-                int(round(value * int(total_steps))) for value in fractions
-            )
-            if tuple(sorted(set(piecewise_steps))) != piecewise_steps:
-                raise ValueError(
-                    "piecewise_fractions must map to distinct optimizer steps"
-                )
-        self.piecewise_steps = tuple(int(step) for step in (piecewise_steps or ()))
-        self.piecewise_probabilities = tuple(
-            float(value) for value in (piecewise_probabilities or ())
-        )
-        if self.schedule_type == "piecewise":
-            if len(self.piecewise_steps) < 1:
-                raise ValueError("piecewise schedule requires at least one step")
-            if len(self.piecewise_steps) != len(self.piecewise_probabilities):
-                raise ValueError("piecewise steps and probabilities must have equal length")
-            if tuple(sorted(self.piecewise_steps)) != self.piecewise_steps:
-                raise ValueError("piecewise steps must be sorted")
-            if any(not 0.0 <= value <= 1.0 for value in self.piecewise_probabilities):
-                raise ValueError("piecewise probabilities must be in [0, 1]")
-
-    def probability(self, optimizer_step: int) -> float:
-        step = int(optimizer_step)
-        if self.schedule_type == "constant":
-            return self.start_probability
-        if self.schedule_type == "piecewise":
-            return self._piecewise_probability(step)
-        if step <= self.start_step:
-            return self.start_probability
-        if step >= self.end_step:
-            return self.end_probability
-
-        duration = max(1, self.end_step - self.start_step)
-        progress = (step - self.start_step) / duration
-        if self.schedule_type == "linear":
-            weight = 1.0 - progress
-        elif self.schedule_type == "cosine":
-            weight = 0.5 * (1.0 + math.cos(math.pi * progress))
-        else:
-            end_value = math.exp(-self.exponential_rate)
-            weight = (math.exp(-self.exponential_rate * progress) - end_value) / (
-                1.0 - end_value
-            )
-        return self.end_probability + (
-            self.start_probability - self.end_probability
-        ) * weight
-
-    def _piecewise_probability(self, step: int) -> float:
-        insertion = bisect.bisect_right(self.piecewise_steps, step)
-        if insertion == 0:
-            return self.piecewise_probabilities[0]
-        if insertion >= len(self.piecewise_steps):
-            return self.piecewise_probabilities[-1]
-        left = insertion - 1
-        if self.piecewise_interpolation == "hold":
-            return self.piecewise_probabilities[left]
-        left_step = self.piecewise_steps[left]
-        right_step = self.piecewise_steps[insertion]
-        progress = (step - left_step) / max(1, right_step - left_step)
-        left_value = self.piecewise_probabilities[left]
-        right_value = self.piecewise_probabilities[insertion]
-        return left_value + (right_value - left_value) * progress
-
-    def forward(self, optimizer_step: int) -> float:
-        return self.probability(optimizer_step)
-
-
-class BlurSigmaScheduler(MaskProbabilityScheduler):
-    """Schedule Gaussian standard deviation in input-image pixels."""
-
-    def __init__(
-        self,
+        total_steps: int,
+        schedule_type: str = "linear",
         start_sigma: float = 5.0,
         end_sigma: float = 0.0,
-        piecewise_sigmas: Optional[Sequence[float]] = None,
-        **kwargs,
+        start_fraction: float = 0.25,
+        end_fraction: float = 0.75,
     ) -> None:
-        sigmas = [float(start_sigma), float(end_sigma)]
-        points = [float(value) for value in (piecewise_sigmas or ())]
-        if any(not math.isfinite(value) or value < 0 for value in (*sigmas, *points)):
-            raise ValueError("blur sigmas must be finite and non-negative")
-        self.sigma_scale = max(*sigmas, *points, 1.0)
-        super().__init__(
-            start_probability=sigmas[0] / self.sigma_scale,
-            end_probability=sigmas[1] / self.sigma_scale,
-            piecewise_probabilities=[value / self.sigma_scale for value in points],
-            **kwargs,
-        )
+        super().__init__()
+        if schedule_type != "linear":
+            raise ValueError("FACTR blur schedule_type must be 'linear'")
+        total_steps = int(total_steps)
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        start_sigma = float(start_sigma)
+        end_sigma = float(end_sigma)
+        if not math.isfinite(start_sigma) or not math.isfinite(end_sigma):
+            raise ValueError("blur sigmas must be finite")
+        if start_sigma < 0 or end_sigma < 0 or start_sigma < end_sigma:
+            raise ValueError("blur sigmas must be non-negative with start_sigma >= end_sigma")
+        start_fraction = float(start_fraction)
+        end_fraction = float(end_fraction)
+        if (
+            not math.isfinite(start_fraction)
+            or not math.isfinite(end_fraction)
+            or not 0.0 <= start_fraction < end_fraction <= 1.0
+        ):
+            raise ValueError("blur phase fractions must satisfy 0 <= start < end <= 1")
+        self.total_steps = total_steps
+        self.schedule_type = schedule_type
+        self.start_sigma = start_sigma
+        self.end_sigma = end_sigma
+        self.start_fraction = start_fraction
+        self.end_fraction = end_fraction
 
     def sigma(self, optimizer_step: int) -> float:
-        return self.probability(optimizer_step) * self.sigma_scale
+        progress = min(max(int(optimizer_step), 0), self.total_steps) / self.total_steps
+        if progress <= self.start_fraction:
+            return self.start_sigma
+        if progress >= self.end_fraction:
+            return self.end_sigma
+        middle_progress = (progress - self.start_fraction) / (
+            self.end_fraction - self.start_fraction
+        )
+        return self.start_sigma + middle_progress * (self.end_sigma - self.start_sigma)
 
     def forward(self, optimizer_step: int) -> float:
         return self.sigma(optimizer_step)
 
 
-def gaussian_blur_images(images: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable Gaussian blur on [..., C, H, W], with an exact identity at zero.
-
-    Kernels span three standard deviations, limited by reflect-padding bounds.
-    Filtering runs in float32 even inside the policy's AMP context.
-    """
-    if not math.isfinite(sigma) or sigma < 0:
-        raise ValueError("blur sigma must be finite and non-negative")
-    if sigma == 0:
-        return images
-    channels, height, width = images.shape[-3:]
-    with torch.autocast(device_type=images.device.type, enabled=False):
-        result = images.reshape(-1, channels, height, width).float()
-        for axis, size in ((-1, width), (-2, height)):
-            radius = min(math.ceil(3 * sigma), size - 1)
-            if radius == 0:
-                continue
-            positions = torch.arange(-radius, radius + 1, device=images.device, dtype=torch.float32)
-            kernel = torch.exp(-0.5 * (positions / sigma).square())
-            kernel = kernel / kernel.sum()
-            if axis == -1:
-                padding, shape = (radius, radius, 0, 0), (1, 1, 1, -1)
-            else:
-                padding, shape = (0, 0, radius, radius), (1, 1, -1, 1)
-            weight = kernel.reshape(shape).expand(channels, -1, -1, -1)
-            result = F.conv2d(F.pad(result, padding, mode="reflect"), weight, groups=channels)
-    return result.reshape_as(images).to(images.dtype)
+# Copied from FACTR's factr/utils.py (Apache-2.0):
+# https://github.com/RaindragonD/FACTR/blob/5a20d69342d9d234fd588c10b7c3e62ea559c9b0/factr/utils.py
+def gaussian_2d_kernel(
+    kernel_size: int, sigma: float, device=None, dtype=None
+) -> torch.Tensor:
+    """Build FACTR's normalized square Gaussian kernel."""
+    if int(kernel_size) < 1:
+        raise ValueError("kernel_size must be positive")
+    if not math.isfinite(float(sigma)) or float(sigma) <= 0:
+        raise ValueError("sigma must be finite and positive")
+    coords = torch.arange(kernel_size, device=device, dtype=dtype)
+    coords = coords - (kernel_size - 1) / 2.0
+    x, y = torch.meshgrid(coords, coords, indexing="xy")
+    kernel = torch.exp(-0.5 * (x.square() + y.square()) / sigma**2)
+    return kernel / kernel.sum()
 
 
-class ContactAwareImageMasker(nn.Module):
-    """Sample whole-image token masks for selected contact-target windows.
+def gaussian_2d_smoothing(img: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """Apply FACTR's depthwise 2-D Gaussian smoothing to ``[..., C, H, W]``."""
+    scale = float(scale)
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError("blur scale must be finite and non-negative")
+    if scale == 0:
+        return img
+    if img.ndim < 3:
+        raise ValueError("img must have shape [..., C, H, W]")
+    channels, height, width = (int(value) for value in img.shape[-3:])
+    kernel_size = max(3, 2 * math.ceil(3 * scale) + 1)
+    # Float16 convolution is not available on every supported CPU.  FACTR
+    # performs the same operation in the input dtype; use float32 only for
+    # those low-precision inputs and cast the result back afterward.
+    work_dtype = torch.float32 if img.dtype in {torch.float16, torch.bfloat16} else img.dtype
+    input_image = img.to(work_dtype)
+    kernel = gaussian_2d_kernel(
+        kernel_size, scale, device=img.device, dtype=work_dtype
+    ).view(1, 1, kernel_size, kernel_size)
+    kernel = kernel.repeat(channels, 1, 1, 1)
+    original_shape = tuple(img.shape)
+    flat = input_image.reshape(-1, channels, height, width)
+    blurred = F.conv2d(flat, kernel, groups=channels, padding=kernel_size // 2)
+    return blurred.reshape(original_shape).to(img.dtype)
 
-    The caller supplies the phase condition that should trigger masking.  For
-    future-phase training this is the future-window contact flag, rather than
-    the current observation's contact state.
-    """
 
-    def __init__(self, scope: str = "full_context") -> None:
-        super().__init__()
-        if scope not in {"current_observation", "full_context"}:
-            raise ValueError(
-                f"Unsupported mask scope={scope!r}; "
-                "expected 'current_observation' or 'full_context'."
-            )
-        self.scope = scope
-
-    def forward(
-        self,
-        contact_mask: torch.Tensor,
-        probability: float,
-        enabled: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        if contact_mask.ndim != 2:
-            raise ValueError(
-                f"contact_mask must have shape [B, To], got {tuple(contact_mask.shape)}"
-            )
-        result = torch.zeros_like(contact_mask, dtype=torch.bool)
-        probability = float(probability)
-        if not enabled or probability <= 0.0:
-            return result
-
-        latest_contact = contact_mask[:, -1]
-        if probability >= 1.0:
-            selected = latest_contact
-        else:
-            random_values = torch.rand(
-                latest_contact.shape,
-                device=contact_mask.device,
-                generator=generator,
-            )
-            selected = latest_contact & (random_values < probability)
-
-        if self.scope == "full_context":
-            return selected[:, None].expand_as(contact_mask).clone()
-        result[:, -1] = selected
-        return result
+def select_contact_blur_mask(
+    contact_mask: torch.Tensor, scope: str = "full_context"
+) -> torch.Tensor:
+    """Select contact-target observations for deterministic pixel blurring."""
+    if contact_mask.ndim != 2 or contact_mask.dtype != torch.bool:
+        raise ValueError("contact_mask must be a bool tensor with shape [B, To]")
+    if scope not in {"current_observation", "full_context"}:
+        raise ValueError(
+            f"Unsupported blur scope={scope!r}; expected 'current_observation' or 'full_context'."
+        )
+    selected = contact_mask[:, -1]
+    if scope == "full_context":
+        return selected[:, None].expand_as(contact_mask)
+    result = torch.zeros_like(contact_mask)
+    result[:, -1] = selected
+    return result

@@ -108,7 +108,7 @@ def test_checkpoint_restores_mode_gate_and_old_policy_defaults(monkeypatch, tmp_
     assert old.future_contact_mode == "legacy_rollout" and not old.contact_fusion_gate
 
 
-def test_direct_token_mask_is_clipped_without_duplicate_dino_calls():
+def test_contact_gate_is_applied_without_duplicate_dino_calls():
     teacher, obs = make_teacher(), observations()
     images = {key: obs[key] for key in IMAGE_SHAPES}
     gate = torch.tensor([[False, True], [True, False]])
@@ -116,8 +116,9 @@ def test_direct_token_mask_is_clipped_without_duplicate_dino_calls():
     handle = teacher.obs_encoder.backbone.register_forward_hook(lambda *args: calls.append(1))
     try:
         with torch.no_grad():
-            output = teacher.obs_encoder(images=images, wrench_history=obs["future_wrench"],
-                                         contact_gate=gate, image_token_mask=torch.ones_like(gate))
+            output = teacher.obs_encoder(
+                images=images, wrench_history=obs["future_wrench"], contact_gate=gate
+            )
         assert len(calls) == 2  # Each camera size is encoded once, with all observations batched.
     finally:
         handle.remove()

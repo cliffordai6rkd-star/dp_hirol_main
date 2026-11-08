@@ -1,0 +1,172 @@
+# 完整学生训练配置；直接通过 train_distill_render_net.py --config 使用。
+name: train_distill_render_net_student
+_target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
+# 直接使用指定教师权重，无需 action_mse.json。
+# teacher_config 可填教师 YAML 以覆盖数据路径；null 时沿用 checkpoint 内的数据配置。
+teacher_config: null
+teacher_config_overrides: []
+teacher_output_dir: null # 默认读取 teacher-config 的 output_dir。
+teacher_checkpoint: data/outputs/2026.11.05/22.45.54_375874_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
+output_dir: data/outputs/civi/student
+
+# 冻结 teacher，以其 context tokens 监督学生 RGB 渲染。
+distillation:
+  objective: token_mse
+  token_loss_weight: 0.0
+  demo_loss_weight: 0.0
+  validation_seed: 42
+
+teacher_cache:
+  enabled: true
+  cleanup_on_exit: true
+  dtype: float16 # 缓存存储精度；loss 仍以 FP32 计算。
+  precision: float32 # teacher context-effect 成对计算使用 FP32。
+  directory: data/cache/render_net_teacher
+  batch_size: 16
+  num_workers: 4
+  load_into_ram: false
+  only: false
+
+render_net:
+  backbone:
+    image_encoder: cnn
+    wrench_encoder: lstm
+    image_self_attn_layers: 6
+    cross_attn_layers: 2
+    decoder_layers: 3
+    patch_size: 8
+    embed_dim: 128
+    num_heads: 4
+    mlp_ratio: 4.0
+    dropout: 0.0
+    base_channels: 32
+    conv_block: bottleneck
+  rendering_mode: residual
+  separate_gate_path: true # 独立 gate 路径；RGB 阶段训练完整 RGB 主干。
+  spatial_modulation:
+    enabled: true # 在 /8、/4 decoder 插入空间调制。
+  initialize_wrench_from_teacher: true
+  conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
+  wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
+  max_obs_steps: 2
+  image_keys: [side, wrist]
+  residual_scale: 1.0
+  high_attention_render:
+    enabled: true
+    source: context
+    selection: soft
+    activation: sigmoid
+    initial_strength: 0.1
+    threshold: 0.1 # 渲染 gate=M*(M>threshold)；设 0.0 可取消强度截断。
+    normalization: image_minmax
+    strength_scale: null
+    percentile: 90.0
+    prediction_threshold: 0.5 # 仅 binary_top_percentile 模式使用。
+    baseline: raw_zero
+    percentiles: [80.0, 99.0]
+    intensity_loss_weight: 1.0
+    context_patch_loss_weight: 1.0
+    pixel_loss_weight: 0.0
+    smoothness_loss_weight: 0.02
+    detach_for_rgb: true
+    teacher_seed: 42
+
+# 数据集和时间窗口读取教师 checkpoint（指定 teacher_config 时读取该 YAML）；normalizer 来自 checkpoint。
+# 这里只列学生对教师数据配置的覆盖项，单独划分学生验证集。
+dataset:
+  val_ratio: 0.1
+  video_backend: pyav
+  video_decode_device: cuda:0
+  preload_images: true
+  image_randomer_config: null
+  load_result_add: ram
+  image_cache_dtype: uint8
+
+dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 16
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.999
+
+logging:
+  progress_bar: true
+  progress_bar_non_tty: false
+  tqdm_interval_sec: 1.0
+  tqdm_leave: false
+  status_interval_sec: 60.0
+  plot_every_steps: 100
+
+training:
+  seed: 42
+  device: cuda:0
+  resume_from: null
+  use_ema: true
+  lr_scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 8
+    threshold: 0.0001
+    min_lr: 0.00001
+  distributed:
+    enabled: false
+    backend: nccl
+    batch_size_is_global: true
+    find_unused_parameters: false
+    timeout_seconds: 86400
+  num_epochs: 1000
+  intensity_warmup_epochs: 5 # Legacy alias；render_stages.intensity_epochs 为准。
+  render_stages:
+    enabled: true
+    intensity_epochs: 5 # 前 5 个 epoch 学强度场，随后冻结 gate 并训练 RGB。
+  max_steps: null
+  max_grad_norm: 1.0
+  log_every: 10
+  max_val_batches: null
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.0001
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  compile:
+    enabled: true
+    render_backbone: false
+    student_dino: true
+    backend: inductor
+    mode: default
+
+hydra:
+  job_logging:
+    formatters:
+      concise:
+        format: '%(asctime)s %(levelname).1s | %(message)s'
+        datefmt: '%H:%M:%S'
+    handlers:
+      console:
+        formatter: concise
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

@@ -7,15 +7,15 @@ defaults:
 name: train_dp_image_query_lstm_contact_blur_insert_usb
 
 policy:
-  image_mask_scope: full_context
-  # Blur RGB before DINO for future-contact samples, with no token masking.
+  image_blur_scope: full_context
+  # Blur RGB before DINO for future-contact samples.
   image_blur_schedule:
-    schedule_type: piecewise
+    schedule_type: linear
+    total_steps: ${training.num_optimizer_steps}
     start_sigma: 5.0
     end_sigma: 0.0
-    piecewise_steps: [0, 50000, 150000, 200000]
-    piecewise_sigmas: [5.0, 5.0, 0.0, 0.0]
-    piecewise_interpolation: linear
+    start_fraction: 0.25
+    end_fraction: 0.75
 
 val_dataloader:
   # Avoid forking a validation worker after CUDA/pinned-memory training.

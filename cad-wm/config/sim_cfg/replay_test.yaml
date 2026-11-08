@@ -1,0 +1,130 @@
+
+# model_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
+# model_path: sim_mesh/franka_fr3/fr3_pika_ati_torque.xml
+# model_path: sim_mesh/scene/fr3_pika_gripper_ati_world.xml
+# model_path: sim_mesh/franka_fr3/fr3_pika_ati_scene.xml
+model_path: sim_mesh/nero/nero_with_gripper.urdf
+output_path: sim_mesh/franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml
+print_info: false
+save_mjcf: false
+show_sim: true
+quick_replay: true
+arm_joint_names:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - joint5
+  - joint6
+  - joint7
+gripper_actuator_name: pika_gripper_actuator
+gripper_ctrl_range: [-0.11, 0.0]
+
+# Xbox Linux joystick mapping. Verify axis ids with:
+#   python sim_mujoco/xbox_controller.py
+xbox_device: /dev/input/js0
+xbox_deadzone: 0.12
+xbox_trigger_deadzone: 0.02
+xbox_axis_map:
+  left_x: 0
+  left_y: 1
+  lt: 2
+  right_x: 3
+  right_y: 4
+  r2: 5
+xbox_axis_sign:
+  left_x: 1.0
+  left_y: -1.0
+  lt: 1.0
+  right_x: 1.0
+  right_y: -1.0
+  r2: 1.0
+xbox_button_map:
+  a: 0
+  y: 3
+# Some controllers expose R2 as a button instead of an axis. Set this to that
+# button id if python sim_mujoco/xbox_controller.py shows r2 never changes.
+xbox_lt_button: null
+xbox_r2_button: null
+xbox_reset_button: null
+
+# Teleoperation mapping:
+# left stick x -> left/right along Y
+# left stick y -> forward/back along X
+# Y button -> up along Z
+# A button -> down along Z
+# right stick x -> roll, right stick y -> pitch
+# R2 -> gripper close amount
+teleop_translation_speed: 0.15
+teleop_rotation_speed: 0.8
+teleop_left_x_index: 1
+teleop_forward_index: 0
+teleop_up_index: 2
+teleop_workspace_min: [0.15, -0.45, 0.08]
+teleop_workspace_max: [0.75, 0.45, 0.85]
+teleop_gripper_open_ctrl: -0.11
+teleop_gripper_closed_ctrl: 0.0
+teleop_gripper_open_q: [-0.04, 0.04]
+teleop_gripper_closed_q: [0.0, 0.0]
+teleop_gripper_initial_closed: false
+teleop_gripper_toggle_threshold: 0.5
+teleop_reset_combo_threshold: 0.5
+teleop_reset_requires_a: false
+teleop_reset_hold_steps: 20
+teleop_reset_joint_speed: 0.8
+teleop_reset_position_tolerance: 0.01
+
+# MuJoCo physics integration frequency. This sets model.opt.timestep = 1 / sim_frequency.
+sim_frequency: 500.0
+
+# High-level target update frequency. For teleop, 50-100 Hz is a good starting point.
+control_frequency: 100.0
+
+# Sine follow smoke test used by sim_mujoco/mujocosim_inteface.py main().
+follow_test_joint_index: 6
+follow_test_amplitude: 0.3
+follow_test_frequency: 0.25
+
+# Pinocchio IK controller. The teleop device should eventually provide target EE poses,
+# and this controller converts those poses to 7-DoF FR3 joint targets.
+ik_urdf_path: sim_mesh/franka_fr3/fr3_pika_gripper_ati.urdf
+ik_ee_frame_name: pika_gripper_ee
+ik_lock_joint_names: []
+ik_arm_joint_names:
+  - fr3_joint1
+  - fr3_joint2
+  - fr3_joint3
+  - fr3_joint4
+  - fr3_joint5
+  - fr3_joint6
+  - fr3_joint7
+ik_gripper_joint_names:
+  - gripper_left_joint
+  - gripper_right_joint
+ik_default_gripper_q: [-0.04, 0.04]
+ik_max_iterations: 80
+ik_tolerance: 1.0e-4
+ik_damping: 1.0e-3
+ik_step_size: 0.5
+ik_position_weight: 1.0
+ik_orientation_weight: 0.5
+ik_reject_unconverged: false
+ik_max_position_error: 0.03
+ik_max_orientation_error: 0.5
+ik_max_joint_delta: 0.12
+ik_max_joint_delta_norm: 0.35
+teleop_pose_quat_order: wxyz
+
+# IK follow smoke test used by sim_mujoco/ik_follow_test.py.
+ik_follow_test_axis: z
+ik_follow_test_amplitude: 0.03
+ik_follow_test_frequency: 0.15
+
+# q: [0.0, -0.785, 0.0, -2.355, 0.0, 1.57079, 0.785]
+q_reset: [0.0, -0.185, 0.0, -2.355, 0.0, 1.57079, 0.785]
+q_reset_gripper: [-0.04, 0.04]
+
+root: data/train_episode/wrench_background/wrench_bg_lerobotv3_
+repo_id: wrench_bg_lerobotv3_
+video_backend: torchcodec
+q_key: observation.joint

@@ -52,6 +52,30 @@ def _shape_meta():
     }
 
 
+def test_checkpoint_episode_view_includes_all_episodes_without_augmentation(monkeypatch):
+    source = _columns(np.arange(28, dtype=np.float32).reshape(4, 7))
+    source = {key: values * 3 for key, values in source.items()}
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", source)
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "episode_data_index", {
+        "from": [0, 4, 8], "to": [4, 8, 12],
+    })
+    monkeypatch.setattr(hirol_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    dataset = HirolLeRobotV3Dataset(
+        shape_meta=_shape_meta(), dataset_path="unused", horizon=2,
+        pad_before=1, pad_after=0, n_obs_steps=2, preload_images=False,
+        action_feature_fields=["action.ee_pose"], val_ratio=0.34,
+    )
+    dataset.image_randomer = object()
+    training_indices = dataset.indices.copy()
+    evaluation = dataset.get_all_episodes_dataset()
+    assert len(np.unique(dataset.episode_index[dataset.indices[:, 0]])) == 2
+    assert set(evaluation.episode_index[evaluation.indices[:, 0]]) == {0, 1, 2}
+    assert evaluation.image_randomer is None and dataset.image_randomer is not None
+    np.testing.assert_array_equal(dataset.indices, training_indices)
+    # The evaluation view shares existing image/action data; it does not reload videos.
+    assert evaluation.action_data is dataset.action_data
+
+
 @pytest.mark.parametrize("columns", [[6], [], [7], [-1], [6, 6], [True]])
 def test_absolute_pose_plus_gripper_action_uses_only_selected_command_column(monkeypatch, columns):
     pose = np.arange(28, dtype=np.float32).reshape(4, 7)

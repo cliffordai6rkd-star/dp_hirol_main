@@ -28,6 +28,7 @@ from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from diffusion_policy.common.render_net_training_logger import RenderNetTrainingLogger
+from diffusion_policy.common.checkpoint_action_mse import resolve_student_teacher
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.teacher_cache_lifecycle import TeacherCacheLifecycle
 from diffusion_policy.dataset.render_net_teacher_cache import (
@@ -147,7 +148,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         torch.backends.cuda.matmul.allow_tf32 = bool(cfg.training.amp.allow_tf32)
         torch.backends.cudnn.allow_tf32 = bool(cfg.training.amp.allow_tf32)
 
-        checkpoint = pathlib.Path(str(cfg.teacher_checkpoint)).expanduser().resolve()
+        checkpoint, self.teacher_source_cfg = resolve_student_teacher(cfg)
+        if cfg.get("teacher_selection"):
+            score = cfg.teacher_selection
+            log.info("Selected teacher %s: checkpoint action MSE=%.8f, episodes=%s",
+                     checkpoint, score["checkpoint_action_mse"], score["episode_ids"])
+        else:
+            log.info("Using specified teacher checkpoint: %s", checkpoint)
         payload, self.teacher_cfg = load_checkpoint_payload(checkpoint)
         self.teacher_state_key = "ema_model" if "ema_model" in payload["state_dicts"] else "model"
         self.teacher_policy = instantiate_policy(payload, self.teacher_cfg, self.device,
@@ -1390,12 +1397,23 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             finally:
                 self._teacher_cache_lifetime = None
 
+    def _dataset_config(self):
+        # Use the supplied teacher YAML for data paths/windows; the checkpoint
+        # remains the source of the model architecture and fitted normalizer.
+        source = self.teacher_source_cfg if self.teacher_source_cfg is not None else self.teacher_cfg
+        config = OmegaConf.create(OmegaConf.to_container(source.task.dataset, resolve=True))
+        with open_dict(config):
+            config.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
+        return config
+
     def _run(self):
         output = pathlib.Path(self.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         if self.is_main_process:
             OmegaConf.save(self.cfg, output / "config.yaml", resolve=True)
             OmegaConf.save(self.teacher_cfg, output / "teacher_config.yaml", resolve=True)
+            if self.teacher_source_cfg is not None:
+                OmegaConf.save(self.teacher_source_cfg, output / "teacher_source_config.yaml", resolve=True)
             # Continuing in a new directory preserves the previously best model.
             if self.resume_from:
                 previous_best = pathlib.Path(self.resume_from).parent / "best.ckpt"
@@ -1403,11 +1421,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if previous_best.is_file() and not destination.exists():
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(previous_best, destination)
-        dataset_cfg = copy.deepcopy(self.teacher_cfg.task.dataset)
-        # Resolve teacher-root interpolations before applying distillation overrides.
-        dataset_cfg = OmegaConf.create(OmegaConf.to_container(dataset_cfg, resolve=True))
-        with open_dict(dataset_cfg):
-            dataset_cfg.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
+        dataset_cfg = self._dataset_config()
         # Keep the original dataset config as the cache identity. Rank-local
         # decoder devices do not change supervision, so all ranks reuse the
         # existing single-GPU teacher cache rather than creating new copies.

@@ -1,0 +1,18 @@
+datapath: "data/train_episode/moving_bread/moving_bread_hirol"
+
+
+resize: True
+resize_size: [224, 224]
+
+random_crop: True 
+random_crop_size: [202, 202]
+
+rotation: False
+rotation_degree: 10 
+
+color_jitter: True
+color_jitter_params:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.05

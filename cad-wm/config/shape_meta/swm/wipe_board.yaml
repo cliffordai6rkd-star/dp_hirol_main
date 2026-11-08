@@ -1,0 +1,101 @@
+io:
+  input: ../nero_ws/runs/wipe_board
+  output: ../nero_ws/runs/swm/wipe_board_lerobot_v3
+  repo_id: wipe_board_lerobot_v3
+  max_episodes: null
+  no_videos: true
+  push_to_hub: false
+
+task: wipe_board
+fps: 100
+
+timeline:
+  mode: raw_lowdim_action_hold
+  state_timestamp_path: teleop/timestamp_us
+  # Match VA v3: previous expert snapshot at each recorded wrist-camera anchor.
+  action_anchor_timestamp_path: cameras/wrist/timestamp_us
+  action_fps: 25
+  max_action_gap_s: 0.015
+
+# This is a low-dimensional WM v3 export. All state rows stay on the raw
+# 100 Hz teleop timeline; camera timestamps only define the held action plan.
+features:
+  observation.joint:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/q_follower
+    align: index
+    lowpass: false
+    # cutoff_hz: 20.0
+    # order: 2
+
+  observation.velocity:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/dq_follower
+    align: index
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
+
+  observation.torque:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_follower
+    align: index
+    lowpass: true
+    cutoff_hz: 20.0
+    order: 1
+
+  observation.delta_q:
+    rate: state
+    dtype: float32
+    shape: [7]
+    sources:
+      - h5_path: teleop/q_cmd
+        align: index
+      - h5_path: teleop/q_follower
+        align: index
+    combine: subtract
+    lowpass: false
+    # cutoff_hz: 15.0
+    # order: 2
+
+  observation.tau_ext:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/tau_ext_pred
+    align: index
+
+  observation.ee_pose:
+    rate: state
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    align: index
+    transform: ee_pose_matrix_to_quaternion
+
+  # High-level expert action semantics: use the same causal snapshot labels as
+  # insert_usb_lerobotv3, then ZOH each 25 Hz label on the 100 Hz state rows.
+  action.joint:
+    rate: action
+    dtype: float32
+    shape: [7]
+    # Match the high-level VA expert action semantic (command target), not the
+    # measured follower state used by observation.joint.
+    h5_path: teleop/q_cmd
+    timestamp_path: teleop/timestamp_us
+    resample: previous
+
+  action.ee_pose:
+    rate: action
+    dtype: float32
+    shape: [7]
+    h5_path: teleop/ee_pose_follower
+    timestamp_path: teleop/timestamp_us
+    resample: previous
+    transform: ee_pose_matrix_to_quaternion

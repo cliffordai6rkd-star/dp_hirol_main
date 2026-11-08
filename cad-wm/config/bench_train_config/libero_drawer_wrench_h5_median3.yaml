@@ -1,0 +1,114 @@
+# Run from cad-wm:
+# python -m train.trainer.cad_wm_train -c <this file>
+# CAD-WM training on the causal median-3 wrench copy.  The original HDF5 is
+# kept untouched; the filtered copy also stores obs/wrenches_raw for audit.
+dataloader:
+  backend: h5
+  root: ../dataset/wm_data/KITCHEN_SCENE1_open_the_top_drawer_of_the_cabinet_and_put_the_bowl_in_it_demo_wrench_with_dq_tau_median3.hdf5
+  h5_episode_group: data
+  h5_fields:
+    q:
+      path: obs/joint_states
+    dq:
+      path: obs/dq
+      columns: [0, 1, 2, 3, 4, 5, 6]
+    tau:
+      path: obs/tau
+      columns: [0, 1, 2, 3, 4, 5, 6]
+    wrench:
+      path: obs/wrenches
+  high_fps: 20
+  state_history_horizon: 10
+  pad_history: true
+  prediction_horizon: 8
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, dq, tau, wrench]
+
+contact_gate:
+  metric: force_xyz_l2
+  label_mode: three_phase
+  # Keep the DP thresholds unchanged.
+  free_threshold: 8.0
+  contact_threshold: 8.0
+  contact_enter_frames: 5
+  contact_exit_frames: 5
+  # Confirmed entry/exit windows are backfilled to their first native frame.
+  precontact_seconds: 1.0
+  class_weights: [1.0, 1.0, 1.0]
+
+model:
+  implementation: model.cad_wm.CADWorldModel
+  inputs: [q, dq, tau]
+  outputs: [wrench]
+  joint_dim: 7
+  hidden_dim: 128
+  lstm_layers: 2
+  flow_layers: 4
+  free_dynamics_hidden_dim: 128
+  flow_inference_steps: 8
+  flow_solver: heun
+  attention_heads: 4
+  ffn_multiplier: 4
+  dropout: 0.01
+
+loss:
+  contact_weight: 0.1
+  free_dynamics_weight: 0.1
+
+train:
+  device: cuda:0
+  downsample: false
+  dataset_on_device: false
+  batch_size: 128
+  num_workers: 0
+  val_num_workers: 0
+  pin_memory: true
+  max_optimizer_steps: 200000
+  num_epochs: 1000000
+  checkpoint_every_steps: 30000
+  checkpoint_eval:
+    enabled: true
+    batch_size: 128
+    seed: 42
+  validation_enabled: false
+  split_mode: episode
+  val_ratio: 0.1
+  # Full-dataset MSE is also evaluated at every 30k-step save.  This controls
+  # additional epoch-based evaluations and live PNG refresh cadence.
+  val_every: 20
+  plot_every_steps: 100
+  seed: 42
+  validation_seed: 42
+  contact_sampling:
+    enabled: true
+    phase_weights: [1.0, 5.0, 5.0]
+    future_phase_reduction: max
+    importance_correction: false
+  lr: 0.0001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  deterministic: false
+  cudnn_benchmark: true
+  allow_tf32: true
+  amp:
+    enabled: true
+    dtype: bfloat16
+  ema:
+    enabled: true
+    decay: 0.999
+    use_for_validation: true
+  scheduler:
+    name: cosine
+    warmup_steps: 500
+    eta_min: 0.000001
+  early_stopping:
+    enabled: false
+    patience: 20
+    warmup_epochs: 20
+    min_delta: 0.000001
+  output_dir: outputs/cad_wm_median3_200k
+  monitor_key: full_dataset_wrench_mse
+  top_k: 3
+  save_latest_checkpoint: true
+  wandb:
+    enabled: false

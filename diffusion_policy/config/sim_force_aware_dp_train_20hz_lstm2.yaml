@@ -10,14 +10,6 @@ policy:
   # Two LSTM layers, one image-query cross-attention layer, and the original DiT.
   force_encoder_layers: 2
   cross_attn_query_residual: true
-  # Use the percentage-based learned token mask from the base sim config.
-  image_blur_schedule: null
-  mask_schedule:
-    schedule_type: piecewise
-    total_steps: ${training.num_optimizer_steps}
-    piecewise_fractions: [0.0, 0.25, 0.75, 1.0]
-    piecewise_probabilities: [1.0, 1.0, 0.0, 0.0]
-    piecewise_interpolation: linear
 
 dataloader:
   batch_size: 32

@@ -1,0 +1,137 @@
+dataloader:
+  repo_id: next_human_data_fitted2_50hz_lbv3
+  root: data/train_episode/next_human_data_fitted2_50hz_lbv3
+  load_images: false
+  video_backend: torchcodec
+
+  # Tau-free uses a 50-step history at 50 Hz.
+  horizon: 50
+  pad_history: false
+
+  contact_free: true
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    # ddq: observation.acceleration
+    delta_q: observation.delta_q
+    tau: observation.torque
+    # tau_other: observation.tau_other
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    - delta_q
+    - tau
+
+  # Purely causal, episode-local preprocessing. Operations run in listed order
+  # and are saved in the checkpoint for online replay.
+  filter_timestamp_key: timestamp
+  filters:
+    q:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    dq:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    delta_q:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+    tau:
+      enabled: false
+      operations:
+        - {type: median, window: 3}
+        # - {type: lowpass, cutoff_hz: 10.0}
+
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: lstm
+  inputs: [q, dq, delta_q]
+  input_dims:
+    q: 7
+    dq: 7
+    delta_q: 7
+  output_dim: 7
+  target_key: tau
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+loss:
+  type: mse
+  # Compute MSE_j in Nm^2 for each joint, then average the seven values.
+  # With joint_weights=null, an equal absolute Nm error has equal cost on all axes.
+  torque_loss_space: physical_nm
+  # Options: equal, mean_abs, max_abs, manual. Automatic modes use train split only.
+  joint_weight_mode: manual
+  joint_weights: [10, 10, 7.5, 7.5, 1, 1, 1]
+  # joint_weights: null
+  tau_weight: 1
+  wrench_weight: 0
+  force_scale_n: 1
+  moment_scale_nm: 1
+
+
+physics:
+  wrench_damping: 0.01
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+train:
+  device: cuda:0
+  batch_size: 512
+  num_workers: 4
+  # Hold out the two lowest-speed trajectories explicitly. This overrides the
+  # random episode choice that val_ratio and seed would otherwise make.
+  # val_ratio: 0.2
+  split_mode: episode
+  val_episode_indices: [15]
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 10
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 5
+    # This value is now in Nm^2 because the monitored metric is physical MSE.
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_free_sequence/50fps_10
+  monitor_key: val_tau_mse_nm2
+  scheduler_monitor_key: val_tau_mse_nm2
+  early_stopping_monitor_key: val_tau_mse_nm2
+  top_k: 5
+
+  ema:
+    enabled: false
+
+  wandb:
+    enabled: false

@@ -1,0 +1,107 @@
+dataloader:
+  repo_id: tau_refinement_ped_lerobotv3
+  root: data/train_episode/tau_refinement_ped_lerobotv3
+  contact_free: true
+  load_images: false
+  video_backend: torchcodec
+  filter_sample_rate_hz: 100
+  horizon: 50
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    tau: observation.torque
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys: [q, dq, delta_q, tau]
+
+  filter_timestamp_key: timestamp
+  filters:
+    q: {enabled: false, operations: []}
+    dq: {enabled: false, operations: []}
+    delta_q: {enabled: false, operations: []}
+    tau:
+      enabled: true
+      dataset_preprocessed_operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: tcn
+  tcn_kernel_size: 2
+  tcn_dilations: [1, 2, 4, 8, 16, 18]
+  # Keep this off for a clean architecture ablation. The regular current-state
+  # skip remains active; adding a second finite-difference skip is a separate run.
+  current_delta_skip: false
+  inputs: [q, dq, delta_q]
+  input_dims:
+    q: 7
+    dq: 7
+    delta_q: 7
+  output_dim: 7
+  target_key: tau
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: silu
+  dropout: 0.1
+
+loss:
+  type: mse
+  tau_weight: 1.0
+  wrench_weight: 0.0
+  force_scale_n: 1.0
+  moment_scale_nm: 0.1
+  joint_weights: null
+
+physics:
+  wrench_damping: 0.02
+  pinocchio:
+    urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+    frame_name: gripper_tcp
+    reference_frame: LOCAL
+    locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+train:
+  device: cuda:0
+  batch_size: 512
+  num_workers: 4
+  val_ratio: 0.1
+  split_mode: sample
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+
+  lr: 1.0e-3
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 5
+    min_lr: 1.0e-6
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 10
+    min_delta: 1.0e-5
+
+  output_dir: outputs/tau_free_sequence/factr2_tcn_h50_sample_mse_lr1e3_noema
+  monitor_key: val_loss
+  scheduler_monitor_key: val_loss
+  early_stopping_monitor_key: val_loss
+  top_k: 5
+
+  ema:
+    enabled: false
+
+  wandb:
+    enabled: false

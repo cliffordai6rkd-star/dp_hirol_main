@@ -39,7 +39,7 @@ def fill_future_wrench_prefix(raw_wrench, future_contact):
 
 def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
                       shared_phase_signal, contact_detector, input_gate, normalizer, wrench_key,
-                      future_contact_mode="legacy_rollout"):
+                      future_contact_mode="legacy_rollout", return_processed_wrench=False):
     """The teacher's exact wrench data flow; also used by RenderNet inference."""
     validate_future_contact_mode(future_contact_mode)
     if shared_phase_signal:
@@ -65,7 +65,10 @@ def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
     # A suppressed physical zero must stay zero after a nonzero-mean normalizer.
     normalized_wrench = torch.where(model_wrench_mask, normalized_wrench,
                                      torch.zeros_like(normalized_wrench))
-    return normalized_wrench, contact, future_has_contact
+    result = (normalized_wrench, contact, future_has_contact)
+    if return_processed_wrench:
+        result = result + (gated_wrench,)
+    return result
 
 
 class WrenchPreprocessor(nn.Module):

@@ -1,0 +1,21 @@
+dataloader:
+  repo_id: ft_test_data_lerobotv3
+  root: data/train_episode/Ft_test_data_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+  normalize_mode: null
+  horizon: 1
+  lowdim_keys:
+    q: observation.joint
+    v: observation.velocity
+    a: observation.acceleration
+    tau: observation.torque
+    wrench: observation.ft_window
+
+model:
+  input_dims:
+    q: 7
+    v: 7
+    a: 7
+    tau: 7
+    wrench: 6

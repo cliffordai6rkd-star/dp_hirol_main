@@ -1,0 +1,279 @@
+use_hardware: true
+use_simulation: false
+robot: fr3
+robot_config:
+  fr3:
+    dof: 7
+    ip: 192.168.1.206
+    stiffness:
+    - 300
+    - 300
+    - 300
+    - 300
+    - 100
+    - 100
+    - 100
+    filter_coeff: 1.0
+    collision_behaviour:
+      torque_min:
+      - 80.0
+      - 80.0
+      - 80.0
+      - 80.0
+      - 60.0
+      - 60.0
+      - 60.0
+      torque_max:
+      - 80.0
+      - 80.0
+      - 80.0
+      - 80.0
+      - 60.0
+      - 60.0
+      - 60.0
+      force_min:
+      - 80.0
+      - 80.0
+      - 80.0
+      - 80.0
+      - 60.0
+      - 60.0
+      force_max:
+      - 80.0
+      - 80.0
+      - 80.0
+      - 80.0
+      - 60.0
+      - 60.0
+gripper: null
+use_smoother: true
+smoother_type: ruckig
+smoother_config:
+  critical_damped:
+    type: critical_damped
+    omega_n: 25.0
+    zeta: 1.0
+    control_frequency: 800
+  adaptive_critical_damped:
+    type: adaptive_critical_damped
+    omega_n: 25.0
+    zeta: 1.0
+    control_frequency: 800
+    omega_n_min: 15.0
+    omega_n_max: 40.0
+    error_thresholds:
+      low: 0.01
+      high: 0.1
+    transition: sigmoid
+    omega_change_limit: 5.0
+  ruckig:
+    type: ruckig
+    control_frequency: 800
+    min_position:
+    - -2.7437
+    - -1.7837
+    - -2.9007
+    - -3.0421
+    - -2.8065
+    - 0.5445
+    - -3.0159
+    max_position:
+    - 2.7437
+    - 1.7837
+    - 2.9007
+    - -0.1518
+    - 2.8065
+    - 4.5169
+    - 3.0159
+    max_velocity:
+    - 2.096
+    - 2.096
+    - 2.096
+    - 2.096
+    - 4.208
+    - 3.344
+    - 4.208
+    max_acceleration:
+    - 8.0
+    - 8.0
+    - 8.0
+    - 8.0
+    - 8.0
+    - 8.0
+    - 8.0
+    max_jerk:
+    - 4000.0
+    - 4000.0
+    - 4000.0
+    - 4000.0
+    - 4000.0
+    - 4000.0
+    - 4000.0
+    synchronization: true
+    sync_mode: time
+async_control_frequency: 1000.0
+auto_enable_async_control: true
+sensor_dicts:
+  cameras:
+  - name: ee_cam
+    type: realsense_camera
+    cfg:
+      realsense_camera:
+        image_shape:
+        - 480
+        - 640
+        fps: 30
+        serial_number: '213622070741'
+        contain_depth: true
+        contain_imu: false
+  - name: third_person_cam
+    type: realsense_camera
+    cfg:
+      realsense_camera:
+        image_shape:
+        - 480
+        - 640
+        fps: 30
+        serial_number: '338122303378'
+        contain_depth: true
+        contain_imu: false
+  ft_sensors:
+  - name: ee_ft
+    type: ati_ft
+    cfg:
+      ati_ft:
+        ip: 192.168.1.131
+        test_times: 3000
+        async_save: true
+        save_freq: 200
+control_frequency: 1000.0
+controller_type: ik
+controller_config:
+  ik:
+    damping_weight: 0.3
+    ik_type: lm
+    tolerance: 1.0e-06
+    max_iteration: 200
+    pyroki_config:
+      num_seeds_init: 64
+      num_seeds_final: 8
+      total_steps: 22
+      init_steps: 8
+      pos_weight: 10.0
+      ori_weight: 5.0
+      limit_weight: 100.0
+      lambda_initial: 1.0
+      max_iterations: 22
+      enable_smoothness: true
+      smoothness_weight: 10
+model_type: model
+model_config:
+  name: fr3_pika_ati
+  cfg:
+    fr3_pika_ati:
+      urdf_path: assets/franka_fr3/fr3_pika_gripper_ati.urdf
+      mesh_offset: assets/franka_fr3
+      frames:
+      - base
+      - fr3_link0
+      - fr3_link1
+      - fr3_link2
+      - fr3_link3
+      - fr3_link4
+      - fr3_link5
+      - fr3_link6
+      - fr3_link7
+      - fr3_link8
+      - pika_gripper_ee
+      - gripper_base_link
+      - gripper_left_link
+      - gripper_right_link
+      base_link: base
+      ee_link: pika_gripper_ee
+      fixed_base: true
+      lock_joints:
+      - base: gripper_base_link
+        end: gripper_left_link
+      - base: gripper_base_link
+        end: gripper_right_link
+use_trajectory_planner: false
+buffer_type: buffer
+trajectory_planner_type: cart_polynomial
+plan_type: cartesian
+trajectory_config:
+  cart_polynomial:
+    interpolation_type: quintic
+    dt: 0.002
+    max_velocity: 1.2
+    enable_motion: false
+    enable_online_planning: true
+  buffer:
+    size: 6
+    dim: 7
+  duo_buffer:
+    size: 8
+    dim: 14
+traj_frequency: 450
+simulation: mujoco
+simulation_config:
+  mujoco:
+    scene_config_file: simulation/scene_config/fr3_insert_tube.yaml
+    robot_xml: assets/franka_fr3/fr3_pika_ati.xml
+    quat_sequence: xyzw
+    dt: 0.002
+    dof:
+    - 7
+    joint_names:
+    - fr3_joint1
+    - fr3_joint2
+    - fr3_joint3
+    - fr3_joint4
+    - fr3_joint5
+    - fr3_joint6
+    - fr3_joint7
+    actuator_names:
+    - fr3_actuator1
+    - fr3_actuator2
+    - fr3_actuator3
+    - fr3_actuator4
+    - fr3_actuator5
+    - fr3_actuator6
+    - fr3_actuator7
+    actuator_mode:
+    - position
+    - position
+    - position
+    - position
+    - position
+    - position
+    - position
+    tool_infos:
+      single:
+        type: gripper
+        joint_names:
+        - gripper_left_joint
+        actuator_names:
+        - pika_gripper_actuator
+    ee_site_name: fr3_ee_attachment
+    base_body:
+    - base
+    extra_render: true
+    max_traj_len: 80
+    use_custom_key_frame: true
+    sensor_dict:
+      ee_cam:
+        resolution:
+        - 480
+        - 640
+      side_cam:
+        resolution:
+        - 480
+        - 640
+      third_person_cam:
+        resolution:
+        - 480
+        - 640
+target_site_name:
+- target_site
+tcp_visualization_site:
+- TCP_site

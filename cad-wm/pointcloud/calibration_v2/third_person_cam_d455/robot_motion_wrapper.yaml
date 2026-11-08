@@ -1,0 +1,23 @@
+motion_config: !include pointcloud/calibration_v2/third_person_cam_d455/motion_config_without_gripper.yaml
+data_collection:
+  save_path_prefix: calibration_v2_robotmotion_auto
+  data_record_frequency: 30
+  image_visualization: false
+  rerun_visualization: false
+  task_description: Calibration v2 RobotMotion automatic collection
+  task_description_goal: Collect Franka robot poses and camera AprilTag detections
+  task_description_steps: Move through configured grid poses and save valid detections.
+motion_control:
+  control_loop_time: 0.02
+  enable_keyboard_listener: false
+  reset_space: joint
+  reset_arm_command:
+  - -0.002240852524182456
+  - -0.7834976804122445
+  - -7.442107452836265e-05
+  - -2.357436399024249
+  - -0.00532840631613707
+  - 1.566669550357334
+  - 0.7724277178011111
+  reset_tool_command:
+    single: 1.0

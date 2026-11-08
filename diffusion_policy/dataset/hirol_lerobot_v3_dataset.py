@@ -1184,6 +1184,23 @@ class HirolLeRobotV3Dataset(BaseImageDataset):
         val_set.image_randomer_shared = False
         return val_set
 
+    def get_all_episodes_dataset(self) -> "HirolLeRobotV3Dataset":
+        """An unaugmented view of every valid episode window for checkpoint inference."""
+        evaluation = copy.copy(self)
+        evaluation.indices = create_indices(
+            self.episode_ends,
+            sequence_length=self.sequence_length,
+            pad_before=self.pad_before,
+            pad_after=self.sampler_pad_after,
+            episode_mask=np.ones(len(self.episode_ends), dtype=bool),
+        )
+        evaluation.indices = evaluation._filter_indices_for_windowed_features(evaluation.indices)
+        evaluation.phase_labels = evaluation._build_phase_labels(evaluation.indices)
+        evaluation.image_randomer = None
+        evaluation.image_randomer_config = None
+        evaluation.image_randomer_shared = False
+        return evaluation
+
     def get_phase_labels(self) -> np.ndarray:
         """Return phase labels aligned with dataset indices.
 

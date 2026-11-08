@@ -15,12 +15,8 @@ policy:
   cross_attn_layers: 1
   cross_attn_query_residual: false  # Use fused CA tokens without adding image tokens.
   camera_attention_mode: joint
-  # Use identical unmasked images in all three ablations.
+  # Use identical clear images in all three ablations.
   image_blur_schedule: null
-  mask_schedule:
-    schedule_type: constant
-    start_probability: 0.0
-    end_probability: 0.0
 
 dataloader:
   batch_size: 64

@@ -1,0 +1,152 @@
+{
+  "schema_version": "1.0",
+  "created_at_utc": "2026-06-18T15:31:31.552299+00:00",
+  "created_by": "pointcloud/calibration_v2/export_camera_extrinsics.py",
+  "opencv_hand_eye_method": "tsai",
+  "frame_convention": {
+    "robot_base": "Franka/base frame used by calibration robot pose matrices",
+    "end_effector": "Franka end-effector frame used by Ft_test_data ee_states.single.pose",
+    "camera": "RealSense color optical frame: x right, y down, z forward",
+    "transform_direction": "T_parent_camera maps homogeneous points from camera frame into parent frame"
+  },
+  "cameras": {
+    "ee_cam": {
+      "camera_name": "ee_cam",
+      "calibration_type": "eye_in_hand",
+      "parent_frame": "end_effector",
+      "transform_name": "T_ee_camera",
+      "T_ee_camera": [
+        [
+          0.021354949845769466,
+          -0.7119510224237396,
+          0.7019043437583761,
+          -0.1512741222660403
+        ],
+        [
+          0.9994694519800328,
+          -0.002066764856972547,
+          -0.03250450802210331,
+          -0.007012139261442403
+        ],
+        [
+          0.024592288950353203,
+          0.7022260819371622,
+          0.7115291625586153,
+          -0.15004633795435068
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "intrinsics": {
+        "width": 640,
+        "height": 480,
+        "ppx": 321.7101745605469,
+        "ppy": 242.95489501953125,
+        "fx": 608.9013061523438,
+        "fy": 608.174560546875,
+        "coeffs": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "source_json": "pointcloud/calibration_v2/ee_cam_d435/data_ee_cam.json",
+      "num_samples": 47,
+      "verification": {
+        "samples": 47,
+        "mean_position_error_m": 0.014791414550464158,
+        "max_position_error_m": 0.023113906694973194,
+        "mean_position_error_mm": 14.791414550464157,
+        "max_position_error_mm": 23.113906694973192,
+        "mean_rotation_error_deg": 0.4010899072387461,
+        "max_rotation_error_deg": 1.1249072812819216,
+        "translation_mean_m": [
+          0.5222094482630643,
+          0.022766612946793528,
+          -0.02953849052748754
+        ],
+        "translation_std_m": [
+          0.007546456457520124,
+          0.0064815301663275855,
+          0.0049896026702711494
+        ],
+        "constant_transform_checked": "T_base_tag"
+      }
+    },
+    "third_person_cam": {
+      "camera_name": "third_person_cam",
+      "calibration_type": "eye_to_hand",
+      "parent_frame": "robot_base",
+      "transform_name": "T_base_camera",
+      "T_base_camera": [
+        [
+          -0.026560434413265055,
+          0.39525979523972143,
+          -0.9181852958912118,
+          1.3175535886812766
+        ],
+        [
+          0.9994751291858697,
+          0.027542225987078117,
+          -0.01705555412661236,
+          0.06165917818942811
+        ],
+        [
+          0.018547492085663253,
+          -0.9181563701541966,
+          -0.3957838683961261,
+          0.6752037874092608
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "intrinsics": {
+        "width": 640,
+        "height": 480,
+        "ppx": 325.61102294921875,
+        "ppy": 247.9328155517578,
+        "fx": 387.9551696777344,
+        "fy": 387.35284423828125,
+        "coeffs": [
+          -0.05548924207687378,
+          0.06312240660190582,
+          -0.0004928535199724138,
+          0.0005864492268301547,
+          -0.019877292215824127
+        ]
+      },
+      "source_json": "pointcloud/calibration_v2/third_person_cam_d455/data_third_person_cam.json",
+      "num_samples": 48,
+      "verification": {
+        "samples": 48,
+        "mean_position_error_m": 0.01713761881917382,
+        "max_position_error_m": 0.026514819284467313,
+        "mean_position_error_mm": 17.13761881917382,
+        "max_position_error_mm": 26.51481928446731,
+        "mean_rotation_error_deg": 0.8841074492908293,
+        "max_rotation_error_deg": 1.806817728672587,
+        "translation_mean_m": [
+          0.08672742856336346,
+          -0.02141287781378717,
+          -0.3831077222209613
+        ],
+        "translation_std_m": [
+          0.007941988496759401,
+          0.00788260522266329,
+          0.006115993573184946
+        ],
+        "constant_transform_checked": "T_ee_tag"
+      }
+    }
+  }
+}

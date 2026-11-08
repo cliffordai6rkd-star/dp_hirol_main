@@ -139,11 +139,11 @@ def stage_command(name, stage, plan, repo_root=REPO_ROOT):
     return command
 
 
-def run_stage(command, directory, env, repo_root=REPO_ROOT):
+def run_stage(command, directory, env, repo_root=REPO_ROOT, *, allow_existing=False):
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=False)
+    directory.mkdir(parents=True, exist_ok=allow_existing)
     print("Running: " + shlex.join(command), flush=True)
-    with (directory / "train.log").open("w") as log:
+    with (directory / "train.log").open("a" if allow_existing else "w") as log:
         process = subprocess.Popen(command, cwd=repo_root, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:

@@ -95,22 +95,14 @@ policy:
   contact_history_reducer: ${task.contact_history_reducer}
   contact_norm: ${contact_norm}
   input_gate_enabled: false
-  image_mask_scope: full_context
+  image_blur_scope: full_context
   image_blur_schedule:
-    schedule_type: cosine
-    start_step: 0
-    end_step: 10000
+    schedule_type: linear
+    total_steps: ${training.num_optimizer_steps}
     start_sigma: 5.0
     end_sigma: 0.0
-  # Retained for legacy token-mask checkpoints; RGB blur takes precedence.
-  mask_schedule:
-    schedule_type: cosine
-    start_step: 0
-    end_step: 10000
-    start_probability: 1.0
-    end_probability: 0.0
-    exponential_rate: 5.0
-
+    start_fraction: 0.25
+    end_fraction: 0.75
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   update_after_step: 0

@@ -52,7 +52,6 @@ def make_teacher(**overrides):
         contact_norm="l1", contact_threshold=2., free_threshold=1.,
         contact_enter_frames=5, contact_exit_frames=5,
         future_contact_mode="token_threshold", contact_fusion_gate=True,
-        mask_schedule={"schedule_type": "constant", "start_probability": 1.},
     )
     config.update(overrides)
     policy = ForceAwareDiffusionTransformerPolicy(**config).eval()
@@ -155,7 +154,10 @@ def test_gate_validation_and_unsupported_architectures():
 
 @pytest.mark.parametrize("blur", [False, True])
 def test_full_context_curriculum_cannot_perturb_closed_observations(blur):
-    teacher = make_teacher(image_blur_schedule={"schedule_type": "constant", "start_sigma": 1.} if blur else None)
+    teacher = make_teacher(image_blur_schedule={
+        "total_steps": 1, "start_sigma": 1., "end_sigma": 0.,
+        "start_fraction": 0.25, "end_fraction": 0.75,
+    } if blur else None)
     obs = observations()
     obs["future_tau_ext"][0, -1, -1, 5] = 3.
     captured = {}
@@ -173,8 +175,6 @@ def test_full_context_curriculum_cannot_perturb_closed_observations(blur):
         torch.testing.assert_close(captured["images"][key][~gate], obs[key][~gate], rtol=0, atol=0)
         if blur:
             assert not torch.equal(captured["images"][key][gate], obs[key][gate])
-    expected_mask = torch.zeros_like(gate) if blur else gate
-    assert torch.equal(captured["image_token_mask"], expected_mask)
     torch.testing.assert_close(context.reshape(2, 2, 10, 16)[~gate], visual.reshape(2, 2, 10, 16)[~gate], rtol=0, atol=0)
 
 

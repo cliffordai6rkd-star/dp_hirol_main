@@ -1,0 +1,27 @@
+pinocchio:
+  urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+  frame_name: gripper_tcp
+  locked_joint_names:
+    - gripper
+    - gripper_joint1
+    - gripper_joint2
+
+plot:
+  output_dir: outputs/pinocchio_nero_check
+
+dataloader:
+  repo_id: nero_master_slave
+  root: data/train_episode/nero_master_slave_lerobotv3
+  load_images: false
+  video_backend: torchcodec
+  normalize_mode: null
+  horizon: 1
+  lowdim_keys:
+    q: observation.joint                     #q
+    v: observation.velocity                  #v
+    a: observation.acceleration
+    tau: observation.torque
+    # ee_velocity: observation.ee_velocity
+    # ee_acceleration: observation.ee_acceleration
+    # ee_pose: action.ee_pose                  #u             
+    # wrench: observation.ft_window            #lambda

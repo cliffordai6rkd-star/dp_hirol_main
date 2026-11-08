@@ -3,6 +3,42 @@ import pathlib
 from typing import Iterable, Optional, Sequence, Tuple
 
 
+def load_config_reference(config_ref: str, overrides=(), *, include_hydra=False):
+    """Compose a YAML file with the same defaults/interpolations as the CLI."""
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+    from omegaconf import OmegaConf
+
+    path = pathlib.Path(config_ref).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Config does not exist: {path}")
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+    # Student training is already inside a Hydra application. Restore its
+    # composition context after independently loading the teacher's defaults.
+    global_hydra = GlobalHydra.instance()
+    previous = global_hydra.hydra
+    global_hydra.clear()
+    try:
+        with initialize_config_dir(version_base=None, config_dir=str(path.parent)):
+            return compose(
+                config_name=path.stem,
+                overrides=list(overrides),
+                return_hydra_config=include_hydra,
+            )
+    finally:
+        GlobalHydra.instance().hydra = previous
+
+
+def configured_output_dir(cfg) -> pathlib.Path:
+    """Resolve the run directory once, before starting either training stage."""
+    from omegaconf import OmegaConf
+
+    output = cfg.get("output_dir") or OmegaConf.select(cfg, "hydra.run.dir")
+    if not output:
+        raise ValueError("Config must specify output_dir or hydra.run.dir")
+    return pathlib.Path(str(output)).expanduser().resolve()
+
+
 _CONFIG_REF_OPTIONS = ("-c", "--config")
 _LEGACY_CONFIG_OPTIONS = ("--config-name", "-cn", "--config-dir", "-cd")
 

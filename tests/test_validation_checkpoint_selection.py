@@ -411,7 +411,7 @@ def test_self_cross_config_ranks_raw_inference_mse_on_full_validation_split():
     "train_dp_image_wrench_selfattn_contact_blur_insert_usb",
 ])
 def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
-    from diffusion_policy.model.vision.contact_curriculum import BlurSigmaScheduler
+    from diffusion_policy.model.vision.contact_curriculum import FactrBlurScheduler
 
     root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
     with initialize_config_dir(config_dir=str(root), version_base=None):
@@ -420,7 +420,7 @@ def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
     start = cfg.training.validation_start_optimizer_step
     assert start == int(0.75 * cfg.training.num_optimizer_steps) == 150000
     assert baseline.training.validation_start_optimizer_step == 0
-    scheduler = BlurSigmaScheduler(**cfg.policy.image_blur_schedule)
+    scheduler = FactrBlurScheduler(**cfg.policy.image_blur_schedule)
     assert scheduler.sigma(start - 1) > 0
     assert scheduler.sigma(start) == 0
     assert cfg.val_dataloader.num_workers == 0
@@ -428,7 +428,8 @@ def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
     assert cfg.val_dataloader.prefetch_factor is None
     assert scheduler.sigma(50_000) == 5
     assert scheduler.sigma(100_000) == 2.5
-    assert cfg.policy.mask_schedule.start_probability == 0
+    assert cfg.policy.image_blur_schedule.start_fraction == 0.25
+    assert cfg.policy.image_blur_schedule.end_fraction == 0.75
     assert cfg.policy.force_temporal_encoder == "lstm"
     if "image_query" in name:
         assert cfg.policy.pre_cross_self_attn_layers == 0
@@ -437,24 +438,6 @@ def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
     else:
         assert cfg.policy.pre_cross_self_attn_layers == 1
         assert cfg.policy.cross_attn_layers == 0
-
-
-@pytest.mark.parametrize("name,sa_layers,ca_layers", [
-    ("train_dp_image_query_lstm_contact_mask_insert_usb", 0, 1),
-    ("train_dp_image_wrench_selfattn_contact_mask_insert_usb", 1, 0),
-])
-def test_contact_mask_configs_restore_legacy_token_mask(name, sa_layers, ca_layers):
-    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
-    with initialize_config_dir(config_dir=str(root), version_base=None):
-        cfg = compose(config_name="alation_study/" + name)
-    assert cfg.policy.image_blur_schedule is None
-    assert cfg.policy.image_mask_scope == "full_context"
-    assert cfg.policy.mask_schedule.schedule_type == "piecewise"
-    assert cfg.policy.mask_schedule.total_steps == cfg.training.num_optimizer_steps
-    assert list(cfg.policy.mask_schedule.piecewise_fractions) == [0.0, 0.25, 0.75, 1.0]
-    assert list(cfg.policy.mask_schedule.piecewise_probabilities) == [1.0, 1.0, 0.0, 0.0]
-    assert cfg.policy.pre_cross_self_attn_layers == sa_layers
-    assert cfg.policy.cross_attn_layers == ca_layers
 
 
 def test_negative_validation_start_is_rejected(tmp_path):

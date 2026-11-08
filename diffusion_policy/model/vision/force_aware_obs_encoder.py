@@ -152,7 +152,6 @@ class ForceAwareObsEncoder(nn.Module):
         )
         self.image_modality = nn.Parameter(torch.zeros(1, 1, 1, self.n_emb))
         self.force_modality = nn.Parameter(torch.zeros(1, 1, 1, self.n_emb))
-        self.image_mask_token = nn.Parameter(torch.zeros(1, 1, self.n_emb))
         self.camera_embedding = (
             nn.Parameter(
                 torch.zeros(1, 1, len(self.image_keys), 1, self.n_emb)
@@ -257,7 +256,6 @@ class ForceAwareObsEncoder(nn.Module):
         nn.init.normal_(self.obs_position, std=0.02)
         nn.init.normal_(self.image_modality, std=0.02)
         nn.init.normal_(self.force_modality, std=0.02)
-        nn.init.normal_(self.image_mask_token, std=0.02)
         if self.camera_embedding is not None:
             nn.init.normal_(self.camera_embedding, std=0.02)
         self._set_backbone_frozen()
@@ -362,7 +360,7 @@ class ForceAwareObsEncoder(nn.Module):
         return tokens[:, 0], tokens[:, patch_start:]
 
     def _encode_image_streams(self, images, image_keys, batch_size, obs_steps,
-                              image_token_mask=None, *, input_grad=False):
+                              *, input_grad=False):
         """Shared visual path, before wrench encoding or attention fusion."""
         camera_groups = {}
         for key in image_keys:
@@ -391,11 +389,6 @@ class ForceAwareObsEncoder(nn.Module):
                            + self.image_modality)
             if self.camera_embedding is not None:
                 patch_image = patch_image + self.camera_embedding[:, :, camera_index]
-            if image_token_mask is not None:
-                patch_image = torch.where(
-                    image_token_mask[:, :, None, None],
-                    self.image_mask_token.reshape(1, 1, 1, self.n_emb), patch_image,
-                )
             camera_patch_tokens.append(patch_image)
         return encoded_camera_patches, camera_patch_tokens
 
@@ -426,7 +419,6 @@ class ForceAwareObsEncoder(nn.Module):
         self,
         image: Optional[torch.Tensor] = None,
         wrench_history: Optional[torch.Tensor] = None,
-        image_token_mask: Optional[torch.Tensor] = None,
         images: Optional[Mapping[str, torch.Tensor]] = None,
         contact_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -514,20 +506,9 @@ class ForceAwareObsEncoder(nn.Module):
                 raise ValueError("contact_gate must be on the same device as images and wrench_history")
 
         obs_position = self.obs_position[:, :obs_steps]
-        if image_token_mask is not None and image_token_mask.shape != (
-            batch_size,
-            obs_steps,
-        ):
-            raise ValueError(
-                "image_token_mask must be [B, To], "
-                f"got {tuple(image_token_mask.shape)}"
-            )
-        if image_token_mask is not None and contact_gate is not None:
-            # Closed observations must retain the original visual tokens.
-            image_token_mask = image_token_mask & contact_gate
 
         encoded_camera_patches, camera_patch_tokens = self._encode_image_streams(
-            images, image_keys, batch_size, obs_steps, image_token_mask,
+            images, image_keys, batch_size, obs_steps,
         )
 
         force = self.wrench_projection(wrench_history)

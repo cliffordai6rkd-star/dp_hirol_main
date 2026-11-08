@@ -25,10 +25,6 @@ policy:
   pre_cross_self_attn_layers: 0  # This baseline has no cross-attention stage.
   camera_attention_mode: joint
   image_blur_schedule: null
-  mask_schedule:
-    schedule_type: constant
-    start_probability: 0.0
-    end_probability: 0.0
 
 logging:
   tags: [baseline, dinov3, self-attention, future-wrench, dual-camera, ee-pose]

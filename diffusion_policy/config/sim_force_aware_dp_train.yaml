@@ -86,17 +86,14 @@ policy:
   contact_history_reducer: ${task.contact_history_reducer}
   contact_norm: ${contact_norm}
   input_gate_enabled: false
-  image_mask_scope: full_context
-  # Learned whole-observation image-token mask.  The milestones are fractions
-  # of training.num_optimizer_steps, so 100k steps means 25k/75k boundaries.
-  image_blur_schedule: null
-  mask_schedule:
-    schedule_type: piecewise
+  image_blur_scope: full_context
+  image_blur_schedule:
+    schedule_type: linear
     total_steps: ${training.num_optimizer_steps}
-    piecewise_fractions: [0.0, 0.25, 0.75, 1.0]
-    piecewise_probabilities: [1.0, 1.0, 0.0, 0.0]
-    piecewise_interpolation: linear
-
+    start_sigma: 5.0
+    end_sigma: 0.0
+    start_fraction: 0.25
+    end_fraction: 0.75
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   update_after_step: 0

@@ -29,10 +29,13 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 from omegaconf import open_dict
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
+from diffusion_policy.common.checkpoint_action_mse import (
+    ACTION_MSE_KEY, record_checkpoint_action_mse,
+)
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.common.phase_sampler import PhaseWeightedDistributedSampler
@@ -208,7 +211,10 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
 
 
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
-    include_keys = ("global_step", "optimizer_step", "epoch", "freeze_config", "topk_state")
+    include_keys = (
+        "global_step", "optimizer_step", "epoch", "freeze_config", "topk_state",
+        "action_mse_metrics",
+    )
 
     def __init__(
         self,
@@ -389,6 +395,15 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     "dataset and policy action_reference_key settings must match"
                 )
         validation_dataset = dataset.get_validation_dataset()
+        if OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
+            if (cfg.checkpoint.topk.monitor_key != ACTION_MSE_KEY
+                    or cfg.checkpoint.topk.mode != "min" or cfg.checkpoint.topk.k < 1):
+                raise ValueError(
+                    "checkpoint.action_mse requires checkpoint.topk.monitor_key="
+                    f"{ACTION_MSE_KEY}, mode=min and k>=1 so the best teacher is retained"
+                )
+            if self.is_main_process:
+                self._checkpoint_eval_dataset = dataset.get_all_episodes_dataset()
         distributed_cfg = cfg.training.get("distributed", {})
         batch_size_is_global = bool(
             distributed_cfg.get("batch_size_is_global", True)
@@ -603,7 +618,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             )
 
         # Keep initialization deterministic across ranks, then decorrelate runtime
-        # randomness used by augmentation, noise, and curriculum masking.
+        # randomness used by augmentation and diffusion noise; the image blur
+        # curriculum is deterministic for a given optimizer step.
         runtime_seed = int(cfg.training.seed) + distributed.rank
         torch.manual_seed(runtime_seed)
         np.random.seed(runtime_seed)
@@ -729,6 +745,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             )
                         )
                     if self.is_main_process:
+                        step_log.update(self._checkpoint_action_mse_and_log(
+                            cfg, device, wandb_run, json_logger,
+                        ))
                         if use_optimizer_step_checkpoints:
                             self._save_optimizer_step_checkpoint(
                                 cfg,
@@ -904,6 +923,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                                 )
                             )
                         if self.is_main_process:
+                            last_log.update(self._checkpoint_action_mse_and_log(
+                                cfg, device, wandb_run, json_logger,
+                            ))
                             self._save_optimizer_step_checkpoint(
                                 cfg,
                                 topk_manager=topk_manager,
@@ -1037,6 +1059,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             self._save_latest_checkpoint()
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot()
+        self._record_action_mse_score(cfg, topk_path)
 
     def _save_optimizer_step_checkpoint(
         self,
@@ -1079,6 +1102,85 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         self._update_best_checkpoint(topk_manager)
         if cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
+        self._record_action_mse_score(cfg, checkpoint_path)
+
+    def _record_action_mse_score(self, cfg, checkpoint):
+        if OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
+            record_checkpoint_action_mse(self.output_dir, self.action_mse_metrics, checkpoint)
+
+    def _checkpoint_action_mse_and_log(self, cfg, device, wandb_run, json_logger):
+        """Score current EMA weights on two newly sampled complete episodes."""
+        if not OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
+            return {}
+        previous = getattr(self, "action_mse_metrics", {})
+        if previous.get("optimizer_step") == self.optimizer_step:
+            return previous
+
+        options = cfg.checkpoint.action_mse
+        dataset = self._checkpoint_eval_dataset
+        row_episodes = dataset.episode_index[dataset.indices[:, 0]]
+        available = np.unique(row_episodes)
+        count = int(options.get("num_episodes", 2))
+        batch_size = int(options.get("batch_size", 16))
+        if count < 1 or count > len(available) or batch_size < 1:
+            raise ValueError("Checkpoint action MSE needs a positive batch size and enough valid episodes")
+        # A new draw at every checkpoint; no fixed held-out episode set.
+        seed = int(cfg.training.seed) + int(self.optimizer_step)
+        selected = np.random.default_rng(seed).choice(available, size=count, replace=False)
+        rows = np.flatnonzero(np.isin(row_episodes, selected))
+        dataloader = DataLoader(
+            Subset(dataset, rows.tolist()), batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=device.type == "cuda",
+            generator=torch.Generator().manual_seed(seed),
+        )
+        policy = self.ema_model if self.ema_model is not None else self.model
+        was_training = policy.training
+        policy.eval()
+        raw_sum = normalized_sum = 0.0
+        action_count = 0
+        log.info("Checkpoint inference: step=%d episodes=%s windows=%d",
+                 self.optimizer_step, selected.tolist(), len(rows))
+        try:
+            devices = [device] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices), torch.no_grad(), self._autocast(cfg, device):
+                generator = torch.Generator(device=device).manual_seed(seed)
+                for batch in dataloader:
+                    batch = dict_apply(batch, lambda value: value.to(device, non_blocking=True))
+                    prediction = policy.predict_action(batch["obs"], generator=generator)["model_action_pred"]
+                    start = policy.action_start_index
+                    end = start + policy.n_action_steps
+                    prediction = prediction[:, start:end].float()
+                    target = batch["action"][:, start:end].float()
+                    if prediction.shape != target.shape or target.shape[1] != policy.n_action_steps:
+                        raise ValueError("Checkpoint inference and target action chunks must match")
+                    raw_sum += torch.nn.functional.mse_loss(prediction, target, reduction="sum").item()
+                    normalized_sum += torch.nn.functional.mse_loss(
+                        policy.normalizer["action"].normalize(prediction),
+                        policy.normalizer["action"].normalize(target), reduction="sum",
+                    ).item()
+                    action_count += target.numel()
+        finally:
+            policy.train(was_training)
+        mse = raw_sum / action_count
+        if not math.isfinite(mse):
+            raise ValueError("Checkpoint inference produced a non-finite action MSE")
+        self.action_mse_metrics = {
+            ACTION_MSE_KEY: mse,
+            "checkpoint_action_mse_normalized": normalized_sum / action_count,
+            "episode_ids": selected.tolist(),
+            "num_windows": len(rows),
+            "num_action_values": action_count,
+            "inference_seed": seed,
+            "policy_state_key": "ema_model" if self.ema_model is not None else "model",
+            "epoch": self.epoch,
+            "global_step": self.global_step,
+            "optimizer_step": self.optimizer_step,
+        }
+        json_logger.log(self.action_mse_metrics)
+        self._log_wandb(wandb_run, self.action_mse_metrics, step=self.global_step)
+        log.info("Checkpoint action MSE=%.8f (normalized=%.8f)",
+                 mse, self.action_mse_metrics["checkpoint_action_mse_normalized"])
+        return self.action_mse_metrics
 
     def _validate_and_log(self, cfg, dataloader, device, wandb_run, json_logger):
         if not self._validation_enabled(cfg):

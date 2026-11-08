@@ -1,0 +1,52 @@
+io:
+  # Inputs are never edited. Each episode is copied and atomically updated.
+  input_dir: data/train_episode/tau_refinement
+  output_dir: data/train_episode/tau_refinement_rts_matched_labels
+  patterns: ["*.h5", "*.hdf5"]
+
+robot:
+  urdf_path: sim_mesh/nero/nero_with_gripper.urdf
+  locked_joint_names: [gripper, gripper_joint1, gripper_joint2]
+
+keys:
+  timestamp: teleop/timestamp_us
+  q: teleop/q_follower
+  dq: teleop/dq_follower
+  tau: teleop/tau_follower
+
+  # q_rts/dq_rts are diagnostics; training still consumes measured q/dq.
+  q_rts: teleop/q_rts
+  dq_rts: teleop/dq_rts
+  ddq_causal: teleop/ddq_kf_causal
+  ddq_rts: teleop/ddq_follower
+  ddq_rts_std: teleop/ddq_rts_std
+  tau_id: teleop/tau_id_rts
+  tau_g: teleop/tau_g
+  tau_id_filtered: teleop/tau_id_rts_filtered
+  tau_other: teleop/tau_other_cal
+
+processing:
+  timestamp_scale_to_s: 1.0e-6
+  # This directory already contains sign-corrected dq. For raw Nero firmware
+  # velocity use [-1, -1, -1, -1, -1, 1, -1] exactly once.
+  dq_sign: [1, 1, 1, 1, 1, 1, 1]
+  # Preserve measured q/dq in RNEA and fill only NaN dropouts from RTS state.
+  rnea_state_source: measured
+  # tau_follower is already filtered with this causal filter. The gravity
+  # residual uses the measured torque directly; this filter only validates the
+  # source dataset contract.
+  torque_filter:
+    cutoff_hz: 10.0
+    median_window: 1
+
+estimator:
+  # Scalar values apply to all joints; a 7-element list tunes joints separately.
+  position_std: 5.0e-4
+  velocity_std: 3.0e-2
+  # Continuous white-jerk spectral-density scale (sqrt units).
+  jerk_std: 2.0
+  initial_position_std: 1.0e-2
+  initial_velocity_std: 2.0e-1
+  initial_acceleration_std: 5.0
+  # Do not smooth across acquisition discontinuities larger than this interval.
+  max_gap_s: 0.1

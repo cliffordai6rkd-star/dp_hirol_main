@@ -1,0 +1,51 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual environments and local env files
+.conda-env/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Training outputs, checkpoints, and experiment logs
+outputs/
+data/outputs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.npz
+*.npy
+events.out.tfevents*
+wandb/
+runs/
+mlruns/
+
+# Local datasets and converted artifacts
+data/train_episode/
+*.h5
+*.hdf5
+*.parquet
+*.mp4
+
+# Plots and generated reports
+loss_epoch.png
+val_loss_epoch.png
+loss_steps.png
+loss_summary.png
+
+# Editor, OS, and local agent state
+.DS_Store
+Thumbs.db
+.codex
+.agents/

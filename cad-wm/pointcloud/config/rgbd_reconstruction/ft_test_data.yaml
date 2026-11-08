@@ -1,0 +1,33 @@
+dataset:
+  dir: data/train_episode/Ft_test_data
+  input_json: data_with_rgbd_extrinsics.json
+
+output:
+  dir: outputs/rgbd_pointcloud/Ft_test_data
+  name: episode_fused_stride8.ply
+  save_per_frame: false
+  ascii: false
+
+frames:
+  start: 1
+  end: 2
+  step: 1
+  max: null
+
+projection:
+  cameras: third_person_cam
+  stride: 1
+  depth_min: 0.05
+  depth_max: 2.0
+  depth_scale_m_per_unit: null
+
+downsample:
+  voxel_size: 0.001
+  max_points: 2000000
+
+visualization:
+  view: true
+  view_existing: null
+  coord_frame_size: 0.08
+  window_width: 1280
+  window_height: 800

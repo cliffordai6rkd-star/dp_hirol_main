@@ -19,67 +19,61 @@ conda env create -p /opt/lcx/conda/envs/dp -f conda_environment.yaml
 
 ### DP 与蒸馏统一入口
 
-在仓库根目录激活训练环境后，使用 `train_pipeline.py` 选择运行阶段：
+在仓库根目录激活训练环境，使用 `train_civi.py` 分别传入教师和学生配置：
 
 ```bash
 conda activate fdp
 
-# 单独训练 DP：20 Hz、LSTM 2 层、cross-attn 1 层，动作包含夹爪命令。
-python train_pipeline.py dp --gpus 0
-
-# 默认先训练 FDP，再自动把教师检查点交给 RenderNet 蒸馏。
-python train_pipeline.py --gpus 0
-
-# 已有教师时只蒸馏；该命令会立即读取此目录当前保存的检查点。
-python train_pipeline.py distill \
-  --teacher-run data/outputs/2026.10.31/14.44.46_sim_force_aware_dp_train_20hz_lstm2_libero_open_top_drawer_put_bowl_20hz_force_aware \
+# 默认先训练教师，再选择去噪推理动作 MSE 最低的 checkpoint 蒸馏学生。
+python train_civi.py \
+  --teacher-config diffusion_policy/config/train_civi_teacher.yaml \
+  --student-config diffusion_policy/config/train_distill_render_net_student.yaml \
   --gpus 0
 
-# 只打印两个阶段的命令，不创建目录、不启动训练。
-python train_pipeline.py --dry-run
+# 只训练教师，或使用 teacher-config 指定目录中已完成的教师只训练学生。
+python train_civi.py --stage teacher
+python train_civi.py --stage student \
+  --teacher-config diffusion_policy/config/train_civi_teacher.yaml \
+  --student-config diffusion_policy/config/train_distill_render_net_student.yaml
+
+# 直接指定现有教师权重，只训练学生，无需 action_mse.json。
+python train_civi.py --stage student \
+  --teacher-config diffusion_policy/config/train_civi_teacher.yaml \
+  --student-config diffusion_policy/config/train_distill_render_net_student.yaml \
+  --teacher-checkpoint /path/to/teacher.ckpt
+
+# 预览命令，以及四卡运行示例。
+python train_civi.py --dry-run
+python train_civi.py --gpus 0,1,2,3 --nproc-per-node 4
 ```
 
-DP 默认使用 `sim_force_aware_dp_train_20hz_lstm2_gripper.yaml`：50 条 episode 全部训练、batch 32、最多 200,000 个优化步，500 步 warmup 后余弦退火，每 20,000 步保存并保留最近 3 个检查点。教师不留出验证 episode，默认将最终 `latest.ckpt` 交给学生。动作顺序为 `[x,y,z,qx,qy,qz,qw,gripper]`：前七维读取 `observation.ee_pose`，最后一维只读取原始 OSC action 的第 6 列（零起始），保留 LIBERO 的 `-1/+1` 夹爪开合指令；不修改源数据。当前任务尚未配置闭环 env runner。
+`--student` 是 `--student-config` 的别名。配置中的 `output_dir` 指定各阶段输出目录；重新开始实验时修改目录，继续教师训练时设置 `training.resume=true`，继续学生训练时设置 `training.resume_from`。`--teacher-override KEY=VALUE` / `--student-override KEY=VALUE` 可重复使用；教师覆盖项也传给学生以保持数据路径一致。多卡由入口内部启动 `torchrun`，batch 按全局大小分配。
 
-蒸馏默认使用最新版 `train_distill_render_net_patch_context.yaml`：像素级 sigmoid 强度场（初值 0.1、渲染阈值 0）、像素级 RGB residual、Denoiser MSE + patch context 强度损失，Token MSE 仅记录。教师 context 响应逐图 min–max 后作为 patch 强度监督，学生头学习重建稠密场。batch 32、最多 1000 epoch，继承新教师的 8 维动作、normalizer 与数据字段，并保持学生原有的 10% episode 验证划分。前两轮 warmup 只优化强度头，之后联合优化 RGB 与强度头。验证去噪 MSE 连续 30 个 epoch 没有至少 0.0001 的改善时自动停止。每轮保存 `latest.ckpt`，验证最优时保存 `best.ckpt`。学生验证 episode 已参与教师训练，不能视为未见数据上的任务泛化评估。设置 `dataset.val_ratio=0` 可选回全数据蒸馏，此时没有验证早停。
+教师配置 `train_civi_teacher.yaml` 沿用 20 Hz、两层 LSTM、image-query cross-attention 与 8 维动作 `[x,y,z,qx,qy,qz,qw,gripper]`。`dataset_path` 统一指定数据位置；默认全部 episode 参与训练，batch 32、最多 200,000 个优化步。`training.checkpoint_every_optimizer_steps=20000` 控制保存间隔。
 
-`--teacher-run` 默认优先使用 `best.ckpt`，没有则使用 `latest.ckpt`；可用 `--teacher-selection latest` 明确选择最新权重，或用 `--teacher-checkpoint /path/to/model.ckpt` 精确指定。`all` 模式始终使用刚完成的 DP 阶段作为教师，DP 阶段失败时不会启动蒸馏。
+每次保存前，教师从全部有效 episode 中重新随机抽取 `checkpoint.action_mse.num_episodes=2` 条轨迹，对两条轨迹的全部有效窗口执行完整去噪推理，不受固定验证划分、`max_val_steps` 或验证起始步数限制。关闭图像增强，使用 EMA（未开启 EMA 时使用 online），比较策略执行的未来动作片段与数据动作，按所有动作元素计算原始动作空间 MSE `checkpoint_action_mse`；另记录归一化 MSE。每次使用新的抽样和推理种子，保存所选 episode 编号和窗口数。Top-K 保留 MSE 最低的 3 个 checkpoint，另保留用于恢复训练的 `latest.ckpt`。
 
-默认采用两阶段流程：FDP 训练结束后冻结完整教师，第二阶段只更新 RenderNet。
-光团与 wrench 的对应关系由网络通过教师去噪输出监督学习，不预设力分量到颜色、
-方向或亮度的规则；`all` 按顺序启动两个阶段。
+学生的 `train_distill_render_net_student.yaml` 是完整独立 YAML，包含主干、门控、损失、数据加载、缓存、优化器、EMA、调度和早停配置。默认 Token MSE 蒸馏，独立 gate 与 RGB 主干，/8、/4 空间调制，sigmoid 强度场阈值 0.1，batch 16、学习率 0.0002；前 5 个 epoch 训练强度场，随后冻结 gate 并训练完整 RGB 主干。学生从传入的教师配置读取数据路径和时间窗口，从该配置的输出目录读取 `checkpoints/action_mse.json`，选择仍保留的 MSE 最低 checkpoint；模型、权重与 normalizer 从该 checkpoint 加载。学生对数据配置的覆盖项（如 10% episode 验证划分、关闭增强）写在学生 YAML 的 `dataset` 下。
 
-两个阶段的配置及 Hydra 参数分别传入，支持自定义配置路径和多卡运行：
+也可在学生 YAML 中设置 `teacher_checkpoint: /path/to/teacher.ckpt`；显式权重优先于 MSE 自动选择，命令行 `--teacher-checkpoint` 优先于 YAML。`teacher_config` 只填写教师 `.yaml`，权重路径填写在 `teacher_checkpoint`。单独运行 `train_distill_render_net.py --config <学生.yaml>` 时，可将 `teacher_config: null` 设为从 checkpoint 内读取数据配置；保留教师 YAML 则从该 YAML 读取数据路径和时间窗口。两种方式均从 checkpoint 加载模型与 normalizer。
 
-```bash
-python train_pipeline.py all \
-  --dp-config diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2_gripper.yaml \
-  --distill-config diffusion_policy/config/train_distill_render_net_patch_context.yaml \
-  --dp-override training.num_optimizer_steps=200000 \
-  --distill-override training.num_epochs=500 \
-  --distill-override dataloader.batch_size=32 \
-  --output-dir data/outputs/my_dp_distill_run
-
-python train_pipeline.py all --gpus 0,1,2,3 --nproc-per-node 4
-```
-
-每个 `--dp-override` / `--distill-override` 后跟一个 `key=value`，可重复使用；多卡由入口内部启动 `torchrun`，batch 按全局大小分配。省略阶段参数等同于 `all`，仍支持 `dp` 或 `distill` 单独运行。
-
-输出集中在一个新目录，教师和学生分别保存配置、`train.log`、指标和检查点：
+默认输出结构：
 
 ```text
-data/outputs/<日期>/<时间>_dp_distill_pipeline/
-├── pipeline.json
+data/outputs/civi/
 ├── teacher/
+│   ├── pipeline.json
 │   ├── checkpoints/
+│   │   ├── action_mse.json
+│   │   ├── best.ckpt
+│   │   └── latest.ckpt
 │   └── train.log
 └── student/
     ├── checkpoints/
     └── train.log
 ```
 
-默认自动选择 `teacher/checkpoints/best.ckpt`，没有则使用 `latest.ckpt`，并传给学生。
-`--output-dir` 可以指定共同的输出目录；已有目录会报错，以免覆盖实验。
+学生实际使用的 checkpoint 写入学生保存的 `config.yaml`；自动选择时另记录 MSE 和 episode 编号。教师阶段失败会停止整条流程。旧的 `train_pipeline.py` 入口仍可运行历史实验；新流程使用 `train_civi.py`。
 
 ### 双相机纯视觉 DP（DINOv3 + Transformer）
 
@@ -575,6 +569,43 @@ checkpoint。修改 `normalization`、旧配置的 `strength_scale` 或分位数
 使用原始 wrench 直接归一化的旧 checkpoint 不包含一致的预处理状态，推理脚本
 会提示重新训练，避免静默改变模型训练时的输入分布。旧错误训练产物已清理。
 
+### FiLM 开关对比视频
+
+对启用了 `render_net.spatial_modulation.enabled` 的学生 checkpoint，使用相同输入分别执行
+完整渲染推理和关闭 decoder FiLM 的推理，保留 checkpoint 的 wrench、注意力、接触门控和区域阈值：
+
+```bash
+python diffusion_policy/scripts/compare_render_net_film_episode.py \
+  --checkpoint data/outputs/2026.11.07/22.23.10_distill_gate_sft_v2/student/checkpoints/best.ckpt \
+  --episode 0 --camera both
+```
+
+输出位于学生目录的 `attention_visualize/render_net_film_episode_0_both_comparison.mp4`。
+视频严格分三行：第一行 FiLM 开启，第二行 FiLM 关闭；每行按相机横向展示原图、预测强度场、
+实际接触/区域门控、渲染 RGB、相对原图的有符号 RGB 残差；第三行同步绘制两次渲染结果的
+MAE 和 RMSE 曲线及时间游标。曲线只展示当前时刻及之前的数据，纵轴随已观测到的最大值扩展。
+默认处理完整 episode，使用数据集 FPS；`--stride 2` 可隔帧处理并保持播放速度。
+
+逐帧 MAE、MSE、RMSE、最大绝对差写入同名前缀的 `_metrics.csv`，预览 PNG 和
+`_metadata.json` 记录整体统计与推理配置。指标使用各窗口最后一帧、选定相机的原始分辨率浮点
+RGB（范围 `[0,1]`），在缩放和视频压缩前计算；整体统计按 RGB 元素数量加权。
+`--difference-gain 5` 只放大前两行的残差显示，`--panel-width 224` 只调整显示尺寸。
+`--output /path/to/comparison.mp4` 可指定位置，`--overwrite` 可覆盖已有结果。
+
+判断是否可以移除 FiLM 时，可进一步比较 Token 蒸馏误差和下游动作误差：
+
+```bash
+python diffusion_policy/scripts/evaluate_render_net_film.py \
+  --checkpoint data/outputs/2026.11.07/22.23.10_distill_gate_sft_v2/student/checkpoints/best.ckpt
+```
+
+默认复现学生原始验证 episode 划分，逐窗口对比 FiLM 开关，使用相同的三组扩散噪声种子
+`42 43 44`。从保存的教师 checkpoint 加载冻结的图像编码器和动作专家，比较与教师融合
+context 的 Token MSE、实际执行动作片段与数据动作的 MSE、3D 位置 RMSE、姿态角误差及
+夹爪 MSE，分别统计全部窗口和渲染门控开启的窗口。学生目录下的 `film_evaluation/`
+保存逐窗口 CSV 和包含各 episode／种子结果的 `summary.json`。这是现有权重直接关闭 FiLM
+的离线评估；去掉 FiLM 后重新训练的性能及闭环任务成功率需单独验证。
+
 ## 系统结构
 
 ```text
@@ -854,7 +885,7 @@ absolute_action_chunk = output["action"]  # [B, 8, 7]
 切换绝对/相对动作表示后必须使用新的输出目录或关闭 `training.resume`，
 不能续训另一种动作表示的 checkpoint。
 
-## Contact-Aware Curriculum Masking
+## Contact-Aware Pixel Blur Curriculum
 
 FDP 使用未归一化、物理单位下的七轴 `tau_ext` 绝对值之和（L1 范数）计算接触阶段。当前配置使用
 `free_threshold=0.65` 和 `contact_threshold=1.5`：超过接触阈值进入接触，低于 free 阈值退出接触，中间区间保持锁存状态。
@@ -1413,16 +1444,12 @@ current_observation | full_context
 
 `full_context` 同时模糊该样本所有相机、全部观测步；`current_observation`
 只模糊最新观测。高斯标准差由真实 optimizer update 驱动，不再通过随机抽取
-样本、替换为 mask token 来逐渐开放视觉信息。`policy.image_blur_schedule` 支持：
-
-```text
-constant | linear | cosine | exponential | piecewise
-```
-
-一般 force-aware 配置默认从 `sigma=5` 按 cosine 日程降到 0，结束步数沿用各
-配置原来的课程时长。没有视觉课程的 baseline 显式设置 `image_blur_schedule: null`，
-并保持原来的零 mask 概率。训练日志新增 `curriculum/blur_sigma` 和
-`curriculum/blurred_image_fraction`；模糊课程的 `masked_image_fraction` 始终为 0。
+样本。`policy.image_blur_schedule` 使用 FACTR 的像素空间高斯核，配置为
+`schedule_type: linear`、`total_steps`、`start_sigma`、`end_sigma`、
+`start_fraction` 和 `end_fraction`。
+当前项目固定为前 25% 保持 `sigma=5`，25%–75% 在线性降到 `sigma=0`，后 25%
+保持清晰。没有视觉课程的 baseline 设置 `image_blur_schedule: null`。训练日志使用
+`curriculum/blur_sigma` 和 `curriculum/blurred_image_fraction`。
 
 200k 步的接触课程有两个独立实验：
 
@@ -1435,9 +1462,9 @@ constant | linear | cosine | exponential | piecewise
 
 | Optimizer 步数 | 高斯标准差 |
 | --- | --- |
-| 0–50k | `sigma=5` |
-| 50k–150k | 从 5 线性降到 0；100k 时为 2.5 |
-| 150k–200k | `sigma=0`，严格使用原始清晰图像 |
+| 0–50k（0–25%） | `sigma=5` |
+| 50k–150k（25%–75%） | 从 5 线性降到 0；100k 时为 2.5 |
+| 150k–200k（75%–100%） | `sigma=0`，严格使用原始清晰图像 |
 
 `training.validation_start_optimizer_step: 150000` 使前 150k 步
 跳过验证（包括 `val_loss`、`val_action_mse`、`val_action_mse_raw`）及动作采样评估，
@@ -1471,10 +1498,9 @@ bash scripts/train_usb_blur_after_current.sh \
 `active_train.pid`、两份 console log 和 `exit_codes.tsv`。通用队列入口
 `train_usb_baselines_after_current.sh` 支持重复传入 `--config` 指定其他顺序。
 
-`*_contact_mask_insert_usb` 配置恢复为旧的 learned token-mask 课程，按总训练步数的
-比例设置里程碑：前 25% 保持全遮蔽，中间 50% 线性降到 0，最后 25% 保持不遮蔽。
-`*_contact_blur_insert_usb` 继续使用 RGB 高斯模糊课程。已有训练目录和 checkpoint
-保存的配置仍按各自记录的课程执行，不会改变已运行实验的课程或权重格式。
+`*_contact_blur_insert_usb` 配置使用相同的 RGB 高斯模糊课程。`sigma` 在输入图像
+进入 DINO 和 ImageNet 标准化之前应用，FACTR 使用的零填充二维 depthwise 卷积保持
+在所有相机和观测步上的空间结构。
 
 ## 图像增强状态
 
@@ -1573,23 +1599,3 @@ python -m diffusion_policy.workspace.train_force_aware_diffusion_workspace \
   --config-name=train_force_aware_diffusion_workspace \
   logging.mode=offline
 ```
-
-ATTN_CKPT="data/outputs/2026.10.20/21.54.27_train_dp_image_query_lstm_insert_usb_insert_usb_force_aware/checkpoints/best.ckpt"
-
-# 查看网络结构和可选层
-python diffusion_policy/scripts/visualize_attention_episode.py \
-  --checkpoint "$ATTN_CKPT" --list-layers
-
-# 导出指定层
-python diffusion_policy/scripts/visualize_attention_episode.py \
-  --checkpoint "$ATTN_CKPT" \
-  --episode 0 --camera both \
-  --mode cross-attn --layer 0 \
-  --attention-percentiles 1 99 \
-  --save-frames --overwrite
-参数	含义
---mode auto	默认：优先 CA，其次融合 SA，最后 DINO
---mode cross-attn 或 --ca	查看 CA
---mode self-attn 或 --sa	查看融合模块的 SA
---mode dino	查看 DINO 主干内部 SA
---layer 0 / --layer -1	第一层 / 最后一层

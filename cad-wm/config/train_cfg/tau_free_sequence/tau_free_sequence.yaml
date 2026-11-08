@@ -1,0 +1,128 @@
+dataloader:
+  repo_id: tau_refinement_ped_lerobotv3
+  root: data/train_episode/tau_refinement_ped_lerobotv3
+  # Dataset contract confirmed during collection: every trajectory is contact-free.
+  contact_free: true
+  load_images: false
+  video_backend: torchcodec
+  filter_sample_rate_hz: 100
+
+  # NEXT uses a stateless 50-step look-back window at 100 Hz.
+  horizon: 50
+  # Skip the first 49 frames so every target has 50 real q observations.
+  pad_history: false
+
+  lowdim_keys:
+    q: observation.joint
+    # Optional NEXT ablation inputs. Add enabled keys to normalize_lowdim_keys.
+    dq: observation.velocity
+    delta_q: observation.delta_q
+    # On contact-free trajectories, measured motor torque is tau_free.
+    tau: observation.torque
+
+  normalize_mode: gaussian
+  normalize_lowdim_keys:
+    - q
+    - dq
+    - delta_q
+    - tau
+
+  # Unified causal preprocessing. This legacy dataset is already low-pass
+  # filtered; the complete source contract is still stored in new checkpoints.
+  filter_timestamp_key: timestamp
+  filters:
+    q: {enabled: false, operations: []}
+    dq: {enabled: false, operations: []}
+    delta_q: {enabled: false, operations: []}
+    tau:
+      enabled: true
+      dataset_preprocessed_operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+      operations:
+        - {type: lowpass, cutoff_hz: 10.0}
+
+model:
+  task: free_space_inverse_dynamics
+  history_mode: stateless_sliding_window
+  architecture: lstm
+
+  # Best currently available inputs. Valid ablations are [q] and, after
+  # reconverting real q_cmd, [q, dq, delta_q]. tau is supervision only.
+  inputs:
+    - q
+    - dq
+    - delta_q
+
+  input_dims:
+    q: 7
+    dq: 7
+    delta_q: 7
+  output_dim: 7
+  target_key: tau
+
+  hidden_dim: 128
+  num_layers: 2
+  head_hidden_dim: 256
+  head_num_layers: 2
+  activation: relu
+  dropout: 0.1
+
+loss:
+  # 七轴力矩使用普通归一化 MSE
+  type: mse
+
+  # 总 loss 权重
+  tau_weight: 1.0
+  wrench_weight: 0
+
+  # Wrench 各分量归一化尺度
+  force_scale_n: 1.0
+  moment_scale_nm: 0.1
+
+  # 可选逐关节权重
+  joint_weights: null
+
+train:
+  device: cuda:0
+  batch_size: 512
+  num_workers: 4
+  val_ratio: 0.1
+
+  # Random windows keep mixed motion regimes represented on both sides. This
+  # split is only used for in-distribution checkpoint ranking.
+  split_mode: sample
+  seed: 42
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  num_epochs: 1000
+  gradient_clip_norm: 1.0
+  scheduler:
+    name: reduce_on_plateau
+    factor: 0.5
+    patience: 5
+    min_lr: 1.0e-7
+
+  early_stopping:
+    enabled: true
+    patience: 20
+    warmup_epochs: 10
+    min_delta: 1.0e-4
+
+  output_dir: outputs/tau_free_sequence/ep7
+  monitor_key: val_peak_cvar_rmse_nm
+  top_k: 5
+
+  ema:
+    enabled: false
+    decay: 0.999
+    update_after_step: 0
+    update_every: 1
+    use_for_validation: true
+
+  wandb:
+    enabled: true
+    project: next
+    name: tau-free-lstm-h50-sample-peak-cvar
+    mode: online
+    log_every_steps: 10

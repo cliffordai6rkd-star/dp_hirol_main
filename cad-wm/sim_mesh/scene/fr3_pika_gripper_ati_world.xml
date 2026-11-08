@@ -1,0 +1,30 @@
+<mujoco model="fr3_pika_gripper_ati_world">
+  <include file="../franka_fr3/mjcf/fr3_pika_gripper_ati.compiled.xml"/>
+
+  <option gravity="0 0 0"/>
+  <statistic center="0.3 0 0.5" extent="1.2"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.2 0.25 1"/>
+    <global azimuth="-140" elevation="-25"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.35 0.42 0.48" rgb2="0.02 0.025 0.03" width="512" height="3072"/>
+    <texture name="floor_grid" type="2d" builtin="checker" mark="edge" rgb1="0.22 0.25 0.27" rgb2="0.12 0.14 0.16" markrgb="0.55 0.58 0.60" width="512" height="512"/>
+    <material name="floor_grid" texture="floor_grid" texuniform="true" texrepeat="6 6" reflectance="0.15"/>
+  </asset>
+
+  <worldbody>
+    <light name="key_light" pos="0.5 -0.5 2.0" dir="-0.2 0.2 -1" directional="true"/>
+    <geom name="floor" type="plane" size="2 2 0.05" material="floor_grid"/>
+
+    <geom name="world_x_axis" type="cylinder" fromto="0 0 0.015 0.35 0 0.015" size="0.006" rgba="1 0.05 0.05 1"/>
+    <geom name="world_y_axis" type="cylinder" fromto="0 0 0.02 0 0.35 0.02" size="0.006" rgba="0.05 0.8 0.05 1"/>
+    <geom name="world_z_axis" type="cylinder" fromto="0 0 0.025 0 0 0.35" size="0.006" rgba="0.05 0.25 1 1"/>
+
+    <site name="world_origin" type="sphere" pos="0 0 0" size="0.018" rgba="1 1 1 1"/>
+    <camera name="overview" pos="1.3 -1.4 0.9" xyaxes="0.73 0.68 0 -0.33 0.35 0.88" fovy="55"/>
+  </worldbody>
+</mujoco>
