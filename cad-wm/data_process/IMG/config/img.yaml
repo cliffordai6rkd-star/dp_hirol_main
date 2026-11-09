@@ -1,4 +1,4 @@
-datapath: "data/train_episode/moving_bread/moving_bread_hirol"
+datapath: "data/train_episode/moving_bread/moving_bread_robot"
 
 
 resize: True

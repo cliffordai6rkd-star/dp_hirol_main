@@ -25,9 +25,15 @@ dataloader:
   prediction_horizon: 8
   normalize_mode: gaussian
   normalize_lowdim_keys: [q, dq, tau, wrench]
+  # Same causal first-order 2 Hz low-pass as DP teacher/student, before windows.
+  wrench_filter:
+    enabled: true
+    cutoff_hz: 2.0
+    timestamp_path: states
+    timestamp_column: 0
 
 contact_gate:
-  # Use raw force XYZ, not joint torque or normalized wrench.
+  # Use filtered physical-unit force XYZ, before Gaussian normalization.
   metric: force_xyz_l2
   label_mode: three_phase
   free_threshold: 8.0

@@ -16,7 +16,7 @@ DEFAULT_CALIBRATION = Path("pointcloud/calibration_v2/camera_extrinsics.json")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Augment a HIROL RGB-D episode JSON with camera intrinsics, depth units, "
+            "Augment a robot RGB-D episode JSON with camera intrinsics, depth units, "
             "and per-frame camera extrinsics in the robot base frame."
         )
     )
@@ -56,13 +56,13 @@ def parse_args() -> argparse.Namespace:
         "--ee-pose-order",
         default="xyzw",
         choices=("xyzw", "wxyz"),
-        help="Quaternion order in ee_states.<robot-key>.pose after xyz. HIROL datasets use xyzw.",
+        help="Quaternion order in ee_states.<robot-key>.pose after xyz. robot datasets use xyzw.",
     )
     parser.add_argument(
         "--depth-scale-m-per-unit",
         type=float,
         default=0.001,
-        help="Depth PNG scale. Existing HIROL spec stores 16-bit depth in millimeters.",
+        help="Depth PNG scale. Existing robot spec stores 16-bit depth in millimeters.",
     )
     parser.add_argument(
         "--depth-aligned-to",

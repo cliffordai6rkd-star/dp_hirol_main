@@ -9,7 +9,7 @@
 `diffusion-policy-train/` 目录包含：
 
 - `diffusion-policy-train.tar.part-00` 到 `part-03`：完整镜像的四个分片，全部需要保留。U 盘是 FAT32，单文件不能超过 4 GiB。
-- `dp_hirol_main-source-data-model.tar.gz`：当前源码、配置、测试、Git 元数据、全部四份本地训练数据和本地 DINOv3 ViT-B/16 权重。
+- `dp_main-source-data-model.tar.gz`：当前源码、配置、测试、Git 元数据、全部四份本地训练数据和本地 DINOv3 ViT-B/16 权重。
 - `install.sh`：校验文件、导入镜像、解压项目；不会启动正式训练。
 - `load-image.sh`：仅导入镜像，供手动安装时使用。
 - `SHA256SUMS`、`使用说明.txt`：校验值和操作说明。
@@ -75,7 +75,7 @@ bash install.sh "$HOME/dp_training"
 安装完成后：
 
 ```bash
-cd "$HOME/dp_training/dp_hirol_main"
+cd "$HOME/dp_training/dp_main"
 bash docker/run_portable.sh check
 bash docker/run_portable.sh all
 ```
@@ -87,7 +87,7 @@ bash docker/run_portable.sh all
 
 `all` 才会开始正式训练，按顺序运行：
 
-1. 教师：`sim_force_aware_dp_train_20hz_lstm2_gripper_contact_gate.yaml`，未来逐点阈值接触 + 完整融合残差门控。
+1. 教师：`sim_force_aware_dp_train.yaml`，未来逐点接触 alpha + FACTR 图像模糊课程。
 2. 学生：`train_distill_render_net_patch_context.yaml`，自动读取刚训练的教师 checkpoint，重新生成兼容的教师目标。
 
 两阶段都启动与可见 GPU 数量相同的进程。全局 batch size 保持 32，由各卡平分；默认适用于 1、2、4、8 卡等能整除 32 的数量。
@@ -124,7 +124,7 @@ student/checkpoints/           学生权重
 终端退出会中断前台训练；长时间运行可放在 `tmux` 会话中。`Ctrl+C` 会停止当前训练进程。
 学生教师目标缓存位于 `data/cache/render_net_teacher`，当前配置结束时清理。
 
-新预处理和门控改变教师的输入及条件表示，需要微调或重训并验证动作性能后再生成蒸馏目标。
+新预处理和 contact alpha 改变教师的条件表示，需要微调或重训并验证动作性能后再生成蒸馏目标。
 `all` 自动衔接两阶段；如果要先验收教师的动作表现，使用 `dp` 单独训练，再使用 `distill`：
 
 ```bash
@@ -133,11 +133,11 @@ bash docker/run_portable.sh dp --output-dir /workspace/data/outputs/teacher_revi
 bash docker/run_portable.sh distill --teacher-run /workspace/data/outputs/teacher_review/teacher
 ```
 
-教师门控本身不保证学生 RGB 像素恒等。此迁移只提供训练环境和代码，并未验证新教师的动作表现。
+教师 alpha 本身不保证学生 RGB 像素恒等。此迁移只提供训练环境和代码，并未验证新教师的动作表现。
 
 ## 本次验证记录
 
-- 相关 pytest：**49 passed，19 warnings**，涵盖接触门控、教师/学生双进程 DDP、学生预热到联合训练、缓存、验证、恢复及流水线 checkpoint 交接。
+- 相关 pytest：覆盖 token alpha、教师/学生双进程 DDP、缓存、验证与流水线 checkpoint 交接。
 - 导出的 Docker 镜像内：**两个 CPU/Gloo 进程通过**通信和同步更新检查，均成功读取本地数据并加载真实 DINO，输出形状 `(1, 197, 768)`。
 - Bash 语法、Compose 配置解析、镜像内四卡训练命令 dry-run 通过。
 - 当前主机仅一张 GPU，且尚无可用的 NVIDIA 容器运行支持；**真实多 GPU / NCCL 尚未验证**，必须在目标主机执行 `check`。

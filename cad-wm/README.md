@@ -47,12 +47,22 @@ python -m train.trainer.cad_wm_train \
 The LIBERO config directly loads the specified HDF5 `data/demo_*` groups.
 Inputs and outputs both use native 20 Hz rows: the latest 10 history rows
 predict wrench at t+1 through t+8, corresponding to 0.05–0.40 s. Targets are
-read directly without timestamp interpolation or resampling. By default,
+read on those native rows without timestamp interpolation or resampling.
+Before windowing, each demo's six-axis wrench is filtered with a causal
+first-order 2 Hz low-pass, matching the DP teacher and student. The recurrence
+is `y[i] = y[i-1] + (1-exp(-2*pi*2*dt))*(x[i]-y[i-1])`, initialized from the
+first sample. `states[:,0]` supplies the measured intervals; state resets per
+demo. Normalization and contact labels use this filtered physical-unit signal.
+Configure this under `dataloader.wrench_filter`; the HDF5 remains unchanged.
+The historical `libero_drawer_wrench_h5_median3.yaml` filename now retains only
+the 200k-step preset, using the original source plus the same 2 Hz low-pass
+and writing to `outputs/cad_wm_lowpass2hz_200k`.
+By default,
 `train.validation_enabled: false` uses all demos for training and normalization.
 Set it to true to enable the configured 90/10 demo split. `--no-val` overrides
 validation settings on the command line.
 
-Contact labels use raw force XYZ L2 norm with thresholds of 8 N for entry
+Contact labels use filtered physical-unit force XYZ L2 norm with thresholds of 8 N for entry
 and exit and five consecutive frames. Strict >8 enters and strict <8 exits;
 equality holds the state and resets the streak. Offline labels backfill each
 confirmed entry/exit window to its first frame. The one second preceding the
@@ -68,7 +78,7 @@ contracts are rejected. With `train.checkpoint_eval.enabled: true`, every
 scheduled save (including the final save) runs full Flow inference over every
 dataset window exactly once, without contact oversampling. Inference uses the
 saved EMA weights when enabled, eight Heun steps, and fixed noise per anchor.
-Predictions are denormalized and compared with recorded future wrench:
+Predictions are denormalized and compared with low-pass filtered future wrench:
 
 ```text
 full_dataset_wrench_mse = sum((predicted_wrench - recorded_wrench)^2) / (windows * 8 * 6)
@@ -120,7 +130,10 @@ future_wrench = result["future_wrench"]  # [B,8,6], N and N.m
 
 Inputs are physical-unit [B,T,7] histories at 20 Hz, ending at the current row.
 Outputs are denormalized into the original sensor frame. DP applies its own
-normalizer and must use matching future timestamps. Pass source_noise=[B,8,6]
+normalizer and must use matching future timestamps. Outputs already represent
+the filtered training target; do not apply another low-pass to each predicted
+window. Retrain weights and normalization for the new filtering recipe; saved
+legacy checkpoints retain their original preprocessing contract. Pass source_noise=[B,8,6]
 to reproduce a sample; otherwise each call draws fresh Gaussian noise. See
 [the training config documentation](config/bench_train_config/README.md) for
 timing, phase and data-definition details.

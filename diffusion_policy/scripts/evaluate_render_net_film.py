@@ -111,7 +111,8 @@ def summarize(records):
 
 
 @torch.inference_mode()
-def evaluate_batch(policy, model, preprocessor, batch, indices, seeds, *, amp_enabled, amp_dtype):
+def evaluate_batch(policy, model, preprocessor, batch, indices, seeds, *, amp_enabled, amp_dtype,
+                   use_teacher_ffn=False):
     device = next(policy.parameters()).device
     obs = {key: value.to(device) for key, value in batch["obs"].items()}
     target = batch["action"].to(device)
@@ -121,8 +122,10 @@ def evaluate_batch(policy, model, preprocessor, batch, indices, seeds, *, amp_en
     autocast = torch.autocast("cuda", dtype=amp_dtype) if amp_enabled else contextlib.nullcontext()
     with autocast:
         _, branches = comparison.compare_observations(model, preprocessor, obs, list(model.image_keys))
-        tokens = {branch: policy.obs_encoder.encode_image_context(branches[branch]["rendered"])
-                  for branch in BRANCHES}
+        encode_kwargs = {"apply_fusion_ffn": True} if use_teacher_ffn else {}
+        tokens = {branch: policy.obs_encoder.encode_image_context(
+            branches[branch]["rendered"], **encode_kwargs,
+        ) for branch in BRANCHES}
     token_mse = {branch: (tokens[branch].float() - teacher_tokens).square().flatten(1).mean(1)
                  for branch in BRANCHES}
     active = torch.stack([gate.flatten(1).any(-1) for gate in branches["film_on"]["gate"].values()]).any(0)
@@ -193,6 +196,7 @@ def run(args):
                 batch_records = evaluate_batch(
                     policy, model, preprocessor, batch, [index for _, _, index in items], args.seeds,
                     amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                    use_teacher_ffn=bool(cfg.get("distillation", {}).get("use_teacher_ffn", False)),
                 )
                 locations = {index: (episode, anchor) for episode, anchor, index in items}
                 for record in batch_records:

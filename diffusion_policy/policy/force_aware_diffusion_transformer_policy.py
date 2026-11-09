@@ -89,14 +89,10 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
         future_contact_mode: str = "legacy_rollout",
-        contact_fusion_gate: bool = False,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
-        self.contact_fusion_gate = bool(contact_fusion_gate)
-        if self.contact_fusion_gate and future_phase_wrench_key is None:
-            raise ValueError("contact_fusion_gate requires future_phase_wrench_key and future contact data")
         obs_shape_meta = shape_meta.get("obs", {})
         configured_image_keys = tuple(
             sorted(
@@ -218,11 +214,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
-        if self.contact_fusion_gate and (
-            getattr(obs_encoder, "cross_attn_query", None) != "image"
-            or getattr(obs_encoder, "cross_attn_layers", 0) <= 0
-        ):
-            raise ValueError("contact_fusion_gate requires image-query fusion with cross_attn_layers > 0")
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
             raise ValueError(
                 f"obs_encoder cameras={list(encoder_image_keys)} do not match "
@@ -453,20 +444,33 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             raise ValueError(f"policy requires {self.n_obs_steps} observation steps")
         return images, raw_phase_wrench, raw_wrench, raw_future_phase_wrench
 
-    def prepare_context_inputs(self, obs_dict):
+    def _prepare_context_inputs(self, obs_dict, *, return_future_contact=False):
         """Prepare RGB and wrench exactly as the teacher does, before learned encoders."""
         images, phase_wrench, wrench, future_phase_wrench = self._validate_obs(obs_dict)
-        normalized_wrench, contact, future_has_contact, processed_wrench = preprocess_wrench(
+        normalized_wrench, contact, future_contact_or_has, processed_wrench = preprocess_wrench(
             wrench, phase_wrench, future_phase_wrench,
             shared_phase_signal=self.phase_wrench_key == self.wrench_key,
             contact_detector=self.contact_detector, input_gate=self.input_gate,
             normalizer=self.normalizer, wrench_key=self.wrench_key,
             future_contact_mode=getattr(self, "future_contact_mode", "legacy_rollout"),
             return_processed_wrench=True,
+            return_future_contact=return_future_contact,
         )
         self._latest_processed_wrench = processed_wrench.detach()
         self._latest_normalized_wrench = normalized_wrench.detach()
-        return images, normalized_wrench, contact, future_has_contact
+        return images, normalized_wrench, contact, future_contact_or_has
+
+    def prepare_context_inputs(self, obs_dict):
+        """Prepare inputs while retaining the legacy reduced contact return."""
+        return ForceAwareDiffusionTransformerPolicy._prepare_context_inputs(
+            self, obs_dict, return_future_contact=False,
+        )
+
+    def prepare_context_inputs_with_future_contact(self, obs_dict):
+        """Prepare inputs and return the complete ``[B, To, K]`` contact mask."""
+        return ForceAwareDiffusionTransformerPolicy._prepare_context_inputs(
+            self, obs_dict, return_future_contact=True,
+        )
 
     def _encode_context(
         self,
@@ -474,18 +478,16 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         apply_curriculum_mask: bool,
         generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        images, normalized_wrench, contact, future_has_contact = self.prepare_context_inputs(obs_dict)
-        contact_gate = None
-        if self.contact_fusion_gate:
-            if future_has_contact is None:
-                raise ValueError("contact_fusion_gate requires future contact data; current contact is insufficient")
-            contact_gate = future_has_contact
+        images, normalized_wrench, contact, future_contact = (
+            self.prepare_context_inputs_with_future_contact(obs_dict)
+        )
+        future_has_contact = future_contact.any(dim=-1)
         # The curriculum degrades image evidence only for windows whose
         # *future* reaches contact.  The current observation is often still
         # free in these windows, so using ``contact`` would blur the wrong
         # phase (or miss the future-contact window entirely).  Configurations
         # without a future phase signal use their current contact state.
-        blur_contact = future_has_contact if future_has_contact is not None else contact
+        blur_contact = future_has_contact
         sigma = 0.0
         blurred_images = torch.zeros_like(blur_contact, dtype=torch.bool)
         if self.blur_scheduler is not None and apply_curriculum_mask:
@@ -494,8 +496,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 blurred_images = select_contact_blur_mask(
                     blur_contact, scope=self.image_blur_scope
                 )
-                if contact_gate is not None:
-                    blurred_images = blurred_images & contact_gate
             if blurred_images.any():
                 images = {key: value.clone() for key, value in images.items()}
                 for key, value in images.items():
@@ -514,11 +514,18 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "curriculum/blurred_image_fraction": blurred_images.float().mean().item(),
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
-        gate_kwargs = {} if contact_gate is None else {"contact_gate": contact_gate}
+        fusion_kwargs = {}
+        if (
+            getattr(self.obs_encoder, "cross_attn_query", None) == "image"
+            and getattr(self.obs_encoder, "cross_attn_layers", 0) > 0
+        ):
+            fusion_kwargs["future_contact"] = future_contact
+            if "contact_alpha" in obs_dict:
+                fusion_kwargs["contact_alpha"] = obs_dict["contact_alpha"][:, :self.n_obs_steps]
         return self.obs_encoder(
             images=images,
             wrench_history=normalized_wrench,
-            **gate_kwargs,
+            **fusion_kwargs,
         )
 
     def conditional_sample(

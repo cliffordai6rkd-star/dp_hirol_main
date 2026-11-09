@@ -5,6 +5,8 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 
+from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
+
 
 class _CrossAttentionBlock(nn.Module):
     """Parameters for cross-attention, an optional query residual and an FFN."""
@@ -285,7 +287,9 @@ class ForceAwareObsEncoder(nn.Module):
             self.last_cross_attention_weights_by_camera = None
             self.last_cross_attention_weights_by_layer = []
 
-    def _apply_cross_attention(self, block, query_tokens, memory_tokens, image_keys, patch_counts):
+    def _apply_cross_attention(
+        self, block, query_tokens, memory_tokens, image_keys, patch_counts, alpha=None,
+    ):
         if self.cross_attn_query == "wrench":
             query = block.force_norm(query_tokens)
             memory_norm = block.image_norm
@@ -318,14 +322,16 @@ class ForceAwareObsEncoder(nn.Module):
                 else torch.cat(attended_by_camera, dim=1)
             )
             weights = weights_by_camera
-        return self.finish_cross_attention(block, query_tokens, attended), weights
+        return self.finish_cross_attention(block, query_tokens, attended, alpha=alpha), weights
 
-    def finish_cross_attention(self, block, query_tokens, attended):
+    def finish_cross_attention(self, block, query_tokens, attended, *, alpha=None):
         """Apply the query residual and tokenwise fusion layers to a CA update.
 
         Also used by spatial interventions to replay the exact downstream
         fusion on a replaced update without recomputing unchanged encoders.
         """
+        if alpha is not None:
+            attended = alpha.to(device=attended.device, dtype=attended.dtype) * attended
         fused = block.cross_dropout(attended)
         if self.cross_attn_query_residual:
             fused = query_tokens + fused
@@ -392,12 +398,22 @@ class ForceAwareObsEncoder(nn.Module):
             camera_patch_tokens.append(patch_image)
         return encoded_camera_patches, camera_patch_tokens
 
-    def encode_image_context(self, images, *, input_grad=False):
+    def encode_image_context(self, images, *, input_grad=False, apply_fusion_ffn=False):
         """Encode images using the existing visual weights, embeddings and output norm.
 
         This path never runs the wrench encoder or fusion attention. Frozen
         backbone weights can still propagate gradients to rendered RGB inputs.
+        Training-only distillation can replay each fusion FFN with a zero
+        attention update, matching the image-query teacher when alpha is zero.
         """
+        if apply_fusion_ffn and (
+            self.cross_attn_query != "image" or not self.cross_attn_layers
+            or not self.cross_attn_query_residual or self.pre_cross_self_attn_layers
+        ):
+            raise ValueError(
+                "Fusion FFN image supervision requires image-query attention with "
+                "a query residual and no preceding joint self-attention"
+            )
         keys = self.image_keys or tuple(sorted(images))
         if set(images) != set(keys):
             raise KeyError("Image context requires the encoder's configured cameras")
@@ -413,14 +429,19 @@ class ForceAwareObsEncoder(nn.Module):
         _, tokens = self._encode_image_streams(
             images, keys, batch_size, obs_steps, input_grad=input_grad,
         )
-        return self.context_norm(torch.cat(tokens, dim=2).flatten(1, 2))
+        context = torch.cat(tokens, dim=2).reshape(batch_size * obs_steps, -1, self.n_emb)
+        if apply_fusion_ffn:
+            for block in (self, *self.extra_cross_attention_layers):
+                context = self.finish_cross_attention(block, context, torch.zeros_like(context))
+        return self.context_norm(context.reshape(batch_size, -1, self.n_emb))
 
     def forward(
         self,
         image: Optional[torch.Tensor] = None,
         wrench_history: Optional[torch.Tensor] = None,
         images: Optional[Mapping[str, torch.Tensor]] = None,
-        contact_gate: Optional[torch.Tensor] = None,
+        future_contact: Optional[torch.Tensor] = None,
+        contact_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if images is not None and image is not None:
             raise ValueError("provide either images or the legacy image argument, not both")
@@ -493,17 +514,34 @@ class ForceAwareObsEncoder(nn.Module):
                 f"wrench history has {history_steps} steps, expected {self.wrench_history_steps}"
             )
 
-        if contact_gate is not None:
+        alpha = contact_alpha
+        if future_contact is not None:
             if self.cross_attn_query != "image" or self.cross_attn_layers <= 0:
-                raise ValueError("contact_gate requires image-query fusion with cross_attn_layers > 0")
-            if not isinstance(contact_gate, torch.Tensor) or contact_gate.dtype != torch.bool:
-                raise TypeError("contact_gate must be a bool tensor [B, To]")
-            if contact_gate.shape != (batch_size, obs_steps):
-                raise ValueError("contact_gate must have shape [B, To] matching the observations")
-            if contact_gate.device != wrench_history.device or any(
-                contact_gate.device != images[key].device for key in image_keys
+                raise ValueError(
+                    "future_contact alpha requires image-query fusion with cross_attn_layers > 0"
+                )
+            if not isinstance(future_contact, torch.Tensor) or future_contact.dtype != torch.bool:
+                raise TypeError("future_contact must be a bool tensor [B, To, K]")
+            if future_contact.ndim != 3 or future_contact.shape[:2] != (batch_size, obs_steps):
+                raise ValueError(
+                    "future_contact must have shape [B, To, K] matching the observations"
+                )
+            if future_contact.device != wrench_history.device or any(
+                future_contact.device != images[key].device for key in image_keys
             ):
-                raise ValueError("contact_gate must be on the same device as images and wrench_history")
+                raise ValueError(
+                    "future_contact must be on the same device as images and wrench_history"
+                )
+            if alpha is None:
+                alpha = compute_contact_alpha(future_contact)
+        if alpha is not None:
+            if self.cross_attn_query != "image" or self.cross_attn_layers <= 0:
+                raise ValueError("contact_alpha requires image-query cross-attention")
+            if alpha.shape != (batch_size, obs_steps):
+                raise ValueError("contact_alpha must have shape [B, To]")
+            alpha = alpha.to(
+                device=wrench_history.device, dtype=wrench_history.dtype,
+            ).reshape(batch_size * obs_steps, 1, 1)
 
         obs_position = self.obs_position[:, :obs_steps]
 
@@ -529,9 +567,6 @@ class ForceAwareObsEncoder(nn.Module):
         flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
             batch_size * obs_steps, image_token_count, self.n_emb
         )
-        # Save X before any joint image/wrench attention. All fusion residuals,
-        # including pre-CA self-attention and FFNs, are selected together below.
-        x_base = flat_images
         if self.pre_cross_self_attn_layers:
             # Per observation: [all camera patches, all temporal wrench outputs].
             # Self-attention changes features, preserving token order/length.
@@ -562,7 +597,7 @@ class ForceAwareObsEncoder(nn.Module):
             # the temporal encoder and optional joint self-attention.
             for block in (self, *self.extra_cross_attention_layers):
                 context, weights = self._apply_cross_attention(
-                    block, context, memory, image_keys, camera_patch_counts
+                    block, context, memory, image_keys, camera_patch_counts, alpha=alpha
                 )
                 if self.capture_cross_attention:
                     detached = (
@@ -575,7 +610,5 @@ class ForceAwareObsEncoder(nn.Module):
                 if self.camera_attention_mode == "per_camera":
                     self.last_cross_attention_weights_by_camera = self.last_cross_attention_weights
 
-        if contact_gate is not None:
-            context = torch.where(contact_gate.reshape(-1, 1, 1), context, x_base)
         context = context.reshape(batch_size, -1, self.n_emb)
         return self.context_norm(context)

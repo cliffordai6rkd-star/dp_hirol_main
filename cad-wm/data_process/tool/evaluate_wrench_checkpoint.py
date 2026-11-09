@@ -70,7 +70,7 @@ def draw_curves(output, label, horizon_index, selected, predictions, targets, ta
         fig, axis = plt.subplots(figsize=(11.5, 3.8), constrained_layout=True)
         rmse = float(np.sqrt(np.square(predicted[:, index] - truth[:, index]).mean()))
         for ax in (axis, axes.flat[index]):
-            ax.plot(times, truth[:, index], color=BLUE, linewidth=1.6, label="Ground truth (median-3)")
+            ax.plot(times, truth[:, index], color=BLUE, linewidth=1.6, label="Ground truth (training preprocessing)")
             ax.plot(times, predicted[:, index], color=YELLOW, linewidth=1.4, label="Prediction")
             ax.set_ylabel(f"{channel} ({'N' if index < 3 else 'N m'})")
             ax.set_xlabel("Target time within episode (s)")
@@ -196,7 +196,8 @@ def main():
         "mode": "recorded-input forecast replay; no simulator steps", "validation_evidence": validation_evidence,
         "episodes": len(dataset.episodes), "windows": len(dataset), "seed": seed,
         "sampling": "every valid window once, without oversampling", "precision": "float32",
-        "input_fields": list(STATE_KEYS), "ground_truth": "median-3 filtered wrench used to train this checkpoint",
+        "input_fields": list(STATE_KEYS), "ground_truth": "physical wrench with this checkpoint's training preprocessing",
+        "wrench_filter": config["dataloader"].get("wrench_filter", {}),
         "time_alignment": "anchor t forecast for t+k*0.05 is compared with recorded wrench at t+k*0.05",
         "all_horizons": overall, "by_horizon": by_horizon, "by_target_phase": by_phase,
         "force_jump_diagnostic": {"top_decile_threshold_n_per_frame": change_threshold,
@@ -219,7 +220,7 @@ def main():
     (output / "README.md").write_text(
         "# CAD-WM wrench forecast replay\n\n"
         "This checkpoint trained on all 50 episodes; these figures are training-data replay, not held-out validation.\n\n"
-        "Blue = recorded median-3 ground truth; yellow = model forecast. Each figure fixes a forecast horizon and aligns by target time. "
+        "Blue = recorded ground truth with checkpoint training preprocessing; yellow = model forecast. Each figure fixes a forecast horizon and aligns by target time. "
         "Input histories contain only q/dq/tau. Forecasts use full noise-to-wrench Heun integration and checkpoint normalization.\n\n"
         f"Root: six individual channels and overview for {worst['episode']} (highest force MSE across all eight horizons), +0.05 s.\n\n"
         f"worst_400ms/: the same episode at +0.40 s. typical_50ms/: {typical['episode']} (median force MSE), +0.05 s.\n\n"

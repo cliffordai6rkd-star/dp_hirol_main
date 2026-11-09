@@ -3,7 +3,7 @@ task: diffusion_policy/config/lerobot_v3/task_lerobot_v3/moving_bread/fr3_moving
 name: moving_bread_cam_eee2ee_unet
 _target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
 
-dataset_path: data/train_episode/moving_bread/moving_bread_hirol_lerobotv3
+dataset_path: data/train_episode/moving_bread/moving_bread_lerobotv3
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}

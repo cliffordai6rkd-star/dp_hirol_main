@@ -9,7 +9,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
 )
 
 
-WRENCH_PREPROCESSING_VERSION = 2
+WRENCH_PREPROCESSING_VERSION = 3
 
 
 def validate_future_contact_mode(mode):
@@ -37,11 +37,35 @@ def fill_future_wrench_prefix(raw_wrench, future_contact):
     return torch.where(has_contact[:, :, None, None], filled, torch.zeros_like(filled)), has_contact
 
 
-def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
-                      shared_phase_signal, contact_detector, input_gate, normalizer, wrench_key,
-                      future_contact_mode="legacy_rollout", return_processed_wrench=False):
-    """The teacher's exact wrench data flow; also used by RenderNet inference."""
+def compute_contact_alpha(future_contact):
+    """Convert a token-level future-contact mask into the deterministic blend weight.
+
+    ``future_contact`` is ``[B, To, K]``.  A completely free chunk receives
+    zero wrench attention, a completely contacting chunk receives one, and a
+    partially contacting chunk follows ``(m - 1) / (K - 1)`` where ``m`` is
+    the number of contacting tokens.  A one-token chunk is binary by
+    definition.
+    """
+    if not isinstance(future_contact, torch.Tensor) or future_contact.ndim != 3:
+        raise ValueError("future_contact must be a bool tensor with shape [B, To, K]")
+    if future_contact.dtype != torch.bool:
+        raise TypeError("future_contact must be a bool tensor with shape [B, To, K]")
+    token_count = int(future_contact.shape[-1])
+    if token_count < 1:
+        raise ValueError("future_contact must contain at least one token per chunk")
+    contact_count = future_contact.sum(dim=-1, dtype=torch.float32)
+    if token_count == 1:
+        return contact_count
+    alpha = (contact_count - 1.0) / float(token_count - 1)
+    return alpha.clamp_(0.0, 1.0)
+
+
+def detect_wrench_contact(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
+                         shared_phase_signal, contact_detector, input_gate,
+                         future_contact_mode="legacy_rollout"):
+    """Shared contact rules for Dataset labels and model-side preprocessing."""
     validate_future_contact_mode(future_contact_mode)
+    gate_mask = None
     if shared_phase_signal:
         gate_mask = input_gate.keep_mask(raw_wrench)
         gated_phase_wrench = torch.where(gate_mask.unsqueeze(-1), raw_wrench,
@@ -49,12 +73,27 @@ def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
     else:
         gated_phase_wrench = raw_phase_wrench
     contact = contact_detector(gated_phase_wrench)
-    future_has_contact = None
+    future_contact = None
     if raw_future_phase_wrench is not None:
         if future_contact_mode == "legacy_rollout" and isinstance(contact_detector, HysteresisContactDetector):
             future_contact = contact_detector.rollout_future(raw_future_phase_wrench, initial_state=contact)
         else:
             future_contact = contact_detector.token_contact(raw_future_phase_wrench)
+    return contact, future_contact, gate_mask
+
+
+def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
+                      shared_phase_signal, contact_detector, input_gate, normalizer, wrench_key,
+                      future_contact_mode="legacy_rollout", return_processed_wrench=False,
+                      return_future_contact=False):
+    """The teacher's exact wrench data flow; also used by RenderNet inference."""
+    contact, future_contact, gate_mask = detect_wrench_contact(
+        raw_wrench, raw_phase_wrench, raw_future_phase_wrench,
+        shared_phase_signal=shared_phase_signal, contact_detector=contact_detector,
+        input_gate=input_gate, future_contact_mode=future_contact_mode,
+    )
+    future_has_contact = None
+    if future_contact is not None:
         gated_wrench, future_has_contact = fill_future_wrench_prefix(raw_wrench, future_contact)
         model_wrench_mask = future_has_contact[:, :, None, None]
     else:
@@ -65,7 +104,13 @@ def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
     # A suppressed physical zero must stay zero after a nonzero-mean normalizer.
     normalized_wrench = torch.where(model_wrench_mask, normalized_wrench,
                                      torch.zeros_like(normalized_wrench))
-    result = (normalized_wrench, contact, future_has_contact)
+    # Keep the public preprocessing tuple stable for existing consumers while
+    # allowing the teacher fusion path to request the complete token mask.
+    if return_future_contact:
+        future_result = future_contact if future_contact is not None else contact.unsqueeze(-1)
+    else:
+        future_result = future_has_contact
+    result = (normalized_wrench, contact, future_result)
     if return_processed_wrench:
         result = result + (gated_wrench,)
     return result
@@ -75,17 +120,13 @@ class WrenchPreprocessor(nn.Module):
     """Save just the teacher's preprocessing state, without DINO/fusion/DiT."""
 
     def __init__(self, n_obs_steps, wrench_key, phase_wrench_key, future_phase_wrench_key,
-                 contact_detector, input_gate, normalizer, future_contact_mode="legacy_rollout",
-                 contact_fusion_gate=False):
+                 contact_detector, input_gate, normalizer, future_contact_mode="legacy_rollout"):
         super().__init__()
         self.n_obs_steps = int(n_obs_steps)
         self.wrench_key = str(wrench_key)
         self.phase_wrench_key = str(phase_wrench_key)
         self.future_phase_wrench_key = future_phase_wrench_key
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
-        self.contact_fusion_gate = bool(contact_fusion_gate)
-        if self.contact_fusion_gate and self.future_phase_wrench_key is None:
-            raise ValueError("contact_fusion_gate requires future_phase_wrench_key and future contact data")
         self.contact_detector = contact_detector
         self.input_gate = input_gate
         self.normalizer = normalizer
@@ -95,15 +136,33 @@ class WrenchPreprocessor(nn.Module):
         return cls(policy.n_obs_steps, policy.wrench_key, policy.phase_wrench_key,
                    policy.future_phase_wrench_key, policy.contact_detector,
                    policy.input_gate, policy.normalizer,
-                   future_contact_mode=getattr(policy, "future_contact_mode", "legacy_rollout"),
-                   contact_fusion_gate=getattr(policy, "contact_fusion_gate", False))
+                   future_contact_mode=getattr(policy, "future_contact_mode", "legacy_rollout"))
 
     @property
     def required_keys(self):
         return tuple(dict.fromkeys(key for key in (self.wrench_key, self.phase_wrench_key,
                                                    self.future_phase_wrench_key) if key is not None))
 
-    def forward(self, obs):
+    def forward(self, obs, *, return_future_contact=False):
+        return self._forward(obs, return_future_contact=return_future_contact)
+
+    def contact_alpha(self, obs):
+        """Compute a label without normalizing wrench or invoking learned layers."""
+        values = {key: obs[key][:, :self.n_obs_steps] for key in self.required_keys}
+        contact, future_contact, _ = detect_wrench_contact(
+            values[self.wrench_key], values[self.phase_wrench_key],
+            values.get(self.future_phase_wrench_key),
+            shared_phase_signal=self.phase_wrench_key == self.wrench_key,
+            contact_detector=self.contact_detector, input_gate=self.input_gate,
+            future_contact_mode=self.future_contact_mode,
+        )
+        return compute_contact_alpha(future_contact if future_contact is not None else contact.unsqueeze(-1))
+
+    def forward_with_future_contact(self, obs):
+        """Return the same preprocessing tuple with the full token mask."""
+        return self._forward(obs, return_future_contact=True)
+
+    def _forward(self, obs, *, return_future_contact):
         values = {key: obs[key][:, :self.n_obs_steps] for key in self.required_keys}
         wrench = values[self.wrench_key]
         if any(value.ndim != 4 or value.shape[:2] != wrench.shape[:2]
@@ -115,6 +174,7 @@ class WrenchPreprocessor(nn.Module):
             contact_detector=self.contact_detector, input_gate=self.input_gate,
             normalizer=self.normalizer, wrench_key=self.wrench_key,
             future_contact_mode=self.future_contact_mode,
+            return_future_contact=return_future_contact,
         )
 
     def get_config(self):
@@ -134,7 +194,6 @@ class WrenchPreprocessor(nn.Module):
             raise TypeError(f"Unsupported contact detector: {type(detector)}")
         return {"version": WRENCH_PREPROCESSING_VERSION,
                 "future_contact_mode": self.future_contact_mode,
-                "contact_fusion_gate": self.contact_fusion_gate,
                 "n_obs_steps": self.n_obs_steps, "wrench_key": self.wrench_key,
                 "phase_wrench_key": self.phase_wrench_key,
                 "future_phase_wrench_key": self.future_phase_wrench_key,
@@ -149,5 +208,4 @@ class WrenchPreprocessor(nn.Module):
         return cls(config["n_obs_steps"], config["wrench_key"], config["phase_wrench_key"],
                    config["future_phase_wrench_key"], detector_cls(**config["contact_detector"]),
                    VectorThresholdGate(**config["input_gate"]), LinearNormalizer(),
-                   future_contact_mode=config.get("future_contact_mode", "legacy_rollout"),
-                   contact_fusion_gate=config.get("contact_fusion_gate", False))
+                   future_contact_mode=config.get("future_contact_mode", "legacy_rollout"))

@@ -49,6 +49,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
 
+from diffusion_policy.common.dataset_config import canonical_dataset_config
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
     ForceAwareDiffusionTransformerPolicy,
 )
@@ -197,6 +198,9 @@ def load_checkpoint_payload(checkpoint_path: pathlib.Path):
         cfg = OmegaConf.load(config_path)
     if not OmegaConf.is_config(cfg):
         cfg = OmegaConf.create(cfg)
+    dataset_config = OmegaConf.select(cfg, "task.dataset")
+    if dataset_config is not None:
+        canonical_dataset_config(dataset_config)
     return payload, cfg
 
 
@@ -243,7 +247,7 @@ def instantiate_episode_dataset(
     dataset_override: Optional[pathlib.Path],
     video_backend: str,
 ):
-    dataset_cfg = copy.deepcopy(cfg.task.dataset)
+    dataset_cfg = canonical_dataset_config(copy.deepcopy(cfg.task.dataset))
     with open_dict(dataset_cfg):
         # Include every episode so --episode is independent of the training
         # validation split.  Disable augmentation and whole-dataset preload;
@@ -691,15 +695,6 @@ def run(
                     obs_step=-1,
                     query_mode=args.attention_query,
                 )
-            # A gated teacher may compute CA for the full forward pass and
-            # discard it in the pure-visual bypass. Do not visualize the
-            # discarded attention as if it affected the returned context.
-            if getattr(policy, "contact_fusion_gate", False):
-                _, _, _, future_has_contact = policy.prepare_context_inputs(obs)
-                if future_has_contact is None:
-                    raise RuntimeError("Contact-gated visualization requires future contact data")
-                if not bool(future_has_contact[0, -1].item()):
-                    attention = {key: torch.zeros_like(value) for key, value in attention.items()}
             camera_records = []
             tau = sample["obs"].get("tau_ext")
             tau_value = float(tau[-1].abs().sum()) if tau is not None else float("nan")

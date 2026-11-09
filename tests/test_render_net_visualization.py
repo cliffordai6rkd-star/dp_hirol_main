@@ -95,7 +95,8 @@ def test_checkpoint_restores_rendering_and_training_normalization(
         images, rendered = visual.render_observations(model, restored_preprocessor, obs,
                                                       ["side", "wrist"], 2)
         expected = expected_model({key: obs[key][:, :2] for key in ("side", "wrist")},
-                                  preprocessor(obs)[0])
+                                  preprocessor(obs)[0],
+                                  future_contact=preprocessor(obs, return_future_contact=True)[2])
     torch.testing.assert_close(restored_preprocessor(obs)[0], preprocessor(obs)[0], rtol=0, atol=0)
     for key in images:
         torch.testing.assert_close(rendered[key], expected[key], rtol=0, atol=0)
@@ -111,13 +112,16 @@ def test_checkpoint_prefers_ema_for_rendered_rgb(tmp_path):
            "wrist": torch.full((1, 2, 3, 8, 12), 0.5),
            "future_wrench": torch.zeros(1, 2, 7, 6),
            "tau_ext": torch.zeros(1, 2, 7, 7), "future_tau_ext": torch.zeros(1, 2, 7, 7)}
+    obs["future_tau_ext"][..., 0] = 2.0
     with torch.no_grad():
         images, rendered = visual.render_observations(model, restored_preprocessor, obs,
                                                       ["side", "wrist"], 2)
-        expected = expected_model(images, preprocessor(obs)[0])
+        expected = expected_model(images, preprocessor(obs)[0],
+                                  future_contact=preprocessor(obs, return_future_contact=True)[2])
         payload = torch.load(checkpoint, pickle_module=dill)
         expected_model.load_state_dict(payload["state_dicts"]["model"])
-        online = expected_model(images, preprocessor(obs)[0])
+        online = expected_model(images, preprocessor(obs)[0],
+                                future_contact=preprocessor(obs, return_future_contact=True)[2])
     for key in images:
         torch.testing.assert_close(rendered[key], expected[key], rtol=0, atol=0)
         assert not torch.allclose(rendered[key], online[key])
@@ -155,7 +159,7 @@ def test_episode_export_uses_real_time_and_selected_cameras(monkeypatch, tmp_pat
             return {"obs": {"side": torch.full((2, 3, 8, 12), 0.25),
                             "wrist": torch.full((2, 3, 8, 12), 0.5),
                             "future_wrench": torch.zeros(2, 7, 6),
-                            "tau_ext": torch.zeros(2, 7, 7), "future_tau_ext": torch.zeros(2, 7, 7)}}
+                            "tau_ext": torch.zeros(2, 7, 7), "future_tau_ext": torch.full((2, 7, 7), 2.0)}}
 
         def close(self):
             self.closed = True

@@ -119,10 +119,11 @@ def load_render_net(checkpoint, device=None):
 def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, use_attention_mask=None):
     """Use the same physical gating and normalization as teacher and student training."""
     images = {key: obs[key][:, :n_obs_steps] for key in image_keys}
-    wrench, contact, future_contact = preprocessor(obs)
+    wrench, contact, future_contact = preprocessor(obs, return_future_contact=True)
     contact_gate = future_contact if future_contact is not None else contact
     return images, model(
         images, wrench, future_contact=contact_gate,
+        contact_alpha=(obs["contact_alpha"][:, :n_obs_steps] if "contact_alpha" in obs else None),
         use_attention_mask=use_attention_mask,
     )
 
@@ -284,9 +285,9 @@ def run(args):
             if "high_attention_render" in cfg.render_net else None,
             "rendering_mode": getattr(model, "rendering_mode", "residual"),
             "rendered_rgb": (
-                "1 - (1 - original) * exp(-residual_scale * region_weight * Gaussian glow); no display amplification"
+                "original + contact_alpha * (1 - original) * (1 - exp(-residual_scale * region_weight * Gaussian glow)); no display amplification"
                 if getattr(model, "rendering_mode", "residual") == "gaussian_glow" else
-                "clamp(original + future_contact * residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
+                "clamp(original + contact_alpha * residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
             ),
             "difference_rgb": "clip(0.5 + difference_gain * (rendered - original), 0, 1); signed RGB delta centered at gray, not attention",
             "stats_scope": "displayed cameras and latest observation; RGB units in [0,1], before video encoding",

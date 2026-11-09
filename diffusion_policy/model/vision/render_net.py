@@ -7,6 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
+
 
 def top_percentile_mask(values, percentile, *, minimum=0.0):
     """Select the highest ceil((100-p)% * patches) independently per image.
@@ -808,7 +810,7 @@ class RenderNet(nn.Module):
         return torch.where(mask > self.region_threshold, mask, torch.zeros_like(mask))
 
     def forward(self, images, wrench_history, *, return_aux=False, use_attention_mask=None,
-                future_contact=None):
+                future_contact=None, contact_alpha=None):
         """Output RGB only; downstream DINO receives no student token adapter."""
         use_mask = self.high_attention_enabled if use_attention_mask is None else bool(use_attention_mask)
         if use_mask and self.mask_head is None:
@@ -817,6 +819,13 @@ class RenderNet(nn.Module):
         gate_wrench_tokens = (self.encode_gate_wrench_history(wrench_history)
                               if use_mask else None)
         batch, steps = wrench_history.shape[:2]
+        alpha = contact_alpha
+        if alpha is None and future_contact is not None:
+            if future_contact.ndim == 2:
+                future_contact = future_contact.unsqueeze(-1)
+            alpha = compute_contact_alpha(future_contact)
+        if alpha is not None and alpha.shape != (batch, steps):
+            raise ValueError("contact_alpha must have shape [B, To]")
         rendered, masks = {}, {}
         for key, image in images.items():
             if key not in self.image_keys:
@@ -875,27 +884,21 @@ class RenderNet(nn.Module):
                 residual = residual * render_gate.reshape(batch, steps, 1, *image.shape[-2:])
             else:
                 render_gate = torch.ones_like(residual[:, :, :1])
-            if future_contact is None:
-                contact_gate = torch.ones(batch, steps, 1, 1, 1,
-                                          device=image.device, dtype=image.dtype)
+            if alpha is None:
+                image_alpha = torch.ones(batch, steps, 1, 1, 1,
+                                         device=image.device, dtype=image.dtype)
             else:
-                contact_gate = future_contact
-                if contact_gate.ndim == 3:
-                    contact_gate = contact_gate.any(dim=-1)
-                if contact_gate.ndim != 2 or contact_gate.shape != (batch, steps):
-                    raise ValueError("future_contact must have shape [B, To] or [B, To, K]")
-                contact_gate = contact_gate.to(device=image.device, dtype=image.dtype).reshape(
+                image_alpha = alpha.to(device=image.device, dtype=image.dtype).reshape(
                     batch, steps, 1, 1, 1,
                 )
-            residual = residual * contact_gate
             if self.rendering_mode == "gaussian_glow":
                 # Positive optical exposure gives smooth bounded brightening without clamp saturation.
                 strength = -torch.expm1(-self.residual_scale * residual)
-                rendered[key] = (image.float() + (1 - image.float()) * strength).to(image.dtype)
+                rendered[key] = (image.float() + image_alpha * (1 - image.float()) * strength).to(image.dtype)
             else:
-                rendered[key] = (image + self.residual_scale * residual).clamp(0, 1)
-            if future_contact is not None:
-                rendered[key] = torch.where(contact_gate > 0, rendered[key], image)
+                rendered[key] = (image + self.residual_scale * image_alpha * residual).clamp(0, 1)
+            if alpha is not None:
+                rendered[key] = torch.where(image_alpha > 0, rendered[key], image)
         return (rendered, masks) if return_aux else rendered
 
 

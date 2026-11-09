@@ -12,6 +12,7 @@ output_dir: data/outputs/civi/student
 # 冻结 teacher，以其 context tokens 监督学生 RGB 渲染。
 distillation:
   objective: token_mse
+  use_teacher_ffn: true # 仅训练监督复用教师冻结 FFN；部署仍只需要 RenderNet。
   token_loss_weight: 0.0
   demo_loss_weight: 0.0
   validation_seed: 42
@@ -74,6 +75,12 @@ render_net:
 # 数据集和时间窗口读取教师 checkpoint（指定 teacher_config 时读取该 YAML）；normalizer 来自 checkpoint。
 # 这里只列学生对教师数据配置的覆盖项，单独划分学生验证集。
 dataset:
+  # Explicit even when the selected legacy teacher checkpoint has no filter config.
+  wrench_filter:
+    enabled: true
+    cutoff_hz: 2.0
+    source_key: observation.wrench
+    timestamp_key: timing.state_timestamp_ns
   val_ratio: 0.1
   video_backend: pyav
   video_decode_device: cuda:0

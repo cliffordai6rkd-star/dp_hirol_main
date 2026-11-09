@@ -9,27 +9,27 @@ from diffusion_policy.common.config_cli import (
 class ConfigCliTest(unittest.TestCase):
     def test_split_config_reference_with_parent_dir(self):
         config_dir, config_name = split_config_reference(
-            'diffusion_policy/config/train_zarr/train_hirol_fr3_unet_abs_jp.yaml'
+            'diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml'
         )
 
         self.assertEqual(config_dir, 'diffusion_policy/config/train_zarr')
-        self.assertEqual(config_name, 'train_hirol_fr3_unet_abs_jp.yaml')
+        self.assertEqual(config_name, 'train_fr3_unet_abs_jp.yaml')
 
     def test_split_config_reference_uses_default_dir_for_bare_filename(self):
         config_dir, config_name = split_config_reference(
-            'train_hirol_fr3_unet_abs_jp.yaml',
+            'train_fr3_unet_abs_jp.yaml',
             default_config_dir='diffusion_policy/config',
         )
 
         self.assertEqual(config_dir, 'diffusion_policy/config')
-        self.assertEqual(config_name, 'train_hirol_fr3_unet_abs_jp.yaml')
+        self.assertEqual(config_name, 'train_fr3_unet_abs_jp.yaml')
 
     def test_rewrite_config_reference_argv_replaces_short_flag(self):
         argv = rewrite_config_reference_argv(
             [
                 'train.py',
                 '-c',
-                'diffusion_policy/config/train_lerobot_v3/train_hirol_fr3_unet_abs_jp_ee_state.yaml',
+                'diffusion_policy/config/train_lerobot_v3/train_fr3_unet_abs_jp_ee_state.yaml',
                 'training.device=cuda:0',
             ]
         )
@@ -39,7 +39,7 @@ class ConfigCliTest(unittest.TestCase):
             [
                 'train.py',
                 '--config-dir=diffusion_policy/config/train_lerobot_v3',
-                '--config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml',
+                '--config-name=train_fr3_unet_abs_jp_ee_state.yaml',
                 'training.device=cuda:0',
             ],
         )
@@ -50,7 +50,7 @@ class ConfigCliTest(unittest.TestCase):
                 'train.py',
                 '-c',
                 'diffusion_policy/config/train_lerobot_v3/train_',
-                'hirol_fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
+                'fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
                 'training.device=cuda:0',
             ]
         )
@@ -60,7 +60,7 @@ class ConfigCliTest(unittest.TestCase):
             [
                 'train.py',
                 '--config-dir=diffusion_policy/config/train_lerobot_v3',
-                '--config-name=train_ hirol_fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
+                '--config-name=train_ fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
                 'training.device=cuda:0',
             ],
         )
@@ -70,7 +70,7 @@ class ConfigCliTest(unittest.TestCase):
             [
                 'train.py',
                 '--config=diffusion_policy/config/train_lerobot_v3/train_',
-                'hirol_fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
+                'fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
                 '--multirun',
             ]
         )
@@ -80,7 +80,7 @@ class ConfigCliTest(unittest.TestCase):
             [
                 'train.py',
                 '--config-dir=diffusion_policy/config/train_lerobot_v3',
-                '--config-name=train_ hirol_fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
+                '--config-name=train_ fr3_pnp_cam_ee_joint_to_ee_unet.yaml',
                 '--multirun',
             ],
         )
@@ -91,8 +91,8 @@ class ConfigCliTest(unittest.TestCase):
                 [
                     'train.py',
                     '-c',
-                    'diffusion_policy/config/train_zarr/train_hirol_fr3_unet_abs_jp.yaml',
-                    '--config-name=train_hirol_fr3_unet_abs_jp.yaml',
+                    'diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml',
+                    '--config-name=train_fr3_unet_abs_jp.yaml',
                 ]
             )
 

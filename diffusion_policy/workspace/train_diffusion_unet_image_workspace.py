@@ -123,8 +123,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset_kwargs = dict()
         memory_aware_dataset_targets = {
-            "diffusion_policy.dataset.hirol_dataset.HirolDataset",
-            "diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset",
+            "diffusion_policy.dataset.zarr_image_dataset.ZarrImageDataset",
+            "diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset",
         }
         if cfg.task.dataset.get("_target_") in memory_aware_dataset_targets:
             dataset_kwargs["memory_limit_gb"] = max_ram_gb

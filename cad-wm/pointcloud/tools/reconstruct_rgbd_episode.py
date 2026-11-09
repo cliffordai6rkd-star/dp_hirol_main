@@ -234,7 +234,7 @@ def config_defaults(config: dict[str, Any]) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Reconstruct fused RGB-D point clouds from an augmented HIROL episode JSON. "
+            "Reconstruct fused RGB-D point clouds from an augmented robot episode JSON. "
             "All reconstruction parameters are read from a YAML/JSON config. "
             "Run pointcloud/tools/add_rgbd_extrinsics.py first."
         )

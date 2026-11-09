@@ -27,7 +27,7 @@ normalizer:
   last_n_dims: 1
 
 dataset:
-  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  _target_: diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset
   shape_meta: *shape_meta
   dataset_path: ${dataset_path}
   horizon: ${horizon}

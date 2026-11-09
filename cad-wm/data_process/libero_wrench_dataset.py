@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from .h5_direct_dataset import load_h5py
+from .causal_data_filter import filter_episode_values
 
 if __package__ and "." in __package__:
     from ..train.nomalizer import Normalizer
@@ -94,7 +95,12 @@ class LiberoWrenchDataset(torch.utils.data.Dataset):
         if self.normalize_mode not in (None, "gaussian"):
             raise ValueError("LIBERO wrench loading supports gaussian normalization or null")
         self.normalizer = None
-        self.filter_config = {}
+        self.wrench_filter = dict(data.get("wrench_filter") or {})
+        filter_enabled = bool(self.wrench_filter.get("enabled", False))
+        cutoff = float(self.wrench_filter.get("cutoff_hz", 2.0))
+        if filter_enabled and (not math.isfinite(cutoff) or cutoff <= 0):
+            raise ValueError("dataloader.wrench_filter.cutoff_hz must be positive and finite")
+        self.filter_config = {"wrench": self.wrench_filter} if filter_enabled else {}
         self.episodes, self.valid_indices = [], []
         self.raw_idx_to_episode_start = {}
         self.importance_weight_by_sample_index = {}
@@ -132,6 +138,21 @@ class LiberoWrenchDataset(torch.utils.data.Dataset):
                 if len(lengths) != 1:
                     raise ValueError(f"{name} has unaligned q/dq/tau/wrench lengths")
                 length = lengths.pop()
+                if filter_enabled:
+                    timestamp_path = str(self.wrench_filter.get("timestamp_path", "states"))
+                    clocks = np.asarray(demo[timestamp_path], dtype=np.float64)
+                    if clocks.ndim == 2:
+                        clocks = clocks[:, int(self.wrench_filter.get("timestamp_column", 0))]
+                    if clocks.shape != (length,) or not np.isfinite(clocks).all():
+                        raise ValueError(f"{name}/{timestamp_path} must provide one finite timestamp per row")
+                    # Match LeRobot's nanosecond conversion of the same LIBERO
+                    # states[:,0] clock before measuring episode-local dt.
+                    clocks_ns = np.rint(clocks * 1e9).astype(np.int64)
+                    times = (clocks_ns - clocks_ns[0]).astype(np.float64) * 1e-9
+                    arrays["wrench"] = torch.from_numpy(filter_episode_values(
+                        times, arrays["wrench"].numpy(),
+                        [{"type": "lowpass", "cutoff_hz": cutoff, "order": 1}],
+                    ))
                 first = 0 if self.pad_history else self.history_horizon - 1
                 if length - self.future_span <= first:
                     raise ValueError(f"{name} is too short for the configured history/future")

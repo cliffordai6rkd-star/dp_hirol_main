@@ -1,0 +1,150 @@
+--- a/diffusion_policy/model/vision/render_net_attention.py
++++ b/diffusion_policy/model/vision/render_net_attention.py
+@@ -154,6 +154,9 @@
+     if baseline != "raw_zero":
+         raise ValueError("Context-effect region supervision currently supports raw_zero")
+     reference = dict(obs)
++    # The Dataset label describes the original sample. Recompute it from the
++    # zero-wrench counterfactual so its force-attention update is disabled.
++    reference.pop("contact_alpha", None)
+     keys = dict.fromkeys(getattr(teacher, name, None) for name in
+                          ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
+     for key in keys:
+--- a/diffusion_policy/workspace/train_distill_render_net_workspace.py
++++ b/diffusion_policy/workspace/train_distill_render_net_workspace.py
+@@ -1081,7 +1081,7 @@
+                 normalize_region_source(self.attention_config.get("source", "noise_attention")),
+             )
+             identity["region_source"] = (
+-                "context_effect_v1" if region_source == "context" else "noise_attention_v1"
++                "context_effect_v2" if region_source == "context" else "noise_attention_v1"
+             )
+         if self.attention_enabled and region_source == "context":
+             identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
+--- a/tests/test_contact_alpha.py
++++ b/tests/test_contact_alpha.py
+@@ -151,3 +151,49 @@
+     zero = make_zero_wrench_obs(teacher, obs)
+     assert "contact_alpha" not in zero and "contact_alpha" in obs
+     assert WrenchPreprocessor.from_policy(teacher).contact_alpha(zero).count_nonzero() == 0
++
++
++@pytest.mark.parametrize("mode", ["token_threshold", "legacy_rollout"])
++def test_context_effect_targets_drop_cached_alpha_for_zero_wrench(mode):
++    from diffusion_policy.model.vision.render_net_attention import teacher_context_effect_targets
++    from diffusion_policy.scripts.visualize_wrench_effect_episode import make_zero_wrench_obs
++
++    teacher = make_teacher(future_contact_mode=mode).eval().requires_grad_(False)
++    obs = observations(3)
++    # Include free, partially contacting and fully contacting future windows.
++    contact_tokens = 4 if mode == "token_threshold" else 8
++    obs["future_tau_ext"][1, :, -contact_tokens:, 5] = 3.
++    obs["tau_ext"][2, ..., 5] = 3.
++    obs["future_tau_ext"][2, ..., 5] = 3.
++    obs["contact_alpha"] = WrenchPreprocessor.from_policy(teacher).contact_alpha(obs)
++    assert obs["contact_alpha"][0].count_nonzero() == 0
++    assert ((obs["contact_alpha"][1] > 0) & (obs["contact_alpha"][1] < 1)).all()
++    assert (obs["contact_alpha"][2] == 1).all()
++    original = {key: value.clone() for key, value in obs.items()}
++    seen = []
++
++    def capture_alpha(module, args, kwargs):
++        alpha = kwargs.get("contact_alpha")
++        seen.append((compute_contact_alpha(kwargs["future_contact"]) if alpha is None else alpha).clone())
++
++    handle = teacher.obs_encoder.register_forward_pre_hook(capture_alpha, with_kwargs=True)
++    try:
++        tokens, maps = teacher_context_effect_targets(teacher, obs)
++    finally:
++        handle.remove()
++    torch.testing.assert_close(seen[0], obs["contact_alpha"], rtol=0, atol=0)
++    assert seen[1].count_nonzero() == 0
++    with torch.no_grad():
++        expected = teacher._encode_context(obs, apply_curriculum_mask=False)
++        zero = teacher._encode_context(make_zero_wrench_obs(teacher, obs), apply_curriculum_mask=False)
++    torch.testing.assert_close(tokens, expected, rtol=0, atol=0)
++    patch_count = sum(teacher.obs_encoder.patch_counts.values())
++    delta = (expected - zero).reshape(3, 2, patch_count, -1).norm(dim=-1)
++    offset = 0
++    for camera in teacher.obs_encoder.image_keys:
++        end = offset + teacher.obs_encoder.patch_counts[camera]
++        torch.testing.assert_close(maps[camera], delta[..., offset:end], rtol=0, atol=0)
++        assert maps[camera][0].count_nonzero() == 0
++        offset = end
++    for key in original:
++        torch.testing.assert_close(obs[key], original[key], rtol=0, atol=0)
+--- a/tests/test_render_net_teacher_cache.py
++++ b/tests/test_render_net_teacher_cache.py
+@@ -43,6 +43,32 @@
+ 
+     def __getitem__(self, index):
+         return {"obs": {"value": torch.tensor([float(self.indices[index, 0])])}}
++
++
++def test_context_effect_cache_does_not_reuse_targets_with_stale_alpha(tmp_path):
++    source = tmp_path / "source"
++    source.mkdir()
++    checkpoint = tmp_path / "teacher.ckpt"
++    checkpoint.write_bytes(b"teacher weights")
++    workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
++    workspace.cfg = OmegaConf.create({
++        "teacher_checkpoint": str(checkpoint),
++        "teacher_cache": {"directory": str(tmp_path / "cache"), "batch_size": 2},
++        "training": {"amp": {"allow_tf32": False}},
++    })
++    workspace.teacher_cfg = OmegaConf.create({"policy": {"fixed": True}})
++    workspace.teacher_state_key = "ema_model"
++    workspace.teacher_policy = SimpleNamespace()
++    workspace.amp_enabled, workspace.amp_dtype = False, torch.bfloat16
++    workspace.attention_enabled = True
++    workspace.attention_config = {"source": "context", "baseline": "raw_zero"}
++    dataset = SourceDataset(source, range(3))
++    root, identity = workspace._teacher_cache_spec(
++        dataset, dataset, OmegaConf.create({"dataset_path": str(source)}),
++    )
++    assert identity["region_source"] == "context_effect_v2"
++    legacy = {**identity, "region_source": "context_effect_v1"}
++    assert root.name != distill.cache_key(legacy)
+ 
+ 
+ def test_cache_resumes_exact_prefix_and_keeps_shuffled_samples_aligned(tmp_path):
+--- a/README.md
++++ b/README.md
+@@ -79,3 +79,37 @@
+ 训练长任务可使用 `nohup` 并将日志写到输出目录，避免依赖 VS Code 终端连接。停止容器会停止其中的训练；使用 `docker stop fdp-dev` 停止开发容器。
+ 
+ 详细步骤、后台训练示例和文件说明见 [服务器迁移与 VS Code 操作说明](docker/SERVER_VSCODE_CN.md)。
++
++## 已迁移服务器的学生蒸馏修复（2026-11-09）
++
++11 月 8 日的迁移包包含一处学生空间 mask 监督生成的遗漏：零力对照输入沿用了原样本的 `contact_alpha`。修复后会根据零力重新计算 alpha=0，正常样本的标签保持不变。教师和 CAD-WM 的正常训练不经过该分支，已有教师和世界模型权重可继续使用。
++
++本机代码已修复，同时将 context-effect 教师目标缓存标识从 `context_effect_v1` 更新为 `context_effect_v2`，新启动的学生会生成新的监督缓存。无需删除数据集、模型或历史输出。
++
++对已经迁移到服务器的旧源码，将补丁 `fdp-alpha-counterfactual-fix.patch` 上传到服务器项目根目录。在 VS Code 容器的 `/workspace` 中执行：
++
++```bash
++cd /workspace
++git apply --check fdp-alpha-counterfactual-fix.patch
++git apply fdp-alpha-counterfactual-fix.patch
++```
++
++补丁可从本机 `docker/artifacts/fdp-alpha-counterfactual-fix.patch` 获取，包含修复代码、回归测试和这段操作说明。服务器无法直接读取本机文件，需通过 VS Code 或文件传输先上传补丁。已经包含修复的代码无需重复应用。
++
++在容器中验证：
++
++```bash
++OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest \
++  tests/test_contact_alpha.py tests/test_render_net_teacher_cache.py \
++  -q -k 'context_effect_targets_drop_cached_alpha or context_effect_cache_does_not_reuse'
++```
++
++若学生蒸馏已开始，先停止学生进程，应用补丁后使用新输出目录重新蒸馏；避免恢复已经用旧 mask 监督训练的学生 checkpoint。教师尚在训练时无需为此中断教师。下面以已有教师目录 `data/outputs/civi_server/teacher` 为例：
++
++```bash
++python train_civi.py --stage student --gpus 0 \
++  --teacher-override output_dir=data/outputs/civi_server/teacher \
++  --student-override output_dir=data/outputs/civi_server/student_alpha_fix
++```
++
++如果教师保存在其他目录，替换上述教师 `output_dir`。这次修复不要求重新构建 Docker 镜像或复制训练数据。

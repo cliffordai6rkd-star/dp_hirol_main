@@ -133,6 +133,10 @@ class CADWorldModel(nn.Module):
             "contact_gate": config["contact_gate"], "loss": config.get("loss", {}),
             "contact_sampling": (config.get("train") or {}).get("contact_sampling", {}),
         })
+        # Old checkpoints without a filter keep their original data contract.
+        # New runs cannot resume weights fitted to a different wrench target.
+        if data.get("wrench_filter"):
+            self._contract["wrench_filter"] = copy.deepcopy(data["wrench_filter"])
 
     def checkpoint_contract(self):
         return copy.deepcopy(self._contract)

@@ -15,7 +15,7 @@ training:
   num_optimizer_steps: 400000
 
 # Encode the future-wrench sequence with a GRU, concatenate all wrench/image
-# tokens, then run joint self-attention. No contact gate or prefix fill.
+# tokens, then run joint self-attention. No cross-attention alpha or prefix fill.
 policy:
   _target_: diffusion_policy.policy.dino_token_baseline_policy.DinoTokenBaselinePolicy
   baseline_mode: self_attn

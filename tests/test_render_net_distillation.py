@@ -143,7 +143,10 @@ def test_camera_identity_changes_rendering_without_depending_on_dictionary_order
 @pytest.mark.parametrize("backbone", ["unet", "transformer"])
 @pytest.mark.parametrize("region_enabled", [False, True])
 @pytest.mark.parametrize("conv_block", ["standard", "bottleneck"])
-def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusion(backbone, region_enabled, conv_block):
+@pytest.mark.parametrize("use_teacher_ffn", [False, True])
+def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusion(
+    backbone, region_enabled, conv_block, use_teacher_ffn,
+):
     torch.manual_seed(42)
     teacher = nn.Module()
     attach_preprocessing(teacher)
@@ -154,7 +157,7 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
     teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
     teacher.obs_encoder = ForceAwareObsEncoder(
         "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
-        wrench_history_steps=7, cross_attn_query="image", dropout=0.0,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=2, dropout=0.0,
         force_temporal_encoder="lstm",
         image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
     )
@@ -174,6 +177,7 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
     handles = [module.register_forward_pre_hook(forbidden) for module in (
         teacher.obs_encoder.wrench_projection, teacher.obs_encoder.force_encoder,
         teacher.obs_encoder.cross_attention, teacher.model,
+        teacher.obs_encoder.extra_cross_attention_layers[0].cross_attention,
     )]
     try:
         renderer = RenderNet(wrench_dim=6, base_channels=4, conditioning_dim=16, backbone=backbone,
@@ -185,7 +189,7 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
         optimizer = torch.optim.AdamW(renderer.parameters(), lr=1e-3)
         for step in range(2):
             optimizer.zero_grad(set_to_none=True)
-            tokens = student_context_tokens(teacher, renderer, obs)
+            tokens = student_context_tokens(teacher, renderer, obs, use_teacher_ffn=use_teacher_ffn)
             assert tokens.shape == target.shape == (2, 20, 16)
             F.mse_loss(tokens, target).backward()
             assert renderer.output.weight.grad.abs().sum() > 0
@@ -204,7 +208,8 @@ def test_frozen_visual_path_trains_renderer_and_conditioner_without_teacher_fusi
             handle.remove()
 
 
-def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
+@pytest.mark.parametrize("use_teacher_ffn", [False, True])
+def test_compiled_student_preserves_context_gradients_and_portable_state_dict(use_teacher_ffn):
     torch.manual_seed(13)
     teacher = nn.Module()
     attach_preprocessing(teacher)
@@ -213,7 +218,7 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
     teacher.obs_encoder = ForceAwareObsEncoder(
         "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
-        wrench_history_steps=7, cross_attn_query="image", dropout=0.0,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=2, dropout=0.0,
         image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
     )
     teacher.eval().requires_grad_(False)
@@ -230,8 +235,9 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
                            backend="aot_eager", fullgraph=True, dynamic=False)
     obs = {"side": torch.rand(2, 2, 3, 16, 16), "wrist": torch.rand(2, 2, 3, 16, 24),
            "wrench": torch.randn(2, 2, 7, 6)}
-    expected = student_context_tokens(teacher, eager, obs)
-    actual = student_context_tokens(teacher, compiled, obs, image_context_encoder=encode)
+    expected = student_context_tokens(teacher, eager, obs, use_teacher_ffn=use_teacher_ffn)
+    actual = student_context_tokens(teacher, compiled, obs, image_context_encoder=encode,
+                                    use_teacher_ffn=use_teacher_ffn)
     torch.testing.assert_close(actual, expected)
     target = torch.randn_like(expected)
     F.mse_loss(expected, target).backward()
@@ -252,8 +258,44 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict():
     restored = copy.deepcopy(eager).eval()
     restored.load_state_dict(compiled.state_dict(), strict=True)
     with torch.no_grad():
-        torch.testing.assert_close(student_context_tokens(teacher, compiled, obs),
-                                   student_context_tokens(teacher, restored, obs))
+        torch.testing.assert_close(
+            student_context_tokens(teacher, compiled, obs, use_teacher_ffn=use_teacher_ffn),
+            student_context_tokens(teacher, restored, obs, use_teacher_ffn=use_teacher_ffn),
+        )
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+def test_teacher_ffn_supervision_matches_closed_teacher_without_rendering(layers):
+    torch.manual_seed(7)
+    teacher = nn.Module()
+    attach_preprocessing(teacher)
+    teacher.image_keys = ("side", "wrist")
+    teacher.normalizer = LinearNormalizer()
+    teacher.normalizer.fit({"wrench": torch.randn(32, 6)})
+    teacher.obs_encoder = ForceAwareObsEncoder(
+        "unused", backbone=PatchBackbone(), n_emb=16, n_head=4, max_obs_steps=2,
+        wrench_history_steps=7, cross_attn_query="image", cross_attn_layers=layers,
+        dropout=0.0, image_shapes={"side": (3, 16, 16), "wrist": (3, 16, 24)},
+    )
+    teacher.eval().requires_grad_(False)
+    obs = {"side": torch.rand(2, 2, 3, 16, 16), "wrist": torch.rand(2, 2, 3, 16, 24),
+           "wrench": torch.randn(2, 2, 7, 6), "contact_alpha": torch.zeros(2, 2)}
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=16, wrench_history_steps=7,
+        embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1, patch_size=8,
+    ).eval()
+    with torch.no_grad():
+        renderer.output.bias.fill_(0.5)
+        images, wrench, _, _ = teacher.prepare_context_inputs(obs)
+        target = teacher.obs_encoder(images=images, wrench_history=wrench,
+                                     contact_alpha=obs["contact_alpha"])
+        rendered = renderer(images, wrench, contact_alpha=obs["contact_alpha"])
+        for key in images:
+            torch.testing.assert_close(rendered[key], images[key], rtol=0, atol=0)
+        actual = student_context_tokens(teacher, renderer, obs, use_teacher_ffn=True)
+        original = student_context_tokens(teacher, renderer, obs)
+    torch.testing.assert_close(actual, target, rtol=0, atol=0)
+    assert F.mse_loss(original, target) > 1e-3
 
 
 @pytest.mark.parametrize("backbone", ["unet", "transformer"])

@@ -16,7 +16,7 @@ env_runner:
   _target_: diffusion_policy.env_runner.base_image_runner.BaseImageRunner
 
 dataset:
-  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  _target_: diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset
   shape_meta: *shape_meta
   dataset_path: ${dataset_path}
   horizon: ${horizon}

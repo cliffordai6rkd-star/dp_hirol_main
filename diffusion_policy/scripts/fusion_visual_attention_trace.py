@@ -115,7 +115,6 @@ class FusionVisualAttentionTrace:
             "context_tokens": self.context_tokens,
             "spatial_boundary": "DINO output patch tokens at the fusion input",
             "equal_camera_fusion_approximation": self.equal_camera_approximation,
-            "contact_fusion_gate": bool(getattr(policy, "contact_fusion_gate", False)),
             "assumptions": list(self.assumptions),
         }
         self.handles = []
@@ -151,7 +150,6 @@ class FusionVisualAttentionTrace:
         self._batch_size = None
         self._device = torch.device("cpu")
         self._weights_valid = None
-        self.contact_gate = None
 
     def __enter__(self):
         if self.active:
@@ -194,11 +192,6 @@ class FusionVisualAttentionTrace:
             raise ValueError("Fusion rollout requires [B,n_obs_steps,C,H,W] images")
         self._batch_size = first.shape[0]
         self._device = first.device if self.batched else torch.device("cpu")
-        gate = bound.get("contact_gate")
-        if gate is not None:
-            self.contact_gate = gate.detach().to(self._device)
-            if not self.batched:
-                self.contact_gate = self.contact_gate[0]
         for key in self.image_keys:
             image = images[key]
             if not self.batched and (image.ndim != 5 or image.shape[0] != 1):
@@ -303,12 +296,6 @@ class FusionVisualAttentionTrace:
             joint = self._backward_self(joint, calls[0])
         joint = joint.reshape(*leading, steps, patches + wrench)
         image, force = joint[..., :patches], joint[..., patches:]
-        if self.contact_gate is not None:
-            # A closed output comes directly from its original image patch,
-            # bypassing every SA/CA/FFN computed above.
-            gate = self.contact_gate.unsqueeze(-1)
-            image = torch.where(gate, image, relevance.reshape(*leading, steps, patches))
-            force = torch.where(gate, force, torch.zeros_like(force))
         maps = {}
         offset = 0
         for key in self.image_keys:

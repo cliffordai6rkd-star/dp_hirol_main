@@ -1,6 +1,6 @@
-task: ../../../task_lerobot_v3/pick_n_palce/hirol_fr3_pnp_cam_state_to_ee_unet_ram.yaml
+task: ../../../task_lerobot_v3/pick_n_palce/fr3_pnp_cam_state_to_ee_unet_ram.yaml
 
-name: train_hirol_fr3_pnp_cam_state_to_ee_unet_b32_ms_guassian_lr-5
+name: train_fr3_pnp_cam_state_to_ee_unet_b32_ms_guassian_lr-5
 _target_: diffusion_policy.workspace.train_diffusion_unet_image_workspace.TrainDiffusionUnetImageWorkspace
 
 dataset_path: data/pick_and_place_lerobotv3

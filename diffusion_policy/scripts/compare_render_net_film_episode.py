@@ -31,6 +31,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from omegaconf import OmegaConf, open_dict
 
+from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
 from diffusion_policy.scripts import visualize_render_net_episode as visual
 
 
@@ -87,22 +88,24 @@ def compare_observations(model, preprocessor, obs, image_keys):
     if not model.spatial_modulation_enabled or not len(model.spatial_modulations):
         raise ValueError("This checkpoint has no enabled FiLM path (render_net.spatial_modulation.enabled)")
     images = {key: obs[key][:, :preprocessor.n_obs_steps] for key in image_keys}
-    wrench, contact, future_contact = preprocessor(obs)
+    wrench, contact, future_contact = preprocessor(obs, return_future_contact=True)
     contact_gate = future_contact if future_contact is not None else contact
+    alpha = (obs["contact_alpha"][:, :preprocessor.n_obs_steps] if "contact_alpha" in obs else
+             compute_contact_alpha(contact_gate if contact_gate.ndim == 3 else contact_gate.unsqueeze(-1)))
     branches = {}
     original_setting = model.spatial_modulation_enabled
     try:
         for name, enabled in zip(BRANCHES, (True, False)):
             model.spatial_modulation_enabled = enabled
-            rendered, masks = model(images, wrench, return_aux=True, future_contact=contact_gate)
+            rendered, masks = model(images, wrench, return_aux=True, future_contact=contact_gate,
+                                    contact_alpha=alpha)
             gates, intensities = {}, {}
             for key, image in images.items():
                 mask = masks.get(key, torch.ones_like(image[:, :, :1]))
                 flat_gate = model._mask_gate(mask.flatten(0, 1), image) if model.high_attention_enabled else mask.flatten(0, 1)
                 gate = flat_gate.reshape_as(mask)
                 if contact_gate is not None:
-                    active = contact_gate.any(dim=-1) if contact_gate.ndim == 3 else contact_gate
-                    gate = gate * active.to(gate.dtype)[..., None, None, None]
+                    gate = gate * alpha.to(gate.dtype)[..., None, None, None]
                 intensities[key], gates[key] = mask, gate
             branches[name] = {"rendered": rendered, "intensity": intensities, "gate": gates}
     finally:

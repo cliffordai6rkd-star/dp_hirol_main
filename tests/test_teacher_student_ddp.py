@@ -1,4 +1,4 @@
-"""Two real CPU DDP replicas of the gated teacher and active student architecture."""
+"""Two real CPU DDP replicas of the alpha teacher and active student architecture."""
 
 from datetime import timedelta
 from pathlib import Path
@@ -9,8 +9,9 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from torch.nn.parallel import DistributedDataParallel
 
-from test_contact_fusion_gate import make_teacher, observations
+from test_contact_alpha import make_teacher, observations
 from diffusion_policy.model.vision.render_net import RenderNet
+from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
 from diffusion_policy.workspace.train_distill_render_net_workspace import TrainDistillRenderNetWorkspace
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import DistributedContext
 
@@ -33,9 +34,10 @@ def _worker(rank, root):
         optimizer = torch.optim.AdamW(teacher.parameters(), lr=1e-3)
         torch.manual_seed(101 + rank)
         obs = observations(1)
-        # One rank's entire fusion gate is closed; the other has contact.
+        # One rank is free; the other has a partially contacting future chunk.
         if rank == 1:
-            obs["future_tau_ext"][..., -1, 5] = 3.
+            obs["future_tau_ext"][..., -4:, 5] = 3.
+        obs["contact_alpha"] = WrenchPreprocessor.from_policy(teacher).contact_alpha(obs)
         action = torch.randn(1, 9, 7)
         for step in range(2):
             optimizer.zero_grad(set_to_none=True)
@@ -72,9 +74,10 @@ def _worker(rank, root):
             loss = workspace._loss(obs, action=action)
             assert torch.isfinite(loss)
             loss.backward()
-            if epoch == 0:
-                assert workspace.model.output.weight.grad is None or workspace.model.output.weight.grad.count_nonzero() == 0
-            else:
+            if workspace.model.output.weight.grad is not None:
+                assert torch.isfinite(workspace.model.output.weight.grad).all()
+            if epoch > 0:
+                assert workspace.model.output.weight.grad is not None
                 assert workspace.model.output.weight.grad.abs().sum() > 0
             optimizer.step()
             assert_replicas_match(workspace.model)
@@ -83,5 +86,5 @@ def _worker(rank, root):
         dist.destroy_process_group()
 
 
-def test_gated_teacher_and_student_warmup_then_joint_ddp(tmp_path):
+def test_alpha_teacher_and_student_warmup_then_joint_ddp(tmp_path):
     mp.spawn(_worker, args=(str(tmp_path),), nprocs=2, join=True)

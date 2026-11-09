@@ -58,7 +58,6 @@ class ImageQueryAttentionCapture:
         self._attention_maps = {}
         self._update_maps = {}
         self._call_index = 0
-        self._contact_gate = None
 
     def __enter__(self):
         if self.active:
@@ -91,7 +90,6 @@ class ImageQueryAttentionCapture:
         self._update_maps = {}
         self._call_index = 0
         inputs = inspect.signature(module.forward).bind_partial(*args, **kwargs).arguments
-        self._contact_gate = inputs.get("contact_gate")
         images = inputs.get("images")
         if images is None:
             image = inputs.get("image")
@@ -162,12 +160,8 @@ class ImageQueryAttentionCapture:
 
     def attention_by_camera(self):
         self._require_complete()
-        if self._contact_gate is not None and not bool(self._contact_gate[0, -1].item()):
-            return {key: torch.zeros_like(value) for key, value in self._attention_maps.items()}
         return dict(self._attention_maps)
 
     def update_by_camera(self):
         self._require_complete()
-        if self._contact_gate is not None and not bool(self._contact_gate[0, -1].item()):
-            return {key: torch.zeros_like(value) for key, value in self._update_maps.items()}
         return dict(self._update_maps)

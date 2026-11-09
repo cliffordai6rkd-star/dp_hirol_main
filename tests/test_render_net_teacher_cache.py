@@ -45,6 +45,32 @@ class SourceDataset:
         return {"obs": {"value": torch.tensor([float(self.indices[index, 0])])}}
 
 
+def test_context_effect_cache_does_not_reuse_targets_with_stale_alpha(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    checkpoint = tmp_path / "teacher.ckpt"
+    checkpoint.write_bytes(b"teacher weights")
+    workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({
+        "teacher_checkpoint": str(checkpoint),
+        "teacher_cache": {"directory": str(tmp_path / "cache"), "batch_size": 2},
+        "training": {"amp": {"allow_tf32": False}},
+    })
+    workspace.teacher_cfg = OmegaConf.create({"policy": {"fixed": True}})
+    workspace.teacher_state_key = "ema_model"
+    workspace.teacher_policy = SimpleNamespace()
+    workspace.amp_enabled, workspace.amp_dtype = False, torch.bfloat16
+    workspace.attention_enabled = True
+    workspace.attention_config = {"source": "context", "baseline": "raw_zero"}
+    dataset = SourceDataset(source, range(3))
+    root, identity = workspace._teacher_cache_spec(
+        dataset, dataset, OmegaConf.create({"dataset_path": str(source)}),
+    )
+    assert identity["region_source"] == "context_effect_v2"
+    legacy = {**identity, "region_source": "context_effect_v1"}
+    assert root.name != distill.cache_key(legacy)
+
+
 def test_cache_resumes_exact_prefix_and_keeps_shuffled_samples_aligned(tmp_path):
     identity = {"checkpoint": "fixed", "indices": "fixed"}
     tokens = torch.arange(5).float()[:, None, None].expand(-1, 6, 8).clone()

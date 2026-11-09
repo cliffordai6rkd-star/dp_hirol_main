@@ -114,7 +114,6 @@ class AttentionCapture:
             "layer_count": self.layer_count,
             "query_source": self.query_source,
             "temporal_layout": self.temporal_layout,
-            "contact_fusion_gate": bool(getattr(policy, "contact_fusion_gate", False)),
         }
         self.handles = []
         self.active = False
@@ -124,7 +123,6 @@ class AttentionCapture:
         self._update_maps = {}
         self._call_index = 0
         self._groups = []
-        self._contact_gate = None
 
     def _camera_layout(self, policy):
         shapes = dict(getattr(self.encoder, "image_shapes", {}))
@@ -176,7 +174,6 @@ class AttentionCapture:
         self._attention_maps, self._update_maps = {}, {}
         self._call_index = 0
         inputs = inspect.signature(module.forward).bind_partial(*args, **kwargs).arguments
-        self._contact_gate = inputs.get("contact_gate")
         images = inputs.get("images")
         if images is None:
             image = inputs.get("image")
@@ -311,15 +308,10 @@ class AttentionCapture:
 
     def attention_by_camera(self):
         self._require_complete()
-        if (self.mode != "dino" and self._contact_gate is not None
-                and not bool(self._contact_gate[0, -1].item())):
-            return {key: torch.zeros_like(value) for key, value in self._attention_maps.items()}
         return dict(self._attention_maps)
 
     def update_by_camera(self):
         if not self.has_updates:
             raise ValueError("Spatial CA update magnitude requires image-query cross-attention")
         self._require_complete()
-        if self._contact_gate is not None and not bool(self._contact_gate[0, -1].item()):
-            return {key: torch.zeros_like(value) for key, value in self._update_maps.items()}
         return dict(self._update_maps)

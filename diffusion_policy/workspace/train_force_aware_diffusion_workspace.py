@@ -43,6 +43,7 @@ from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
+from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
 from diffusion_policy.policy.force_aware_diffusion_transformer_policy import (
     ForceAwareDiffusionTransformerPolicy,
 )
@@ -383,6 +384,12 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         dataset: BaseImageDataset = hydra.utils.instantiate(cfg.task.dataset)
         if not isinstance(dataset, BaseImageDataset):
             raise TypeError("cfg.task.dataset must instantiate BaseImageDataset")
+        if hasattr(dataset, "set_contact_label_config"):
+            label_config = WrenchPreprocessor.from_policy(self.model).get_config()
+            dataset.set_contact_label_config(label_config)
+            for saved_cfg in (self.cfg, cfg):
+                with open_dict(saved_cfg.task.dataset):
+                    saved_cfg.task.dataset.contact_label_config = label_config
         if hasattr(dataset, "relative_pose_actions"):
             if bool(dataset.relative_pose_actions) != bool(
                 self.model.relative_pose_actions

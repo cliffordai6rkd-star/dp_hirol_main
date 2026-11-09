@@ -4,7 +4,7 @@ import torchvision
 from torch.utils.data import DataLoader
 
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.dataset.hirol_lerobot_v3_dataset import HirolLeRobotV3Dataset
+from diffusion_policy.dataset.lerobot_v3_dataset import LeRobotV3ImageDataset
 from diffusion_policy.model.vision.model_getter import get_resnet
 from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
 
@@ -25,7 +25,7 @@ from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsE
 # 这样可以直接验证：
 # “当前图像在进入 ImageNet Normalize 之前，到底是不是保持了 [0,1] 的正确前提”
 
-DATASET_PATH = "data/train_episode/moving_bread/moving_bread_hirol_lerobotv3"
+DATASET_PATH = "data/train_episode/moving_bread/moving_bread_lerobotv3"
 BATCH_SIZE = 3
 HORIZON = 16
 N_OBS_STEPS = 2
@@ -110,7 +110,7 @@ def flatten_obs_time(obs_dict, n_obs_steps):
 # =========================
 # 4. 构造 Dataset 与 DataLoader
 # =========================
-dataset = HirolLeRobotV3Dataset(
+dataset = LeRobotV3ImageDataset(
     shape_meta=shape_meta,
     dataset_path=DATASET_PATH,
     horizon=HORIZON,

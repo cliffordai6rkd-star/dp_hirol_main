@@ -27,6 +27,15 @@ The future wrench and phase targets are recorded rows t+1 through t+8, at
 There is no timestamp interpolation or resampling. high_fps determines timing
 and prediction_horizon controls the number of future rows.
 
+Both training presets use a causal first-order 2 Hz low-pass on all six
+wrench channels before window extraction, phase labels and normalization,
+matching the DP teacher/student. Each demo starts from its first measured
+wrench; the measured `states[:,0]` intervals set
+`alpha = 1-exp(-2*pi*2*dt)`. Configure `dataloader.wrench_filter`.
+The original HDF5 is unchanged. The historical `*_median3.yaml` filename
+retains the 200k-step preset but now reads the original source, applies only
+the 2 Hz low-pass, and writes to `outputs/cad_wm_lowpass2hz_200k`.
+
 ## Checkpoint evaluation and selection
 
 `train.checkpoint_eval.enabled: true` runs inference over the full original
@@ -105,7 +114,7 @@ noise per anchor and reports physical errors from integrated predictions.
 
 ## Contact phases and strengthened sampling
 
-Labels use raw sqrt(Fx²+Fy²+Fz²), with thresholds of 8 N for entry and exit.
+Labels use filtered physical-unit sqrt(Fx²+Fy²+Fz²), with thresholds of 8 N for entry and exit.
 Five consecutive native frames confirm a transition. Strict >8 enters,
 strict <8 exits, and equality retains state and breaks the streak. Offline
 labels backfill both transitions to the first frame of their confirmation
@@ -135,7 +144,8 @@ future_wrench = result["future_wrench"]  # [B,8,6], Fx/Fy/Fz/Mx/My/Mz, N and N.m
 ```
 
 The predictor restores EMA weights and normalization, then returns physical
-sensor-frame wrench. DP applies its own normalizer. Each call draws fresh
+sensor-frame wrench representing the filtered target; no second low-pass is
+applied at prediction time. DP applies its own normalizer. Each call draws fresh
 Gaussian noise; pass source_noise for a reproducible sample. History buffers
 reset per episode. For [B,n_obs_steps,8,6], retain predictions made at each
 observation anchor and stack them along that axis.

@@ -9,7 +9,7 @@
 先回到项目根目录，再执行：
 
 ```bash
-cd /home/lcy/code/dp_hirol_main
+cd /path/to/dp_main
 
 APT_MIRROR=mirrors.aliyun.com \
   docker compose --progress plain -f docker/docker_compose.yaml build trainer

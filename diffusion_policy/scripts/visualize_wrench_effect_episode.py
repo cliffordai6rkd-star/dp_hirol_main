@@ -7,8 +7,8 @@ camera/observation image's own patch p2/p98 color scale. Use --color-scope
 episode for a shared episode scale. These are feature magnitudes, not attention
 probabilities, physical force units, or final-action attribution. No diffusion
 sampling is needed. Original values and preprocessing diagnostics are saved.
-When complete fusion is gated off, update maps are zero; context differences
-still include the entire fused-versus-visual branch change.
+The captured update includes the same deterministic contact alpha used by the
+teacher encoder, so zero-alpha observations contribute no wrench residual.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from diffusion_policy.scripts import visualize_cross_attention_episode as common
 from diffusion_policy.scripts import visualize_image_query_cross_attention_episode as rendering
 from diffusion_policy.scripts.episode_wrench_plot import WrenchEpisodePlot, load_episode_wrench
 from diffusion_policy.scripts.visualize_denoising_attention_episode import heat_overlay
+from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
 
 
 METRICS = {
@@ -56,6 +57,7 @@ METRIC_LABELS = {
 def make_zero_wrench_obs(policy, obs):
     """Keep image objects unchanged; zero every required raw wrench/phase key."""
     zero = dict(obs)
+    zero.pop("contact_alpha", None)
     keys = dict.fromkeys(getattr(policy, name, None) for name in
                          ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
     for key in keys:
@@ -80,6 +82,7 @@ class WrenchEffectCapture:
         self.handles = []
         self.active = False
         self._updates = []
+        self._alpha = None
 
     def __enter__(self):
         if self.active:
@@ -105,12 +108,15 @@ class WrenchEffectCapture:
             handle.remove()
         self.handles.clear()
         self._updates = []
+        self._alpha = None
         self.active = False
 
     def _capture(self, module, inputs, output):
         update = output[0]
         if not torch.is_tensor(update) or update.ndim != 3 or update.shape[0] != self.steps:
             raise ValueError("Expected CA update [n_obs_steps, image_patches, channels] with batch one")
+        if self._alpha is not None:
+            update = update * self._alpha.to(device=update.device, dtype=update.dtype)
         self._updates.append(update.detach().float().cpu().clone())
 
     @torch.inference_mode()
@@ -121,15 +127,16 @@ class WrenchEffectCapture:
         if first.shape[0] != 1:
             raise ValueError("Episode residual visualization requires batch size one")
         self._updates = []
+        self._alpha = None
         signature = inspect.signature(self.encoder.forward)
-        contact_gate = None
 
         def capture_inputs(module, args, kwargs):
-            nonlocal contact_gate
             bound = signature.bind_partial(*args, **kwargs)
-            gate = bound.arguments.get("contact_gate")
-            if gate is not None:
-                contact_gate = gate[0].detach().cpu().clone()
+            future_contact = bound.arguments.get("future_contact")
+            if future_contact is not None:
+                self._alpha = compute_contact_alpha(future_contact)[0].detach().cpu().reshape(
+                    self.steps, 1, 1
+                )
             if normalized_zero:
                 if "wrench_history" not in bound.arguments:
                     raise ValueError("Encoder has no explicit wrench_history input")
@@ -151,17 +158,15 @@ class WrenchEffectCapture:
         context = context.detach().float().cpu().reshape(self.steps, patches, channels)
         if not torch.isfinite(update).all() or not torch.isfinite(context).all():
             raise ValueError("Encoder produced non-finite residual updates or context")
-        result = {"context": context, "ca_update": update}
-        if contact_gate is not None:
-            result["contact_gate"] = contact_gate
+        result = {"context": context, "ca_update": update,
+                  "alpha": (self._alpha if self._alpha is not None
+                             else torch.ones(self.steps, 1, 1))}
         return result
 
 
 def applied_ca_update(branch):
-    """Exclude computed CA updates discarded by the complete fusion gate."""
-    update = branch["ca_update"]
-    gate = branch.get("contact_gate")
-    return update if gate is None else torch.where(gate[:, None, None], update, torch.zeros_like(update))
+    """Return the alpha-scaled CA update captured from the encoder."""
+    return branch["ca_update"]
 
 
 @torch.inference_mode()

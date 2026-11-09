@@ -48,7 +48,7 @@ normalizer:
   last_n_dims: 1
 
 dataset:
-  _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+  _target_: diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset
   shape_meta: *shape_meta
   dataset_path: ${dataset_path}
   horizon: ${horizon}
@@ -81,6 +81,11 @@ dataset:
   action_layout: per_step
   relative_pose_actions: ${task.relative_pose_actions}
   timestamp_key: timestamp
+  wrench_filter:
+    enabled: true
+    cutoff_hz: 2.0
+    source_key: observation.wrench
+    timestamp_key: timing.state_timestamp_ns
   timestamp_step_sec: 0.04
   timestamp_tolerance_sec: null
   observation_validity_key: timing.camera_valid

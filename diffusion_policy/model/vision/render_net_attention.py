@@ -154,6 +154,9 @@ def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero"):
     if baseline != "raw_zero":
         raise ValueError("Context-effect region supervision currently supports raw_zero")
     reference = dict(obs)
+    # The Dataset label describes the original sample. Recompute it from the
+    # zero-wrench counterfactual so its force-attention update is disabled.
+    reference.pop("contact_alpha", None)
     keys = dict.fromkeys(getattr(teacher, name, None) for name in
                          ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
     for key in keys:

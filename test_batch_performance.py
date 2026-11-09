@@ -10,7 +10,7 @@ os.chdir(ROOT_DIR)
 import time
 import torch
 from torch.utils.data import DataLoader
-from diffusion_policy.dataset.hirol_lerobot_v3_dataset import  HirolLeRobotV3Dataset
+from diffusion_policy.dataset.lerobot_v3_dataset import  LeRobotV3ImageDataset
 
 def test_batch_performance():
     # Dataset configuration
@@ -40,10 +40,10 @@ def test_batch_performance():
         }
     }
 
-    dataset_path = "data/train_episode/moving_bread/moving_bread_hirol_lerobotv3"
+    dataset_path = "data/train_episode/moving_bread/moving_bread_lerobotv3"
 
-    print("Creating HirolLobotv3Dataset...")
-    dataset = HirolLeRobotV3Dataset(
+    print("Creating LeRobotV3ImageDataset...")
+    dataset = LeRobotV3ImageDataset(
         shape_meta=shape_meta,
         dataset_path=dataset_path,
         horizon=16,

@@ -33,7 +33,9 @@ def config(tmp_path):
         demos = file.create_group("data")
         demos.attrs["env_args"] = json.dumps({"env_kwargs": {"control_freq": 20}})
         for episode in range(2):
-            obs = demos.create_group(f"demo_{episode}").create_group("obs")
+            demo = demos.create_group(f"demo_{episode}")
+            demo.create_dataset("states", data=(0.25 + np.arange(40) * .05)[:, None])
+            obs = demo.create_group("obs")
             rows = np.arange(40, dtype=np.float32)[:, None]
             obs.create_dataset("joint_states", data=np.broadcast_to(rows + episode * 1000, (40, 7)))
             for name in ("dq", "tau"):
@@ -206,6 +208,8 @@ def test_full_mse_cadence_plot_updates_and_histories_survive_resume(config, monk
 
 
 def test_grouped_h5_slices_alignment_and_episode_boundaries(config):
+    # Keep the legacy unfiltered-row contract covered independently of filtering.
+    config["dataloader"]["wrench_filter"]["enabled"] = False
     dataset = LiberoWrenchDataset(config)
     assert len(dataset.episodes) == 2 and len(dataset) == 64
     first = dataset[0]

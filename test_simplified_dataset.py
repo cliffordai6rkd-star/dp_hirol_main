@@ -10,7 +10,7 @@ os.chdir(ROOT_DIR)
 import time
 import torch
 from torch.utils.data import DataLoader
-from diffusion_policy.dataset.hirol_dataset import HirolDataset
+from diffusion_policy.dataset.zarr_image_dataset import ZarrImageDataset
 
 def test_simplified_dataset():
     """Test the simplified dataset with direct memory access"""
@@ -29,10 +29,10 @@ def test_simplified_dataset():
 
     dataset_path = "/home/zyx/dataset/dp/fr3/0920/water_pouring_1_step_0_skip_abs_jps.zarr"
 
-    print("Creating simplified HirolDataset...")
+    print("Creating simplified ZarrImageDataset...")
     start_time = time.perf_counter()
 
-    dataset = HirolDataset(
+    dataset = ZarrImageDataset(
         shape_meta=shape_meta,
         dataset_path=dataset_path,
         horizon=16,

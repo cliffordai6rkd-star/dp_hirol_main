@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from diffusion_policy.dataset.hirol_lerobot_v3_dataset import HirolLeRobotV3Dataset
+from diffusion_policy.dataset.lerobot_v3_dataset import LeRobotV3ImageDataset
 
 
 # =========================
@@ -110,11 +110,11 @@ def normalize_in_chunks(name, data, field_normalizer, components, chunk_size=409
 # =========================
 # 3. 实例化 Dataset
 # =========================
-# 这一段对应训练时 Hydra 创建 HirolLeRobotV3Dataset 的过程。
+# 这一段对应训练时 Hydra 创建 LeRobotV3ImageDataset 的过程。
 # 重点确认 feature_map 和训练 YAML 一致，否则 shape 对但语义可能错。
-dataset = HirolLeRobotV3Dataset(
+dataset = LeRobotV3ImageDataset(
     shape_meta=shape_meta,
-    dataset_path="data/train_episode/moving_bread/moving_bread_hirol_lerobotv3",
+    dataset_path="data/train_episode/moving_bread/moving_bread_lerobotv3",
     horizon=16,
     pad_before=1,
     pad_after=7,

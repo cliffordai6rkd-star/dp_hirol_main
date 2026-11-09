@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from diffusion_policy.dataset.hirol_lerobot_v3_dataset import HirolLeRobotV3Dataset
+from diffusion_policy.dataset.lerobot_v3_dataset import LeRobotV3ImageDataset
 from diffusion_policy.model.vision.contact_curriculum import ContactDetector, HysteresisContactDetector
 from diffusion_policy.scripts.episode_wrench_plot import WrenchEpisodePlot, load_episode_wrench
 
@@ -25,7 +25,7 @@ def episode_dataset(values, *, start=5, timestamp_key="timestamp"):
         phase_source_key="observation.wrench", _phase_source_data=None,
         _load_column=column, episode_ranges=[range(start), range(start, len(raw))],
         timestamps=times, timestamp_key=timestamp_key,
-        _timestamp_seconds=HirolLeRobotV3Dataset._timestamp_seconds,
+        _timestamp_seconds=LeRobotV3ImageDataset._timestamp_seconds,
         contact_threshold=100., contact_force_dims=(0, 1, 2), contact_norm="l2",
         contact_enter_frames=1, contact_exit_frames=1,
     )

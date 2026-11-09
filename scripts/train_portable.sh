@@ -19,7 +19,7 @@ if [[ "$mode" == check ]]; then
     scripts/check_ddp_runtime.py "$@"
 fi
 args=("$mode"
-  --dp-config diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2_gripper_contact_gate.yaml
+  --dp-config diffusion_policy/config/sim_force_aware_dp_train.yaml
   --distill-config diffusion_policy/config/train_distill_render_net_patch_context.yaml
   --nproc-per-node "$nproc")
 case "$mode" in

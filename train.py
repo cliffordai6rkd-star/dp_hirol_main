@@ -2,23 +2,23 @@
 Usage:
 Training:
 python train.py --config-name=train_diffusion_lowdim_workspace
-python train.py -c diffusion_policy/config/train_zarr/train_hirol_fr3_unet_abs_jp.yaml
+python train.py -c diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml
 
 GPU Selection:
 # Single GPU training - specify device
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:1
+python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
+python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:1
 
 # Multi-GPU data-parallel training (torchrun creates one process per GPU)
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
     --config-name=train_dp_inert_usb
 
 # CPU training (for debugging)
-python train.py --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml training.device=cpu
+python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cpu
 
 Examples:
 # Train on specific GPU with custom output directory
-python train.py --config-dir=. --config-name=train_hirol_fr3_unet_abs_jp_ee_state.yaml \
+python train.py --config-dir=. --config-name=train_fr3_unet_abs_jp_ee_state.yaml \
     training.device=cuda:1 \
     hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_gpu1'
 

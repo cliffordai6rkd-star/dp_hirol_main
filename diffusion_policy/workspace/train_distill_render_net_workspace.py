@@ -29,6 +29,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from diffusion_policy.common.render_net_training_logger import RenderNetTrainingLogger
 from diffusion_policy.common.checkpoint_action_mse import resolve_student_teacher
+from diffusion_policy.common.dataset_config import canonical_dataset_config
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.teacher_cache_lifecycle import TeacherCacheLifecycle
 from diffusion_policy.dataset.render_net_teacher_cache import (
@@ -87,31 +88,42 @@ class _NullTrainingLogger:
 
 
 def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
-                           return_contact=False, image_context_encoder=None):
-    """Only RGB and normalized wrench enter RenderNet; no teacher force/fusion path."""
-    images, wrench, contact, future_contact = teacher.prepare_context_inputs(obs)
-    # The teacher's preprocessing already applies the configured hysteresis or
-    # token-level future-contact rule.  Reuse that exact per-observation gate
-    # in the student renderer; a missing future phase falls back to current
-    # contact, matching the teacher preprocessing contract.
-    contact_gate = future_contact if future_contact is not None else contact
+                           return_contact=False, image_context_encoder=None,
+                           use_teacher_ffn=False):
+    """Render RGB with the shared alpha, then encode it with the frozen visual path."""
+    prepare_with_future = getattr(teacher, "prepare_context_inputs_with_future_contact", None)
+    if prepare_with_future is not None:
+        images, wrench, contact, future_contact = prepare_with_future(obs)
+    else:
+        # Lightweight teacher adapters used by existing render-only callers
+        # expose the original four-value preprocessing interface.
+        images, wrench, contact, future_contact = teacher.prepare_context_inputs(obs)
+        if future_contact is None:
+            future_contact = contact
+    # The Dataset alpha is shared with the teacher; the complete future mask
+    # also lets render-only callers compute the same continuous blend weight.
     renderer_impl = getattr(render_net, "module", render_net)
     if isinstance(renderer_impl, RenderNet):
         rendered, masks = render_net(
-            images, wrench, future_contact=contact_gate, return_aux=True,
+            images, wrench, future_contact=future_contact, return_aux=True,
+            contact_alpha=(obs["contact_alpha"][:, :teacher.n_obs_steps]
+                           if "contact_alpha" in obs else None),
         )
     else:
         # Lightweight test/render adapters from older checkpoints may expose
         # only the original two-input signature.
         rendered, masks = render_net(images, wrench, return_aux=True)
     encode = teacher.obs_encoder.encode_image_context if image_context_encoder is None else image_context_encoder
-    tokens = encode(rendered, input_grad=True)
+    if use_teacher_ffn:
+        tokens = encode(rendered, input_grad=True, apply_fusion_ffn=True)
+    else:
+        tokens = encode(rendered, input_grad=True)
     if return_aux and return_contact:
-        return tokens, masks, contact_gate
+        return tokens, masks, future_contact
     if return_aux:
         return tokens, masks
     if return_contact:
-        return tokens, contact_gate
+        return tokens, future_contact
     return tokens
 
 
@@ -163,6 +175,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if self.teacher_policy.obs_encoder.cross_attn_query != "image":
             raise ValueError("RenderNet distillation requires teacher cross_attn_query: image")
         self.teacher_policy.eval().requires_grad_(False)
+        log.info("Student token supervision: frozen image encoder%s; deployment uses RenderNet only",
+                 " + teacher fusion FFNs" if self.use_teacher_ffn else "")
         self.normalizer = self.teacher_policy.normalizer
         self.wrench_preprocessor = WrenchPreprocessor.from_policy(self.teacher_policy).eval().requires_grad_(False)
         with open_dict(self.cfg):
@@ -475,6 +489,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return str(self.distillation_config.get("objective", "token_mse"))
 
     @property
+    def use_teacher_ffn(self):
+        # Historical student checkpoints retain their original visual loss path.
+        return bool(self.distillation_config.get("use_teacher_ffn", False))
+
+    @property
     def metric_name(self):
         return "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
 
@@ -549,7 +568,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     def _instantiate_dataset(self, config):
         def instantiate():
             dataset = hydra.utils.instantiate(config)
-            # The Hirol dataset converts RAM preload into a shared tmpfs cache
+            # The robot dataset converts RAM preload into a shared tmpfs cache
             # under torchrun. Do not silently turn this into an SSD image cache.
             wants_ram = config.get("preload_images", False) and (
                 config.get("load_result_add", "ram") in (None, "", "ram", "memory", "mem")
@@ -715,23 +734,23 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return (not self.model.training) or getattr(self, "training_stage", "joint") in {"rgb", "joint"}
 
     @staticmethod
-    def _contact_token_metrics(student_tokens, teacher_tokens, contact_gate):
+    def _contact_token_metrics(student_tokens, teacher_tokens, contact_mask):
         """Return contact ratio and token MSE split without changing gradients."""
-        if contact_gate is None:
-            contact_gate = torch.ones(
+        if contact_mask is None:
+            contact_mask = torch.ones(
                 student_tokens.shape[0], 1, device=student_tokens.device, dtype=torch.bool,
             )
-        if contact_gate.ndim == 3:
-            contact_gate = contact_gate.any(dim=-1)
-        if contact_gate.ndim != 2:
-            raise ValueError("contact gate must have shape [B, To] or [B, To, K]")
-        if student_tokens.shape[0] != contact_gate.shape[0]:
-            raise ValueError("contact gate batch size does not match context tokens")
-        steps = contact_gate.shape[1]
+        if contact_mask.ndim == 3:
+            contact_mask = contact_mask.any(dim=-1)
+        if contact_mask.ndim != 2:
+            raise ValueError("contact mask must have shape [B, To] or [B, To, K]")
+        if student_tokens.shape[0] != contact_mask.shape[0]:
+            raise ValueError("contact mask batch size does not match context tokens")
+        steps = contact_mask.shape[1]
         if steps < 1 or student_tokens.shape[1] % steps:
             raise ValueError("context token layout is not divisible by observation steps")
         tokens_per_step = student_tokens.shape[1] // steps
-        token_open = contact_gate.to(torch.bool).unsqueeze(-1).expand(
+        token_open = contact_mask.to(torch.bool).unsqueeze(-1).expand(
             -1, -1, tokens_per_step,
         ).reshape(student_tokens.shape[0], -1)
         per_token = (student_tokens.float() - teacher_tokens.float()).square().mean(dim=-1)
@@ -741,7 +760,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         open_mse = open_values.mean() if open_values.numel() else zero
         closed_mse = closed_values.mean() if closed_values.numel() else zero
         return {
-            "contact_open_ratio": contact_gate.float().mean(),
+            "contact_open_ratio": contact_mask.float().mean(),
             "open_token_mse": open_mse,
             "closed_token_mse": closed_mse,
             "open_token_count": float(open_values.numel()),
@@ -841,15 +860,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     renderer = getattr(self, "ema_model", None)
                     if renderer is None:
                         renderer = self.model
-            student_tokens, masks, contact_gate = student_context_tokens(
+            student_tokens, masks, contact_mask = student_context_tokens(
                 self.teacher_policy, renderer, obs,
                 return_aux=True, return_contact=True, image_context_encoder=compiled_encoder,
+                use_teacher_ffn=self.use_teacher_ffn,
             )
             if student_tokens.shape != teacher_tokens.shape:
                 raise RuntimeError(f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}")
             token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
             contact_metrics = self._contact_token_metrics(
-                student_tokens, teacher_tokens, contact_gate,
+                student_tokens, teacher_tokens, contact_mask,
             )
             mask_mse = token_mse.new_zeros(())
             patch_mse = token_mse.new_zeros(())
@@ -1050,7 +1070,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "policy": OmegaConf.to_container(self.teacher_cfg.policy, resolve=True),
             "wrench_preprocessing_version": WRENCH_PREPROCESSING_VERSION,
             "future_contact_mode": getattr(self.teacher_policy, "future_contact_mode", "legacy_rollout"),
-            "contact_fusion_gate": bool(getattr(self.teacher_policy, "contact_fusion_gate", False)),
             "dataset": OmegaConf.to_container(dataset_cfg, resolve=True),
             "source": dataset_source_signature(dataset.dataset_path),
             "amp_enabled": self.amp_enabled, "amp_dtype": str(self.amp_dtype),
@@ -1074,7 +1093,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 normalize_region_source(self.attention_config.get("source", "noise_attention")),
             )
             identity["region_source"] = (
-                "context_effect_v1" if region_source == "context" else "noise_attention_v1"
+                "context_effect_v2" if region_source == "context" else "noise_attention_v1"
             )
         if self.attention_enabled and region_source == "context":
             identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
@@ -1404,9 +1423,14 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         config = OmegaConf.create(OmegaConf.to_container(source.task.dataset, resolve=True))
         with open_dict(config):
             config.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
-        return config
+            if hasattr(self, "wrench_preprocessor"):
+                config.contact_label_config = self.wrench_preprocessor.get_config()
+                with open_dict(self.cfg.dataset):
+                    self.cfg.dataset.contact_label_config = config.contact_label_config
+        return canonical_dataset_config(config)
 
     def _run(self):
+        dataset_cfg = self._dataset_config()
         output = pathlib.Path(self.output_dir)
         output.mkdir(parents=True, exist_ok=True)
         if self.is_main_process:
@@ -1421,7 +1445,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if previous_best.is_file() and not destination.exists():
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(previous_best, destination)
-        dataset_cfg = self._dataset_config()
         # Keep the original dataset config as the cache identity. Rank-local
         # decoder devices do not change supervision, so all ranks reuse the
         # existing single-GPU teacher cache rather than creating new copies.

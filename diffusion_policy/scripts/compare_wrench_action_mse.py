@@ -183,6 +183,7 @@ def evaluate_batch(policy, obs, target, *, seed, noise_generator, noise_scale=20
     scores = {}
     for name, wrench in conditions.items():
         inputs = dict(obs)
+        inputs.pop("contact_alpha", None)
         inputs[wrench_key] = wrench
         generator = torch.Generator(device=target.device).manual_seed(int(seed))
         prediction = policy.predict_action(inputs, generator=generator)["model_action_pred"]

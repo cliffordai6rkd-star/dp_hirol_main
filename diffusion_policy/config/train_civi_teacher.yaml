@@ -95,7 +95,6 @@ policy:
   phase_wrench_key: wrench
   future_phase_wrench_key: future_wrench
   future_contact_mode: legacy_rollout
-  contact_fusion_gate: false
   wrench_history_steps: 8
   relative_pose_actions: false
   action_reference_key: action_reference
@@ -285,7 +284,7 @@ task:
     mode: gaussian
     last_n_dims: 1
   dataset:
-    _target_: diffusion_policy.dataset.hirol_lerobot_v3_dataset.HirolLeRobotV3Dataset
+    _target_: diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset
     shape_meta:
       obs:
         wrist:
@@ -353,6 +352,11 @@ task:
     action_layout: per_step
     relative_pose_actions: false
     timestamp_key: timestamp
+    wrench_filter:
+      enabled: true
+      cutoff_hz: 2.0
+      source_key: observation.wrench
+      timestamp_key: timing.state_timestamp_ns
     timestamp_step_sec: 0.05
     timestamp_tolerance_sec: null
     observation_validity_key: timing.camera_valid

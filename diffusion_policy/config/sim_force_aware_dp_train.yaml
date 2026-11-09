@@ -53,7 +53,6 @@ policy:
   phase_wrench_key: ${task.phase_wrench_key}
   future_phase_wrench_key: ${task.future_phase_wrench_key}
   future_contact_mode: legacy_rollout
-  contact_fusion_gate: false
   wrench_history_steps: ${task.future_wrench_steps}
   relative_pose_actions: ${task.relative_pose_actions}
   action_reference_key: ${task.action_reference_key}
