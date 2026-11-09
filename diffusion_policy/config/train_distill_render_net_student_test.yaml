@@ -12,7 +12,7 @@ output_dir: data/outputs/civi/student
 # 冻结 teacher，以其 context tokens 监督学生 RGB 渲染。
 distillation:
   objective: token_mse
-  use_teacher_ffn: true # 仅训练监督复用教师冻结 FFN；部署仍只需要 RenderNet。
+  use_teacher_ffn: false # 教师和学生都使用融合 FFN 之前的 context token。
   token_loss_weight: 0.0
   demo_loss_weight: 0.0
   validation_seed: 42

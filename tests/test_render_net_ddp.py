@@ -101,6 +101,7 @@ def _config(root):
                          "diffusion_policy/config/train_distill_render_net.yaml")
     del cfg["hydra"]
     cfg.distillation.objective = "token_mse" # This fixture exercises the legacy obs-only teacher.
+    cfg.distillation.use_teacher_ffn = False # TinyEncoder has no fusion FFN modules.
     cfg.teacher_checkpoint = str(root / "teacher.ckpt")
     cfg.teacher_cache.directory = str(root / "teacher_cache")
     cfg.teacher_cache.batch_size = 2

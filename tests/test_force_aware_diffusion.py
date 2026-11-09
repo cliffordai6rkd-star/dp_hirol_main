@@ -227,7 +227,7 @@ def test_hysteresis_contact_detector_supports_l1_norm_and_future_rollout():
     assert rollout.tolist() == [[[False, False, True, True]]]
 
 
-def test_hysteresis_contact_detector_requires_five_consecutive_frames():
+def test_hysteresis_contact_detector_requires_five_consecutive_frames_for_causal_scan():
     detector = HysteresisContactDetector(
         free_threshold=8.0,
         contact_threshold=8.0,
@@ -240,9 +240,35 @@ def test_hysteresis_contact_detector_requires_five_consecutive_frames():
         [[[[9.0], [9.0], [9.0], [9.0], [9.0],
            [7.0], [7.0], [7.0], [7.0], [7.0]]]]
     )
-    states = detector.rollout_future(wrench, initial_state=torch.tensor([[False]]))
-    assert states.tolist() == [[[False, False, False, False, True,
-                                 True, True, True, True, False]]]
+    # The causal scan keeps the configured debounce.  Future windows use a
+    # horizon-aware suffix rule tested below instead.
+    states = detector._scan_tokens(wrench.reshape(1, -1), initial_state=torch.tensor([False]))
+    assert states.tolist() == [[False, False, False, False, True,
+                                True, True, True, True, False]]
+
+
+def test_future_rollout_accepts_late_three_frame_contact_without_chatter():
+    detector = HysteresisContactDetector(
+        free_threshold=8.0,
+        contact_threshold=8.0,
+        force_dims=(0,),
+        norm="l2",
+        enter_frames=5,
+        exit_frames=5,
+    )
+    # Contact begins at the sixth of eight future samples.  Only the final
+    # three samples remain, so a fixed five-frame debounce would erase it.
+    future = torch.zeros(1, 1, 8, 1)
+    future[..., 5:, 0] = 9.0
+    states = detector.rollout_future(future, initial_state=torch.tensor([[False]]))
+    assert states.tolist() == [[[False, False, False, False, False, True, True, True]]]
+
+    # A short early spike still does not enter contact, preserving debounce
+    # against noise and repeated state switching.
+    noisy = torch.zeros(1, 1, 8, 1)
+    noisy[..., 1, 0] = 9.0
+    noisy_states = detector.rollout_future(noisy, initial_state=torch.tensor([[False]]))
+    assert noisy_states.count_nonzero() == 0
 
 
 def test_future_wrench_prefix_uses_first_contact_vector():

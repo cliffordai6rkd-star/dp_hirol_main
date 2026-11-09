@@ -245,6 +245,10 @@ def test_compiled_student_preserves_context_gradients_and_portable_state_dict(us
     assert compiled.state_dict().keys() == eager.state_dict().keys()
     for name, parameter in compiled.named_parameters():
         reference = dict(eager.named_parameters())[name]
+        # The detached region gate is intentionally outside the RGB loss graph.
+        if reference.grad is None:
+            assert parameter.grad is None
+            continue
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
         torch.testing.assert_close(parameter.grad, reference.grad, rtol=2e-4, atol=1e-6)
     assert compiled.wrench_encoder.weight_ih_l0.grad.abs().sum() > 0
@@ -414,7 +418,8 @@ def test_residual_free_image_query_uses_query_slot_region_targets():
 @pytest.mark.parametrize("mode", ["train", "eval", "no_grad", "cached_train"])
 def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, mode):
     teacher, obs, shapes = make_attention_teacher()
-    config = {"enabled": region_enabled, "percentiles": [82.5, 97.3], "teacher_seed": 42}
+    config = {"enabled": region_enabled, "percentiles": [82.5, 97.3], "teacher_seed": 42,
+              "pixel_loss_weight": 2.0}
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
     workspace.teacher_policy = teacher
     workspace.device = torch.device("cpu")
@@ -424,7 +429,9 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
     workspace.model.train(mode != "eval")
     workspace.attention_config = config
     workspace.attention_enabled = region_enabled
-    workspace.mask_loss_weight = 2.0
+    workspace.context_patch_loss_weight = 0.0
+    workspace.intensity_loss_weight = 1.0
+    workspace.smoothness_loss_weight = 0.0
     workspace.amp_enabled = False
     workspace.shape_info = {}  # Shape logging covered by real checkpoint forward.
     cached_targets = None
@@ -449,10 +456,10 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
         with torch.set_grad_enabled(mode != "no_grad"):
             loss = workspace._loss(obs, cached_targets=cached_targets)
         supervised = region_enabled and mode in {"train", "cached_train"}
-        assert len(calls) == (2 if supervised and mode != "cached_train" else 0)
+        assert len(calls) == (2 if region_enabled and mode != "cached_train" else 0)
         assert workspace.loss_metrics["mask_supervised"] == supervised
         assert loss.item() == pytest.approx(workspace.loss_metrics["token_mse"]
-                                          + 2 * workspace.loss_metrics["mask_mse"])
+                                          + (2 * workspace.loss_metrics["mask_mse"] if supervised else 0))
         if mode in {"train", "cached_train"}:
             loss.backward()
             assert workspace.model.output.weight.grad.abs().sum() > 0
@@ -467,7 +474,7 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
             with torch.no_grad():
                 torch.testing.assert_close(tokens, teacher._encode_context(obs, apply_curriculum_mask=False),
                                            atol=0, rtol=0)
-        elif not supervised:
+        elif not region_enabled:
             assert workspace.loss_metrics["mask_mse"] == 0
         assert not teacher.training
         assert all(not p.requires_grad and p.grad is None for p in teacher.parameters())

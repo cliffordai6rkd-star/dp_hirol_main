@@ -5,7 +5,7 @@ teacher_checkpoint: data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/
 # Stage 2 follows completed FDP training: freeze the teacher and train only RenderNet.
 distillation:
   objective: token_mse # Stage 2 uses the frozen-teacher context token target.
-  use_teacher_ffn: true # Training-only frozen fusion FFNs; deploy RenderNet alone.
+  use_teacher_ffn: false # Keep both teacher and student targets before fusion FFNs.
   token_loss_weight: 0.0 # Kept for compatibility with the denoiser objective.
   demo_loss_weight: 0.0 # Optional original diffusion objective against demonstration actions.
   validation_seed: 42 # Repeat the same noisy-action probes for checkpoint selection.

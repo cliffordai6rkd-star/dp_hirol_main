@@ -9,7 +9,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
 )
 
 
-WRENCH_PREPROCESSING_VERSION = 3
+WRENCH_PREPROCESSING_VERSION = 4
 
 
 def validate_future_contact_mode(mode):

@@ -230,13 +230,43 @@ class HysteresisContactDetector(nn.Module):
                 result[..., index] = state
             return result
 
-        # Each future observation has its own initial state, then scans its K
-        # future wrench samples in order.
+        # A future chunk is only K samples long (often fewer than
+        # ``enter_frames``).  Require the configured streak when it fits, but
+        # shorten it to the remaining suffix when contact starts late in the
+        # chunk.  This preserves debounce for early noise while preventing a
+        # late contact from being discarded merely because the horizon ends
+        # first; ``fill_future_wrench_prefix`` then fills the physical prefix
+        # from the first confirmed token.
         states = []
         for obs_index in range(magnitude.shape[1]):
-            states.append(self._scan_tokens(
-                magnitude[:, obs_index], initial_state=initial_state[:, obs_index]
-            ))
+            values = magnitude[:, obs_index]
+            state = initial_state[:, obs_index].to(device=values.device, dtype=torch.bool)
+            chunk = torch.zeros_like(values, dtype=torch.bool)
+            above_count = torch.zeros_like(state, dtype=torch.long)
+            required_count = torch.full_like(above_count, self.enter_frames)
+            below_count = torch.zeros_like(state, dtype=torch.long)
+            for index in range(values.shape[-1]):
+                above = values[:, index] > self.contact_threshold.to(values)
+                below = values[:, index] < self.free_threshold.to(values)
+                above_count = torch.where(above, above_count + 1, torch.zeros_like(above_count))
+                late_onset = values.shape[-1] - index < self.enter_frames
+                required_count = torch.where(
+                    above & (above_count == 1),
+                    torch.full_like(required_count, 1 if late_onset else self.enter_frames),
+                    required_count,
+                )
+                below_count = torch.where(below, below_count + 1, torch.zeros_like(below_count))
+                enter = (~state) & (above_count >= required_count)
+                leave = state & (below_count >= self.exit_frames)
+                state = torch.where(enter, torch.ones_like(state), state)
+                state = torch.where(leave, torch.zeros_like(state), state)
+                chunk[:, index] |= state
+                above_count = torch.where(enter, torch.zeros_like(above_count), above_count)
+                required_count = torch.where(
+                    enter, torch.full_like(required_count, self.enter_frames), required_count
+                )
+                below_count = torch.where(leave, torch.zeros_like(below_count), below_count)
+            states.append(chunk)
         return torch.stack(states, dim=1)
 
     def token_contact(self, raw_wrench: torch.Tensor) -> torch.Tensor:

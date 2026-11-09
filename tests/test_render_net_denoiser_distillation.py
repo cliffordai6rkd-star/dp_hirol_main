@@ -208,7 +208,7 @@ def test_real_frozen_visual_encoder_and_action_transformer_pass_input_gradients(
         6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
         patch_size=4, embed_dim=8, image_self_attn_layers=1, cross_attn_layers=1, num_heads=2,
         rendering_mode=rendering_mode,
-        high_attention_render={"enabled": rendering_mode == "gaussian_glow"},
+        high_attention_render={"enabled": rendering_mode == "gaussian_glow", "detach_for_rgb": False},
         glow={"num_blobs": 4},
     )
     loss = workspace._batch_loss({"obs": obs, "action": torch.randn(2, 4, 7)})

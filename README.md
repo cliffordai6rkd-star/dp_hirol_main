@@ -31,7 +31,7 @@ python train_civi.py \
 
 先训练教师，再按动作 MSE 选择教师权重进行学生蒸馏。一阶低通 2 Hz 与 Dataset/DataLoader 的共享 alpha 已启用。四卡时将 `--gpus 0` 替换为 `--gpus 0,1,2,3 --nproc-per-node 4`。输出目录应使用本次新目录；续训时显式指定 checkpoint。
 
-学生配置的 `distillation.use_teacher_ffn: true` 让渲染图像经过冻结的 DINO、视觉投影/位置编码、教师各融合层的 FFN（含 LayerNorm 和残差）及最终 context norm，再与教师最终 token 计算 MSE。学生监督路径不运行教师 wrench 编码器或 cross-attention；alpha=0 时与教师的纯视觉基线一致。仅更新 RenderNet，部署渲染仍只需要 RenderNet 和原有输入预处理。旧学生 checkpoint 未设置该选项时，评估沿用原监督路径。
+学生配置默认关闭 `distillation.use_teacher_ffn`，教师和学生都直接使用融合前的 context token，避免蒸馏目标依赖教师 FFN。学生监督路径不运行教师 wrench 编码器或 cross-attention；alpha=0 时与教师的纯视觉基线一致。仅更新 RenderNet，部署渲染仍只需要 RenderNet 和原有输入预处理。旧学生 checkpoint 未设置该选项时，评估沿用原监督路径。
 
 复用已有教师、仅重新训练学生：
 
