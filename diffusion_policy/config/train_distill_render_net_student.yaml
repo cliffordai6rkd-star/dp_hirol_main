@@ -58,7 +58,7 @@ render_net:
     selection: soft
     activation: sigmoid
     initial_strength: 0.1
-    threshold: 0.5 # 渲染 gate=M*(M>threshold)；设 0.0 可取消强度截断。
+    threshold: 0.1 # 渲染 gate=M*(M>threshold)；设 0.0 可取消强度截断。
     normalization: image_minmax
     strength_scale: null
     percentile: 90.0

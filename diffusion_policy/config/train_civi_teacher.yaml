@@ -45,7 +45,7 @@ phase_resampling:
   precontact_seconds: 1.0
   weights:
     free: 1.0
-    precontact: 7.0
+    precontact: 5.0
     contact: 5.0
 freeze_dino_backbone: true
 freeze_modules: []
@@ -144,14 +144,14 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 4
   shuffle: true
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
 val_dataloader:
-  batch_size: 32
+  batch_size: 128
   num_workers: 0
   shuffle: false
   pin_memory: true

@@ -21,6 +21,7 @@ conda activate fdp
 export HF_HOME=/tmp/hf_home
 export HF_DATASETS_CACHE=/tmp/hf_home/datasets
 export TRANSFORMERS_CACHE=/tmp/hf_home/transformers
+
 python train_civi.py \
   --teacher-config diffusion_policy/config/train_civi_teacher.yaml \
   --student-config diffusion_policy/config/train_distill_render_net_student.yaml \
