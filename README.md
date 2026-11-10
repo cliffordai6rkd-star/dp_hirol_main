@@ -30,6 +30,7 @@ python train_civi.py \
   --teacher-override val_dataloader.batch_size=128 \
   --teacher-override training.num_optimizer_steps=200000 \
   --teacher-override training.checkpoint_every_optimizer_steps=20000 \
+  --teacher-override checkpoint.action_mse.every_optimizer_steps=5000 \
   --teacher-override checkpoint.topk.k=4 \
   --teacher-override training.validation_start_optimizer_step=200001 \
   --teacher-override output_dir=data/outputs/civi/fdp_bs128_200k/teacher \
@@ -37,6 +38,8 @@ python train_civi.py \
 ```
 
 程序会先完成教师训练，再自动选择教师 checkpoint 并训练学生。输出目录必须是新目录。
+
+教师每 5000 个 optimizer step 做动作推理评估，按最低 action MSE 更新 `best.ckpt`、保留 Top-K；每 20000 步定期保存 `latest.ckpt`，评估入选的权重也会更新 `latest.ckpt`。
 
 学生配置默认关闭 `distillation.use_teacher_ffn`，教师和学生都直接使用融合前的 context token，避免蒸馏目标依赖教师 FFN。学生监督路径不运行教师 wrench 编码器或 cross-attention；alpha=0 时与教师的纯视觉基线一致。仅更新 RenderNet，部署渲染仍只需要 RenderNet 和原有输入预处理。旧学生 checkpoint 未设置该选项时，评估沿用原监督路径。
 
@@ -149,6 +152,7 @@ python -u sim_force_aware_dp_train.py \
   training.resume=true \
   training.num_optimizer_steps=200000 \
   training.checkpoint_every_optimizer_steps=20000 \
+  checkpoint.action_mse.every_optimizer_steps=5000 \
   training.validation_start_optimizer_step=100001 \
   checkpoint.topk.k=4 \
   hydra.run.dir=data/outputs/civi/teacher_bs128_100k_topk4_20261109 \

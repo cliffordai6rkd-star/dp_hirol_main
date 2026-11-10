@@ -45,8 +45,8 @@ phase_resampling:
   precontact_seconds: 1.0
   weights:
     free: 1.0
-    precontact: 5.0
-    contact: 5.0
+    precontact: 1.0
+    contact: 1.0
 freeze_dino_backbone: true
 freeze_modules: []
 policy:
@@ -221,6 +221,7 @@ checkpoint:
   save_last_snapshot: false
   action_mse:
     enabled: true
+    every_optimizer_steps: 5000
     num_episodes: 2
     batch_size: 16
 task:
@@ -368,6 +369,9 @@ task:
     image_cache_dtype: uint8
     image_cache_chunk_frames: 64
     phase_resampling_enabled: true
+    # Sampling phase follows the current measured, debounced wrench.
+    # Future-wrench contact does not turn a pre-contact anchor into contact.
+    phase_label_mode: current_wrench
     phase_source_key: observation.wrench
     contact_threshold: 8.0
     contact_enter_frames: 5

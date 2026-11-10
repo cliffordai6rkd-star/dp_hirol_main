@@ -359,7 +359,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 )
 
         validation_start = self._validation_start_optimizer_step(cfg)
-        if self.is_main_process and self.optimizer_step < validation_start:
+        if (self.is_main_process and self._uses_validation_checkpoint(cfg)
+                and self.optimizer_step < validation_start):
             log.info(
                 "Validation and validation-based Top-K/best selection start at "
                 "optimizer_step=%d; earlier checkpoints only update latest.ckpt",
@@ -800,6 +801,18 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         log_interval = int(cfg.training.get("log_every_optimizer_steps", 50))
         if log_interval < 1:
             raise ValueError("training.log_every_optimizer_steps must be positive")
+        checkpoint_interval = cfg.training.get("checkpoint_every_optimizer_steps")
+        if checkpoint_interval is not None:
+            checkpoint_interval = int(checkpoint_interval)
+            if checkpoint_interval < 1:
+                raise ValueError("training.checkpoint_every_optimizer_steps must be positive or null")
+        action_mse_interval = None
+        if OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
+            action_mse_interval = OmegaConf.select(cfg, "checkpoint.action_mse.every_optimizer_steps")
+            if action_mse_interval is not None:
+                action_mse_interval = int(action_mse_interval)
+                if action_mse_interval < 1:
+                    raise ValueError("checkpoint.action_mse.every_optimizer_steps must be positive or null")
         loss_sum = None
         loss_count = 0
         last_log = {}
@@ -910,34 +923,33 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 if self.is_main_process and should_log:
                     json_logger.log(last_log)
                     self._log_wandb(wandb_run, last_log, step=self.global_step)
-                checkpoint_every_optimizer_steps = cfg.training.get(
-                    "checkpoint_every_optimizer_steps"
+                periodic_checkpoint = (
+                    checkpoint_interval is not None
+                    and self.optimizer_step % checkpoint_interval == 0
                 )
-                if checkpoint_every_optimizer_steps is not None:
-                    checkpoint_interval = int(checkpoint_every_optimizer_steps)
-                    if checkpoint_interval < 1:
-                        raise ValueError(
-                            "training.checkpoint_every_optimizer_steps must be "
-                            "positive or null"
+                action_mse_due = (
+                    action_mse_interval is not None
+                    and self.optimizer_step % action_mse_interval == 0
+                )
+                if periodic_checkpoint or action_mse_due:
+                    if last_log["train_loss"] is None:
+                        last_log["train_loss"] = float(group_loss_tensor.item())
+                    if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
+                        last_log.update(
+                            self._validate_and_log(
+                                cfg, val_dataloader, device, wandb_run, json_logger,
+                            )
                         )
-                    if self.optimizer_step % checkpoint_interval == 0:
-                        if last_log["train_loss"] is None:
-                            last_log["train_loss"] = float(group_loss_tensor.item())
-                        if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
-                            last_log.update(
-                                self._validate_and_log(
-                                    cfg, val_dataloader, device, wandb_run, json_logger,
-                                )
-                            )
-                        if self.is_main_process:
-                            last_log.update(self._checkpoint_action_mse_and_log(
-                                cfg, device, wandb_run, json_logger,
-                            ))
-                            self._save_optimizer_step_checkpoint(
-                                cfg,
-                                topk_manager=topk_manager,
-                                metric_dict=last_log,
-                            )
+                    if self.is_main_process:
+                        last_log.update(self._checkpoint_action_mse_and_log(
+                            cfg, device, wandb_run, json_logger,
+                        ))
+                        self._save_optimizer_step_checkpoint(
+                            cfg,
+                            topk_manager=topk_manager,
+                            metric_dict=last_log,
+                            periodic_checkpoint=periodic_checkpoint,
+                        )
 
         epoch_loss = (
             float((loss_sum / loss_count).item()) if loss_sum is not None else float("nan")
@@ -1073,6 +1085,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         cfg,
         topk_manager=None,
         metric_dict=None,
+        *,
+        periodic_checkpoint: bool = True,
     ) -> None:
         step_tag = f"optimizer_step={self.optimizer_step:08d}"
         checkpoint_dir = pathlib.Path(self.output_dir).joinpath("checkpoints")
@@ -1093,7 +1107,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if checkpoint_path is not None:
             self.save_checkpoint(path=checkpoint_path, use_thread=False)
 
-            # Keep resume compatibility without duplicating the checkpoint payload.
+            # Also advance latest for accepted evaluation-only candidates: Top-K
+            # may just have deleted the file its previous symlink pointed to.
             if cfg.checkpoint.save_last_ckpt:
                 latest_path = self.get_checkpoint_path()
                 temporary_link = checkpoint_dir.joinpath(
@@ -1102,12 +1117,12 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 temporary_link.unlink(missing_ok=True)
                 temporary_link.symlink_to(checkpoint_path.name)
                 os.replace(temporary_link, latest_path)
-        elif topk_manager is not None and cfg.checkpoint.save_last_ckpt:
+        elif periodic_checkpoint and topk_manager is not None and cfg.checkpoint.save_last_ckpt:
             # If a metric-based Top-K manager rejects this checkpoint, still keep
-            # a single latest checkpoint for reliable resume.
+            # a single latest checkpoint at the regular save interval for resume.
             self._save_latest_checkpoint()
         self._update_best_checkpoint(topk_manager)
-        if cfg.checkpoint.save_last_snapshot:
+        if periodic_checkpoint and cfg.checkpoint.save_last_snapshot:
             self.save_snapshot(tag=step_tag)
         self._record_action_mse_score(cfg, checkpoint_path)
 

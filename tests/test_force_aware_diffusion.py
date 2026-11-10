@@ -112,6 +112,7 @@ def make_policy(
     pre_cross_self_attn_layers=0,
     image_blur_schedule=None,
     action_dim=7,
+    action_representation="ee_pose",
 ):
     encoder = make_obs_encoder(
         image_keys=image_keys, pre_cross_self_attn_layers=pre_cross_self_attn_layers
@@ -168,6 +169,7 @@ def make_policy(
         n_action_steps=8,
         n_obs_steps=2,
         relative_pose_actions=relative_pose_actions,
+        action_representation=action_representation,
         num_inference_steps=2,
         n_emb=16,
         contact_threshold=policy_contact_threshold,
@@ -753,6 +755,27 @@ def test_policy_prediction_is_clear_and_returns_eight_action_steps(action_dim):
         atol=1e-5,
     )
     assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0.0
+
+
+def test_joint_position_prediction_preserves_joint_angles_and_gripper(monkeypatch):
+    policy = make_policy(action_dim=8, action_representation="joint_position")
+    policy.eval()
+    # Joint angles 4--7 must not be projected onto a unit quaternion.
+    target = torch.tensor([0.1, -0.4, 0.2, -2.4, 0.3, 1.8, 0.7, -1.0]).repeat(2, 9, 1)
+    normalized = policy.normalizer["action"].normalize(target)
+    monkeypatch.setattr(policy, "conditional_sample", lambda *args, **kwargs: normalized)
+    obs = {
+        "wrist": torch.rand(2, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(2, 2, 8, 6),
+    }
+    result = policy.predict_action(obs)
+    torch.testing.assert_close(result["model_action_pred"], target)
+    torch.testing.assert_close(result["action"], target[:, 1:9])
+
+
+def test_joint_position_actions_cannot_use_relative_pose_transform():
+    with pytest.raises(ValueError, match="relative_pose_actions requires action_representation"):
+        make_policy(relative_pose_actions=True, action_representation="joint_position")
 
 
 @pytest.mark.parametrize("action_dim", [7, 8])

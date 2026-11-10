@@ -1,0 +1,46 @@
+# Joint-trajectory teacher: [q(t+1), gripper_command(t)], 8 dimensions.
+# q is the recorded measured joint position, not the original controller q_cmd.
+# The current LIBERO socket adapter accepts EE poses only; this config is for
+# training/offline prediction until a JOINT_POSITION execution path is added.
+defaults:
+  - train_civi_teacher
+  - _self_
+
+name: train_civi_teacher_joint
+exp_name: train_civi_teacher_joint
+output_dir: data/outputs/civi/teacher_joint_phase111
+
+phase_resampling:
+  weights:
+    free: 1.0
+    precontact: 1.0
+    contact: 1.0
+
+policy:
+  action_representation: joint_position
+  relative_pose_actions: false
+
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64
+
+task:
+  dataset:
+    action_feature_fields:
+      - observation.joint
+      - action
+    action_feature_columns:
+      action: [6]
+    # At 20 Hz, each q target is 50 ms ahead of its command row.
+    # Leave the original gripper command on row t.
+    action_feature_offsets:
+      observation.joint: 1
+    relative_pose_actions: false
+
+logging:
+  name: teacher_joint_phase111
+
+hydra:
+  run:
+    dir: ${output_dir}

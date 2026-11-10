@@ -89,6 +89,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
         future_contact_mode: str = "legacy_rollout",
+        action_representation: str = "ee_pose",
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
@@ -186,6 +187,10 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             )
 
         action_dim = action_shape[0]
+        if action_representation not in {"ee_pose", "joint_position"}:
+            raise ValueError("action_representation must be 'ee_pose' or 'joint_position'")
+        if relative_pose_actions and action_representation != "ee_pose":
+            raise ValueError("relative_pose_actions requires action_representation='ee_pose'")
         if relative_pose_actions and action_dim != 7:
             raise ValueError(
                 "relative_pose_actions requires action shape [7] in xyz + xyzw format"
@@ -279,6 +284,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self.n_obs_steps = int(n_obs_steps)
         self.action_start_index = int(action_start_index)
         self.action_dim = int(action_dim)
+        self.action_representation = action_representation
         self.image_keys = configured_image_keys
         self.image_key = configured_image_keys[0] if len(configured_image_keys) == 1 else None
         self.wrench_key = wrench_key
@@ -572,7 +578,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         model_action_prediction = self.normalizer["action"].unnormalize(
             normalized_prediction
         )
-        model_action_prediction = normalize_pose_quaternions(model_action_prediction)
+        if self.action_representation == "ee_pose":
+            model_action_prediction = normalize_pose_quaternions(model_action_prediction)
         action_prediction = model_action_prediction
         if self.relative_pose_actions:
             if self.action_reference_key not in obs_dict:

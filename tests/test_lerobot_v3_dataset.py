@@ -106,6 +106,78 @@ def test_absolute_pose_plus_gripper_action_uses_only_selected_command_column(mon
     torch.testing.assert_close(normalizer.unnormalize(normalizer.normalize(values)), values)
 
 
+def test_next_joint_targets_keep_current_gripper_and_episode_boundaries(monkeypatch):
+    episode_length = 12
+    q = np.repeat(np.arange(24, dtype=np.float32)[:, None], 7, axis=1)
+    commands = np.zeros((24, 7), dtype=np.float32)
+    commands[:, 6] = np.arange(24, dtype=np.float32) + 100
+    commands[[11, 23], 6] = 9999  # Invalid target rows must not affect normalization.
+    source = {
+        "timestamp": np.tile(np.arange(episode_length) / 20.0, 2),
+        "observation.wrench_ext": np.zeros((24, 8, 6), dtype=np.float32),
+        "observation.joint": q,
+        "action": commands,
+    }
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", source)
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "episode_data_index", {
+        "from": [0, 12], "to": [12, 24],
+    })
+    monkeypatch.setattr(v3_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    shapes = _shape_meta()
+    shapes["action"]["shape"] = [8]
+    dataset = LeRobotV3ImageDataset(
+        shape_meta=shapes, dataset_path="unused", horizon=9,
+        pad_before=1, pad_after=0, n_obs_steps=2, preload_images=False,
+        window_sampling_strategy="timestamp", timestamp_step_sec=0.05,
+        action_feature_fields=["observation.joint", "action"],
+        action_feature_columns={"action": [6]},
+        action_feature_offsets={"observation.joint": 1},
+    )
+    assert np.isnan(dataset.action_data[[11, 23], :7]).all()
+    assert not dataset._action_valid[[11, 23]].any()
+    np.testing.assert_array_equal(dataset.action_data[:, 7], commands[:, 6])
+    sequences = dataset._sequence_indices_from_sampler_rows(dataset.indices)
+    assert len(dataset) == 8
+    for index, rows in enumerate(sequences):
+        batch = dataset[index]
+        assert torch.isfinite(batch["action"]).all()
+        # The policy selects from n_obs_steps - 1, so its first executed target
+        # must be next q, paired with the command at the latest observation.
+        anchor = rows[dataset.n_obs_steps - 1]
+        selected = batch["action"][dataset.n_obs_steps - 1 :]
+        np.testing.assert_array_equal(selected[0, :7], q[anchor + 1])
+        assert selected[0, 7] == commands[anchor, 6]
+        np.testing.assert_array_equal(batch["action"][:, :7], q[rows + 1])
+        np.testing.assert_array_equal(batch["action"][:, 7], commands[rows, 6])
+        assert ((rows + 1) // episode_length == rows // episode_length).all()
+    normalizer = dataset.get_normalizer(mode="gaussian", last_n_dims=1)["action"]
+    expected = dataset.action_data[np.unique(sequences)]
+    np.testing.assert_allclose(normalizer.get_input_stats()["max"], expected.max(axis=0))
+    np.testing.assert_allclose(normalizer.get_input_stats()["mean"], expected.mean(axis=0))
+    assert torch.isfinite(dataset.get_all_actions()).all()
+    assert dataset.get_all_actions().shape == (22, 8)
+    # Evaluation views must apply the same missing-target filtering.
+    assert len(dataset.get_all_episodes_dataset()) == len(dataset)
+
+
+@pytest.mark.parametrize("offsets,layout", [
+    ({"missing": 1}, "per_step"),
+    ({"action.ee_pose": True}, "per_step"),
+    ({"action.ee_pose": 0.5}, "per_step"),
+    ({"action.ee_pose": 1}, "prechunked"),
+])
+def test_action_field_offsets_reject_invalid_configuration(monkeypatch, offsets, layout):
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", _columns(np.zeros((4, 7))))
+    monkeypatch.setattr(v3_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    with pytest.raises(ValueError, match="action_feature_offsets"):
+        LeRobotV3ImageDataset(
+            shape_meta=_shape_meta(), dataset_path="unused", horizon=2,
+            n_obs_steps=2, preload_images=False,
+            action_feature_fields=["action.ee_pose"],
+            action_feature_offsets=offsets, action_layout=layout,
+        )
+
+
 class LeRobotV3ImageDatasetActionLayoutTest(unittest.TestCase):
     def _create_dataset(
         self,
@@ -489,6 +561,105 @@ def test_ddp_reuses_one_shared_image_cache_after_ram_is_filled(tmp_path, monkeyp
                                         multiprocessing_context="spawn")
     batch = next(iter(loader))
     torch.testing.assert_close(batch["obs"]["side"][1], torch.full((1, 3, 2, 2), 1 / 255))
+
+
+def _phase_label_fixture(force, *, episode_length=None, mode="current_wrench"):
+    """Exercise sampler semantics independently of image decoding/window padding."""
+    force = np.asarray(force, dtype=np.float32)
+    length = len(force)
+    episode_length = length if episode_length is None else episode_length
+    dataset = object.__new__(LeRobotV3ImageDataset)
+    dataset.phase_resampling_enabled = True
+    dataset.phase_label_mode = mode
+    dataset.contact_threshold = 8.0
+    dataset.contact_enter_frames = 5
+    dataset.contact_exit_frames = 5
+    dataset.contact_force_dims = (0, 1, 2)
+    dataset.contact_norm = "l2"
+    dataset.precontact_seconds = 1.0
+    dataset.dataset_length = length
+    dataset.anchor_position = 0
+    dataset._phase_source_data = np.zeros((length, 6), dtype=np.float32)
+    dataset._phase_source_data[:, 0] = force
+    dataset.windowed_lowdim_data = {
+        "wrench": np.zeros((length, 8, 6), dtype=np.float32),
+        "future_wrench": np.zeros((length, 8, 6), dtype=np.float32),
+    }
+    dataset.episode_ranges = [range(start, start + episode_length)
+                              for start in range(0, length, episode_length)]
+    dataset.episode_index = np.arange(length) // episode_length
+    # Float32 timestamps match the real Parquet dataset, including boundary error.
+    dataset.timestamps = ((np.arange(length) % episode_length) / 20).astype(np.float32)
+    indices = np.array([[row, row + 1, 0, 1] for row in range(length)])
+    return dataset, indices
+
+
+def test_current_wrench_sampling_does_not_promote_future_contact():
+    force = np.zeros(40, dtype=np.float32)
+    force[12:24] = 10
+    dataset, indices = _phase_label_fixture(force)
+    dataset.windowed_lowdim_data["future_wrench"][5, :, 0] = 10
+    labels = dataset._build_phase_labels(indices)
+    assert labels[5] == 1  # Currently free, approaching measured contact.
+    assert labels[18] == 2  # Current contact even though all window tokens are zero.
+    dataset.phase_label_mode = "window_contact"
+    legacy = dataset._build_phase_labels(indices)
+    assert legacy[5] == 2  # The old look-ahead promotion remains reproducible.
+
+
+def test_current_wrench_sampling_is_invariant_to_future_and_history_windows():
+    force = np.zeros(40, dtype=np.float32)
+    force[12:24] = 10
+    dataset, indices = _phase_label_fixture(force)
+    expected = dataset._build_phase_labels(indices)
+    # Both a future contact prediction and stale contact in the observation
+    # window must not override the current measured state of a sample anchor.
+    dataset.windowed_lowdim_data["future_wrench"][:, :, 0] = 100
+    dataset.windowed_lowdim_data["wrench"][30, :, 0] = 100
+    actual = dataset._build_phase_labels(indices)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual[30] == 0  # Five low frames have already confirmed release.
+
+
+def test_current_wrench_sampling_preserves_causal_five_frame_confirmation():
+    force = np.zeros(25, dtype=np.float32)
+    force[7:14] = 10
+    dataset, indices = _phase_label_fixture(force)
+    labels = dataset._build_phase_labels(indices)
+    assert (labels[7:11] == 1).all()  # High, but not yet confirmed contact.
+    assert (labels[:11] != 2).all()  # No offline backfill into earlier frames.
+    assert (labels[11:18] == 2).all()
+    assert labels[18] == 0  # Fifth consecutive low frame confirms release.
+
+
+def test_current_wrench_sampling_resets_contact_at_each_episode():
+    force = np.zeros(32, dtype=np.float32)
+    force[8:16] = 10  # First episode ends in contact; second is always free.
+    dataset, indices = _phase_label_fixture(force, episode_length=16)
+    labels = dataset._build_phase_labels(indices)
+    assert labels[15] == 2
+    np.testing.assert_array_equal(labels[16:], np.zeros(16, dtype=np.int8))
+
+
+def test_current_wrench_precontact_includes_float32_one_second_boundary():
+    force = np.zeros(70, dtype=np.float32)
+    force[39:55] = 10  # Confirmed at frame 43 / 2.15 seconds.
+    dataset, indices = _phase_label_fixture(force)
+    labels = dataset._build_phase_labels(indices)
+    assert labels[22] == 0
+    np.testing.assert_array_equal(np.flatnonzero(labels == 1), np.arange(23, 43))
+    assert labels[43] == 2
+
+
+def test_saved_configs_default_to_legacy_window_contact_labels(monkeypatch):
+    monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", _columns(np.zeros((4, 7))))
+    monkeypatch.setattr(v3_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    dataset = LeRobotV3ImageDataset(
+        shape_meta=_shape_meta(), dataset_path="unused", horizon=2,
+        n_obs_steps=2, preload_images=False,
+        action_feature_fields=["action.ee_pose"],
+    )
+    assert dataset.phase_label_mode == "window_contact"
 
 
 if __name__ == "__main__":

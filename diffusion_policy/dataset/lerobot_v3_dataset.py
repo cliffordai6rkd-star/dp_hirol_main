@@ -141,6 +141,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         windowed_lowdim_feature_groups: Optional[Mapping[str, Mapping]] = None,
         action_feature_fields: Optional[Sequence[str]] = None,
         action_feature_columns: Optional[Mapping[str, Sequence[int]]] = None,
+        action_feature_offsets: Optional[Mapping[str, int]] = None,
         action_layout: str = "per_step",
         relative_pose_actions: bool = False,
         action_reference_key: str = "action_reference",
@@ -173,6 +174,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         episode_warmup_steps: int = 0,
         wrench_filter: Optional[Mapping] = None,
         contact_label_config: Optional[Mapping] = None,
+        phase_label_mode: str = "window_contact",
     ):
         super().__init__()
         if window_sampling_strategy not in {"idx", "timestamp"}:
@@ -221,6 +223,9 @@ class LeRobotV3ImageDataset(BaseImageDataset):
             raise ValueError("image_cache_dtype must be 'uint8' or 'float32'")
         self.image_cache_chunk_frames = max(1, int(image_cache_chunk_frames))
         self.phase_resampling_enabled = bool(phase_resampling_enabled)
+        if phase_label_mode not in {"window_contact", "current_wrench"}:
+            raise ValueError("phase_label_mode must be 'window_contact' or 'current_wrench'")
+        self.phase_label_mode = phase_label_mode
         self.phase_source_key = str(phase_source_key)
         self.contact_threshold = (
             None if contact_threshold is None else float(contact_threshold)
@@ -312,9 +317,18 @@ class LeRobotV3ImageDataset(BaseImageDataset):
 
         self.action_feature_fields = list(action_feature_fields or ["action"])
         self.action_feature_columns = dict(action_feature_columns or {})
+        self.action_feature_offsets = dict(action_feature_offsets or {})
         unknown_action_fields = set(self.action_feature_columns) - set(self.action_feature_fields)
         if unknown_action_fields:
             raise ValueError(f"action_feature_columns contains unused fields: {sorted(unknown_action_fields)}")
+        unknown_offset_fields = set(self.action_feature_offsets) - set(self.action_feature_fields)
+        if unknown_offset_fields:
+            raise ValueError(f"action_feature_offsets contains unused fields: {sorted(unknown_offset_fields)}")
+        for field, offset in self.action_feature_offsets.items():
+            if isinstance(offset, bool) or not isinstance(offset, (int, np.integer)):
+                raise ValueError(f"action_feature_offsets[{field!r}] must be an integer frame offset")
+        if self.action_layout != "per_step" and any(self.action_feature_offsets.values()):
+            raise ValueError("Nonzero action_feature_offsets require action_layout='per_step'")
 
         self.lerobot_dataset = LeRobotV3Dataset(
             self.dataset_path,
@@ -402,6 +416,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                     self.lowdim_feature_groups[key], dtype=np.float32
                 )
         action_arrays = []
+        self._action_valid = np.ones(self.dataset_length, dtype=bool)
         for field in self.action_feature_fields:
             values = self._load_column(field, dtype=np.float32)
             if field in self.action_feature_columns:
@@ -411,6 +426,22 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                         or len(set(columns)) != len(columns)):
                     raise ValueError(f"action_feature_columns[{field!r}] must contain distinct column indices in [0, {values.shape[-1]})")
                 values = values[..., columns]
+            offset = int(self.action_feature_offsets.get(field, 0))
+            if offset:
+                # Shift each field independently: a next-state joint target can
+                # accompany the current row's gripper command. Missing targets
+                # stay invalid instead of wrapping or repeating an episode end.
+                shifted = np.full_like(values, np.nan)
+                valid = np.zeros(self.dataset_length, dtype=bool)
+                for episode_range in self.episode_ranges:
+                    rows = np.arange(episode_range.start, episode_range.stop)
+                    source_rows = rows + offset
+                    within_episode = (source_rows >= episode_range.start) & (source_rows < episode_range.stop)
+                    rows = rows[within_episode]
+                    shifted[rows] = values[source_rows[within_episode]]
+                    valid[rows] = True
+                values = shifted
+                self._action_valid &= valid
             action_arrays.append(values)
         self.action_data = np.concatenate(action_arrays, axis=-1)
 
@@ -819,6 +850,8 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         starts = np.r_[0, self.episode_ends[:-1]]
         keep = (sequences >= starts[episodes, None] + self.episode_warmup_steps).all(axis=1)
         keep &= self._observation_valid[observations].all(axis=1)
+        if self.action_layout == "per_step":
+            keep &= self._action_valid[sequences[:, self.n_latency_steps :]].all(axis=1)
         for valid_rows in self._windowed_lowdim_valid_rows.values():
             keep &= valid_rows[observations].all(axis=1)
         return indices[keep]
@@ -872,10 +905,12 @@ class LeRobotV3ImageDataset(BaseImageDataset):
     def _build_phase_labels(self, indices: np.ndarray) -> np.ndarray:
         """Return 0=free, 1=pre-contact, 2=contact for each sample window.
 
-        A window is contact-relevant when either its observed tau history or
-        its future tau history contains a token above the contact threshold.
-        Remaining anchors in the one-second interval before the first contact
-        timestamp of their episode are marked pre-contact.
+        ``current_wrench`` uses the causal, debounced measured source at the
+        observation anchor. Neither future windows nor filled wrench prefixes
+        can promote an anchor to contact. ``window_contact`` reproduces the
+        historical rule that any contact in an observation window qualifies.
+        Non-contact anchors before the first confirmed episode contact are
+        pre-contact for the configured duration. Debounce is not backfilled.
         """
         if not self.phase_resampling_enabled:
             return np.zeros((len(indices),), dtype=np.int8)
@@ -887,15 +922,14 @@ class LeRobotV3ImageDataset(BaseImageDataset):
             return np.zeros((0,), dtype=np.int8)
 
         window_contact = np.zeros((self.dataset_length,), dtype=bool)
-        # Use every materialized low-dimensional observation window.  This
-        # keeps phase sampling usable for both the legacy tau_ext datasets and
-        # the simulated wrench-only dataset, whose keys are wrench/future_wrench.
-        for values in self.windowed_lowdim_data.values():
-            magnitudes = self._phase_magnitude(values)
-            if self.contact_enter_frames == 1 and self.contact_exit_frames == 1:
-                window_contact |= np.asarray(magnitudes > self.contact_threshold).any(axis=1)
-            else:
-                window_contact |= self._debounced_contact(magnitudes).any(axis=1)
+        if self.phase_label_mode == "window_contact":
+            # Preserve old saved configs and checkpoint diagnostics exactly.
+            for values in self.windowed_lowdim_data.values():
+                magnitudes = self._phase_magnitude(values)
+                if self.contact_enter_frames == 1 and self.contact_exit_frames == 1:
+                    window_contact |= np.asarray(magnitudes > self.contact_threshold).any(axis=1)
+                else:
+                    window_contact |= self._debounced_contact(magnitudes).any(axis=1)
 
         source = self._phase_source_data
         if source is None:
@@ -927,7 +961,11 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         episodes = self.episode_index[anchors]
         anchor_timestamps = timestamps[anchors]
         labels = np.zeros((len(indices),), dtype=np.int8)
-        labels[window_contact[anchors]] = 2
+        contact = frame_contact if self.phase_label_mode == "current_wrench" else window_contact
+        labels[contact[anchors]] = 2
+        # Recorded timestamps are float32 seconds. Include the exact left
+        # endpoint of a 1 s interval despite subtraction/quantization error.
+        time_epsilon = 1e-6 if self.phase_label_mode == "current_wrench" else 0.0
         precontact = np.zeros_like(labels, dtype=bool)
         for episode_idx, onset in enumerate(contact_onset):
             if not np.isfinite(onset):
@@ -935,7 +973,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
             in_window = episodes == episode_idx
             precontact |= (
                 in_window
-                & (anchor_timestamps >= onset - self.precontact_seconds)
+                & (anchor_timestamps >= onset - self.precontact_seconds - time_epsilon)
                 & (anchor_timestamps < onset)
             )
         labels[(labels == 0) & precontact] = 1
@@ -1284,7 +1322,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
-        return torch.from_numpy(self.action_data.copy())
+        return torch.from_numpy(self.action_data[self._action_valid].copy())
 
     def __len__(self) -> int:
         return len(self.indices)

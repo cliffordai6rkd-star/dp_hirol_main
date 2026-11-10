@@ -123,8 +123,13 @@ def test_checkpoint_inference_uses_complete_fresh_episodes_and_ema(tmp_path):
     assert len(local_logger.records) == 3
 
 
-def test_step_checkpoints_run_inference_before_save_and_retain_lowest_score(tmp_path):
+@pytest.mark.parametrize("explicit_null_interval", [False, True])
+def test_step_checkpoints_run_inference_before_save_and_retain_lowest_score(
+    tmp_path, explicit_null_interval,
+):
     workspace = _workspace(tmp_path)
+    if explicit_null_interval:
+        workspace.cfg.checkpoint.action_mse.every_optimizer_steps = None
     manager = workspace._make_topk_manager(workspace.cfg)
     scheduler = torch.optim.lr_scheduler.LambdaLR(workspace.optimizer, lambda _: 1.0)
     batch = {"obs": {"prediction": torch.zeros(1, 4, 2)}, "action": torch.zeros(1, 4, 2)}
@@ -143,6 +148,88 @@ def test_step_checkpoints_run_inference_before_save_and_retain_lowest_score(tmp_
     saved_metrics = dill.loads(payload["pickles"]["action_mse_metrics"])
     assert saved_metrics[ACTION_MSE_KEY] == best[ACTION_MSE_KEY]
     assert saved_metrics["episode_ids"] == best["episode_ids"]
+
+
+def test_independent_inference_cadence_preserves_best_and_periodic_resume(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    workspace.cfg.checkpoint.action_mse.every_optimizer_steps = 2
+    workspace.cfg.training.checkpoint_every_optimizer_steps = 8
+    workspace.cfg.training.gradient_accumulate_every = 2
+    workspace.cfg.checkpoint.save_last_snapshot = True
+    snapshots = []
+    monkeypatch.setattr(
+        TrainForceAwareDiffusionWorkspace, "save_snapshot",
+        lambda self, tag: snapshots.append(tag),
+    )
+    manager = workspace._make_topk_manager(workspace.cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(workspace.optimizer, lambda _: 1.0)
+    logger = _Logger()
+    batch = {"obs": {"prediction": torch.zeros(1, 4, 2)}, "action": torch.zeros(1, 4, 2)}
+    directory = tmp_path / "checkpoints"
+
+    def train_to(step, inference_weight):
+        with torch.no_grad():
+            workspace.ema_model.weight.fill_(inference_weight)
+        workspace._train_epoch(
+            cfg=workspace.cfg, dataloader=[batch] * 4, device=torch.device("cpu"),
+            lr_scheduler=scheduler, ema=None, wandb_run=_Logger(), json_logger=logger,
+            topk_manager=manager, target_optimizer_steps=step,
+        )
+
+    def load_checkpoint(path):
+        return torch.load(path, map_location="cpu", pickle_module=dill)
+
+    train_to(2, 100.0)
+    first = (directory / "best.ckpt").resolve()
+    assert first.is_file()
+    assert (directory / "latest.ckpt").resolve() == first
+
+    # A better evaluation between periodic saves evicts the old latest target.
+    train_to(4, 0.0)
+    best = (directory / "best.ckpt").resolve()
+    assert best != first and not first.exists()
+    assert best.is_file() and (directory / "latest.ckpt").resolve() == best
+    best_payload = load_checkpoint(best)
+    assert dill.loads(best_payload["pickles"]["optimizer_step"]) == 4
+    assert best_payload["state_dicts"]["ema_model"]["weight"].item() == 0.0
+    latest_before_rejection = (directory / "latest.ckpt").read_bytes()
+
+    # A worse evaluation is recorded, but neither checkpoint nor snapshot is written.
+    train_to(6, 200.0)
+    assert (directory / "latest.ckpt").is_symlink()
+    assert (directory / "latest.ckpt").read_bytes() == latest_before_rejection
+    assert (directory / "best.ckpt").resolve() == best
+    assert not list(directory.glob("step=00000006-*.ckpt"))
+    assert snapshots == []
+    scores = json.loads((directory / "action_mse.json").read_text())
+    assert [record["optimizer_step"] for record in scores["records"]] == [2, 4, 6]
+    assert scores["records"][-1]["checkpoint"] is None
+
+    # The regular checkpoint still saves current training state if Top-K rejects it.
+    train_to(8, 300.0)
+    assert not (directory / "latest.ckpt").is_symlink()
+    latest_payload = load_checkpoint(directory / "latest.ckpt")
+    assert dill.loads(latest_payload["pickles"]["optimizer_step"]) == 8
+    assert dill.loads(latest_payload["pickles"]["global_step"]) == 16
+    assert latest_payload["state_dicts"]["ema_model"]["weight"].item() == 300.0
+    assert snapshots == ["optimizer_step=00000008"]
+    assert (directory / "best.ckpt").resolve() == best
+    scores = json.loads((directory / "action_mse.json").read_text())
+    assert [record["optimizer_step"] for record in scores["records"]] == [2, 4, 6, 8]
+    assert [record["global_step"] for record in scores["records"]] == [4, 8, 12, 16]
+    assert scores["best"]["optimizer_step"] == 4
+    assert scores["records"][-1]["checkpoint"] is None
+    assert sum(ACTION_MSE_KEY in record for record in logger.records) == 4
+
+    resumed = _workspace(tmp_path)
+    resumed.cfg = copy.deepcopy(workspace.cfg)
+    resumed.load_payload(latest_payload)
+    restored_manager = resumed._make_topk_manager(resumed.cfg)
+    assert resumed.optimizer_step == 8
+    assert restored_manager.path_value_map == manager.path_value_map
+    assert (directory / "best.ckpt").resolve() == best
+    selected, selected_metrics = select_action_mse_teacher(tmp_path)
+    assert selected == best and selected_metrics["optimizer_step"] == 4
 
 
 def test_student_reads_teacher_yaml_paths_and_selects_mse_instead_of_latest(tmp_path):
