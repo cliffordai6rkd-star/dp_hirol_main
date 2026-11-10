@@ -10,6 +10,7 @@ if __name__ == "__main__":
 import copy
 import contextlib
 import dill
+import hashlib
 import logging
 import math
 import os
@@ -53,6 +54,33 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 log = logging.getLogger(__name__)
+
+
+def _action_mse_protocol(cfg):
+    """Describe the deterministic full-data score; old sampled scores use None."""
+    options = OmegaConf.select(cfg, "checkpoint.action_mse")
+    if options is None or not options.get("enabled", False):
+        return None
+    selection = options.get("episode_selection", "random")
+    if selection not in {"random", "all"}:
+        raise ValueError("checkpoint.action_mse.episode_selection must be 'random' or 'all'")
+    if selection == "random":
+        return None
+    return {
+        "name": "all_windows_fixed_noise_v1",
+        "episode_selection": "all",
+        "seed": int(options.get("seed", 42)),
+        "noise_seed_scheme": "blake2b_episode_anchor_v1",
+        "reduction": "action_element_mean",
+        "num_inference_steps": OmegaConf.select(cfg, "policy.num_inference_steps"),
+        "clip_sample": OmegaConf.select(cfg, "policy.noise_scheduler.clip_sample"),
+    }
+
+
+def _action_mse_window_seed(seed, episode_id, anchor_frame):
+    """Stable sample noise identity, independent of batch/order/checkpoint step."""
+    identity = f"{int(seed)}:{int(episode_id)}:{int(anchor_frame)}".encode("ascii")
+    return int.from_bytes(hashlib.blake2b(identity, digest_size=8).digest(), "little") & ((1 << 63) - 1)
 
 
 @dataclass(frozen=True)
@@ -977,6 +1005,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             "monitor_key": manager.monitor_key,
             "mode": manager.mode,
             "format_str": manager.format_str,
+            "action_mse_protocol": _action_mse_protocol(cfg),
             "validation_start_optimizer_step": (
                 self._validation_start_optimizer_step(cfg)
                 if self._uses_validation_checkpoint(cfg) else 0
@@ -998,9 +1027,12 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             if self._uses_validation_checkpoint(cfg) else 0
         )
         same_validation_window = state.get("validation_start_optimizer_step", 0) == validation_start
+        same_action_protocol = state.get("action_mse_protocol") == _action_mse_protocol(cfg)
         if state and not same_validation_window:
             log.info("Validation start changed; resetting the saved Top-K ranking")
-        if same_validation_window and all(
+        if state and not same_action_protocol:
+            log.info("Action MSE evaluation protocol changed; resetting the saved Top-K ranking")
+        if same_validation_window and same_action_protocol and all(
             state.get(key) == getattr(manager, key) for key in ("monitor_key", "mode", "format_str")
         ):
             candidates = [
@@ -1117,9 +1149,9 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 temporary_link.unlink(missing_ok=True)
                 temporary_link.symlink_to(checkpoint_path.name)
                 os.replace(temporary_link, latest_path)
-        elif periodic_checkpoint and topk_manager is not None and cfg.checkpoint.save_last_ckpt:
+        elif topk_manager is not None and cfg.checkpoint.save_last_ckpt:
             # If a metric-based Top-K manager rejects this checkpoint, still keep
-            # a single latest checkpoint at the regular save interval for resume.
+            # current state for resume, including evaluation-only checkpoints.
             self._save_latest_checkpoint()
         self._update_best_checkpoint(topk_manager)
         if periodic_checkpoint and cfg.checkpoint.save_last_snapshot:
@@ -1131,25 +1163,39 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             record_checkpoint_action_mse(self.output_dir, self.action_mse_metrics, checkpoint)
 
     def _checkpoint_action_mse_and_log(self, cfg, device, wandb_run, json_logger):
-        """Score current EMA weights on two newly sampled complete episodes."""
+        """Score EMA over all windows with fixed sample noise, or legacy episodes."""
         if not OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
             return {}
+        protocol = _action_mse_protocol(cfg)
         previous = getattr(self, "action_mse_metrics", {})
-        if previous.get("optimizer_step") == self.optimizer_step:
+        if (previous.get("optimizer_step") == self.optimizer_step
+                and previous.get("action_mse_protocol") == protocol):
             return previous
 
         options = cfg.checkpoint.action_mse
         dataset = self._checkpoint_eval_dataset
         row_episodes = dataset.episode_index[dataset.indices[:, 0]]
         available = np.unique(row_episodes)
-        count = int(options.get("num_episodes", 2))
+        count = len(available) if protocol is not None else int(options.get("num_episodes", 2))
         batch_size = int(options.get("batch_size", 16))
         if count < 1 or count > len(available) or batch_size < 1:
             raise ValueError("Checkpoint action MSE needs a positive batch size and enough valid episodes")
-        # A new draw at every checkpoint; no fixed held-out episode set.
-        seed = int(cfg.training.seed) + int(self.optimizer_step)
-        selected = np.random.default_rng(seed).choice(available, size=count, replace=False)
+        seed = protocol["seed"] if protocol is not None else int(cfg.training.seed) + int(self.optimizer_step)
+        selected = (available if protocol is not None else
+                    np.random.default_rng(seed).choice(available, size=count, replace=False))
         rows = np.flatnonzero(np.isin(row_episodes, selected))
+        window_seeds = None
+        if protocol is not None:
+            # IDs use the actual observation anchor, not the window's left edge
+            # (which may be padded) or its rank in a particular evaluation batch.
+            starts = np.r_[0, np.flatnonzero(np.diff(dataset.episode_index)) + 1]
+            episode_starts = {int(dataset.episode_index[index]): int(index) for index in starts}
+            anchors = [dataset._anchor_index_from_sampler_row(dataset.indices[row]) for row in rows]
+            window_seeds = [
+                _action_mse_window_seed(seed, dataset.episode_index[anchor],
+                                       anchor - episode_starts[int(dataset.episode_index[anchor])])
+                for anchor in anchors
+            ]
         dataloader = DataLoader(
             Subset(dataset, rows.tolist()), batch_size=batch_size, shuffle=False,
             num_workers=0, pin_memory=device.type == "cuda",
@@ -1160,26 +1206,41 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         policy.eval()
         raw_sum = normalized_sum = 0.0
         action_count = 0
-        log.info("Checkpoint inference: step=%d episodes=%s windows=%d",
-                 self.optimizer_step, selected.tolist(), len(rows))
+        log.info("Checkpoint inference: step=%d episodes=%s windows=%d protocol=%s",
+                 self.optimizer_step, selected.tolist(), len(rows),
+                 protocol["name"] if protocol is not None else "random_episodes")
         try:
             devices = [device] if device.type == "cuda" else []
             with torch.random.fork_rng(devices=devices), torch.no_grad(), self._autocast(cfg, device):
                 generator = torch.Generator(device=device).manual_seed(seed)
+                row_offset = 0
                 for batch in dataloader:
                     batch = dict_apply(batch, lambda value: value.to(device, non_blocking=True))
-                    prediction = policy.predict_action(batch["obs"], generator=generator)["model_action_pred"]
+                    batch_size_actual = len(batch["action"])
+                    batch_generator = generator
+                    if window_seeds is not None:
+                        batch_generator = [torch.Generator(device=device).manual_seed(sample_seed)
+                                           for sample_seed in window_seeds[row_offset:row_offset + batch_size_actual]]
+                    prediction = policy.predict_action(batch["obs"], generator=batch_generator)["model_action_pred"]
+                    row_offset += batch_size_actual
                     start = policy.action_start_index
                     end = start + policy.n_action_steps
                     prediction = prediction[:, start:end].float()
                     target = batch["action"][:, start:end].float()
                     if prediction.shape != target.shape or target.shape[1] != policy.n_action_steps:
                         raise ValueError("Checkpoint inference and target action chunks must match")
-                    raw_sum += torch.nn.functional.mse_loss(prediction, target, reduction="sum").item()
-                    normalized_sum += torch.nn.functional.mse_loss(
-                        policy.normalizer["action"].normalize(prediction),
-                        policy.normalizer["action"].normalize(target), reduction="sum",
-                    ).item()
+                    normalized_prediction = policy.normalizer["action"].normalize(prediction)
+                    normalized_target = policy.normalizer["action"].normalize(target)
+                    if protocol is not None:
+                        # Double accumulation avoids batch-boundary rounding in
+                        # the dataset mean; policy inference retains its AMP mode.
+                        raw_sum += (prediction.double() - target.double()).square().sum().item()
+                        normalized_sum += (normalized_prediction.double() - normalized_target.double()).square().sum().item()
+                    else:
+                        raw_sum += torch.nn.functional.mse_loss(prediction, target, reduction="sum").item()
+                        normalized_sum += torch.nn.functional.mse_loss(
+                            normalized_prediction, normalized_target, reduction="sum",
+                        ).item()
                     action_count += target.numel()
         finally:
             policy.train(was_training)
@@ -1193,6 +1254,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             "num_windows": len(rows),
             "num_action_values": action_count,
             "inference_seed": seed,
+            "action_mse_protocol": protocol,
             "policy_state_key": "ema_model" if self.ema_model is not None else "model",
             "epoch": self.epoch,
             "global_step": self.global_step,

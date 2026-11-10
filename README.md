@@ -30,7 +30,7 @@ python train_civi.py \
   --teacher-override val_dataloader.batch_size=128 \
   --teacher-override training.num_optimizer_steps=200000 \
   --teacher-override training.checkpoint_every_optimizer_steps=20000 \
-  --teacher-override checkpoint.action_mse.every_optimizer_steps=5000 \
+  --teacher-override checkpoint.action_mse.every_optimizer_steps=10000 \
   --teacher-override checkpoint.topk.k=4 \
   --teacher-override training.validation_start_optimizer_step=200001 \
   --teacher-override output_dir=data/outputs/civi/fdp_bs128_200k/teacher \
@@ -39,7 +39,9 @@ python train_civi.py \
 
 程序会先完成教师训练，再自动选择教师 checkpoint 并训练学生。输出目录必须是新目录。
 
-教师每 5000 个 optimizer step 做动作推理评估，按最低 action MSE 更新 `best.ckpt`、保留 Top-K；每 20000 步定期保存 `latest.ckpt`，评估入选的权重也会更新 `latest.ckpt`。
+教师默认每 10000 个 optimizer step 做全量动作推理评估：全部轨迹的有效窗口各评估一次，不做强化采样或随机图像增强，EMA 模型使用按 episode 和窗口固定的推理噪声。按总平方误差除以动作元素数得到 action MSE，选取最低分更新 `best.ckpt` 并保留 Top-K；每次评估后都更新 `latest.ckpt`，即使没有进入 Top-K。输出目录中的 `action_mse.png` 随评估自动刷新。当前 50 条轨迹都参与训练，因此这条曲线表示训练集拟合程度，不是独立验证集性能。
+
+只训练教师时添加 `--stage teacher`。`checkpoint.action_mse.episode_selection=all` 与 `seed=42` 定义全量固定噪声协议；旧配置缺少该字段时仍按原来的随机轨迹规则评估。切换协议后，已有 checkpoint 应统一重评，不能将新旧分数混用于 Top-K。可使用 `diffusion_policy/scripts/reevaluate_checkpoint_action_mse.py` 将重评结果生成到独立目录，核对后再替换原评分和 checkpoint 目录。
 
 学生配置默认关闭 `distillation.use_teacher_ffn`，教师和学生都直接使用融合前的 context token，避免蒸馏目标依赖教师 FFN。学生监督路径不运行教师 wrench 编码器或 cross-attention；alpha=0 时与教师的纯视觉基线一致。仅更新 RenderNet，部署渲染仍只需要 RenderNet 和原有输入预处理。旧学生 checkpoint 未设置该选项时，评估沿用原监督路径。
 

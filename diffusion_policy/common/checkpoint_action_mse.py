@@ -1,6 +1,7 @@
 """Checkpoint scores from fresh episode inference, shared by teacher and student."""
 
 import json
+import logging
 import math
 from pathlib import Path
 
@@ -70,6 +71,9 @@ def record_checkpoint_action_mse(run_dir, metrics, checkpoint):
     directory.mkdir(parents=True, exist_ok=True)
     scores = directory / SCORES_FILENAME
     records = json.loads(scores.read_text())["records"] if scores.is_file() else []
+    protocol = metrics.get("action_mse_protocol")
+    if any(item.get("action_mse_protocol") != protocol for item in records):
+        raise ValueError("Action MSE protocol changed; re-evaluate retained checkpoints before combining scores")
     previous = next((item for item in records if item["optimizer_step"] == metrics["optimizer_step"]), {})
     record = dict(metrics, checkpoint=Path(checkpoint).name if checkpoint else previous.get("checkpoint"))
     records = [item for item in records if item["optimizer_step"] != record["optimizer_step"]]
@@ -77,6 +81,16 @@ def record_checkpoint_action_mse(run_dir, metrics, checkpoint):
     candidates = _available_scores(directory, records)
     best = min(candidates, key=lambda item: item[ACTION_MSE_KEY]) if candidates else None
     payload = {"metric": ACTION_MSE_KEY, "mode": "min", "best": best, "records": records}
+    if protocol is not None:
+        payload["action_mse_protocol"] = protocol
     temporary = scores.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
     temporary.replace(scores)
+    if protocol is not None and protocol.get("episode_selection") == "all":
+        # Render in the training process so PNG refreshes survive future resumes.
+        # Plotting is secondary to preserving the scores and training checkpoint.
+        try:
+            from diffusion_policy.scripts.plot_checkpoint_action_mse import plot_scores
+            plot_scores(payload, Path(run_dir) / "action_mse.png")
+        except Exception:
+            logging.getLogger(__name__).exception("Could not update action_mse.png; checkpoint scores are saved")

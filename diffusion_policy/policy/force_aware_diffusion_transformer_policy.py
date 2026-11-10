@@ -564,7 +564,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
     def predict_action(
         self,
         obs_dict: Dict[str, torch.Tensor],
-        generator: Optional[torch.Generator] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> Dict[str, torch.Tensor]:
         if "past_action" in obs_dict:
             raise NotImplementedError("past_action conditioning is not implemented")

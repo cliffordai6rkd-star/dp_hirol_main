@@ -773,6 +773,27 @@ def test_joint_position_prediction_preserves_joint_angles_and_gripper(monkeypatc
     torch.testing.assert_close(result["action"], target[:, 1:9])
 
 
+def test_per_window_generators_keep_prediction_stable_across_batch_splits():
+    policy = make_policy()
+    policy.eval()
+    obs = {
+        "wrist": torch.rand(3, 2, 3, 16, 16),
+        "wrench_ext": torch.zeros(3, 2, 8, 6),
+    }
+    seeds = [17, 2026, 99]
+    def predict(indices):
+        return policy.predict_action(
+            {key: value[indices] for key, value in obs.items()},
+            generator=[torch.Generator().manual_seed(seeds[i]) for i in indices],
+        )["action_pred"]
+    with torch.no_grad():
+        combined = predict([0, 1, 2])
+        split = torch.cat([predict([0]), predict([1, 2])])
+        reordered = predict([2, 0, 1])
+    torch.testing.assert_close(combined, split, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(combined[[2, 0, 1]], reordered, atol=1e-5, rtol=1e-5)
+
+
 def test_joint_position_actions_cannot_use_relative_pose_transform():
     with pytest.raises(ValueError, match="relative_pose_actions requires action_representation"):
         make_policy(relative_pose_actions=True, action_representation="joint_position")

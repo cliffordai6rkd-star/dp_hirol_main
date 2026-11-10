@@ -221,8 +221,9 @@ checkpoint:
   save_last_snapshot: false
   action_mse:
     enabled: true
-    every_optimizer_steps: 5000
-    num_episodes: 2
+    every_optimizer_steps: 10000
+    episode_selection: all
+    seed: 42
     batch_size: 16
 task:
   name: libero_open_top_drawer_put_bowl_20hz_force_aware

@@ -11,7 +11,9 @@ from diffusion_policy.common.checkpoint_action_mse import (
     ACTION_MSE_KEY, record_checkpoint_action_mse, resolve_student_teacher, select_action_mse_teacher,
 )
 from diffusion_policy.workspace.train_distill_render_net_workspace import TrainDistillRenderNetWorkspace
-from diffusion_policy.workspace.train_force_aware_diffusion_workspace import TrainForceAwareDiffusionWorkspace
+from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
+    TrainForceAwareDiffusionWorkspace, _action_mse_protocol, _action_mse_window_seed,
+)
 
 
 class _Normalizer:
@@ -32,7 +34,8 @@ class _Policy(torch.nn.Module):
 
     def predict_action(self, obs, generator):
         assert not self.training and not torch.is_grad_enabled()
-        self.prediction_calls.append(torch.rand((), generator=generator).item())
+        generators = generator if isinstance(generator, list) else [generator]
+        self.prediction_calls.extend(torch.rand((), generator=value).item() for value in generators)
         return {"model_action_pred": obs["prediction"] + self.weight}
 
     def compute_loss(self, batch, optimizer_step):
@@ -51,8 +54,13 @@ class _Episodes(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.indices)
 
+    @staticmethod
+    def _anchor_index_from_sampler_row(row):
+        return int(row[0])
+
     def __getitem__(self, row):
         self.seen_rows.append(row)
+        row = int(self.indices[row, 0])
         # Context and past-horizon values must be excluded from the action MSE.
         prediction = torch.tensor([[999.0, 999.0], [row + 1.0, 2.0], [3.0, 4.0], [999.0, 999.0]])
         return {"obs": {"prediction": prediction}, "action": torch.zeros_like(prediction)}
@@ -192,12 +200,12 @@ def test_independent_inference_cadence_preserves_best_and_periodic_resume(tmp_pa
     best_payload = load_checkpoint(best)
     assert dill.loads(best_payload["pickles"]["optimizer_step"]) == 4
     assert best_payload["state_dicts"]["ema_model"]["weight"].item() == 0.0
-    latest_before_rejection = (directory / "latest.ckpt").read_bytes()
-
-    # A worse evaluation is recorded, but neither checkpoint nor snapshot is written.
+    # A worse evaluation still saves latest for resume, but not a Top-K copy.
     train_to(6, 200.0)
-    assert (directory / "latest.ckpt").is_symlink()
-    assert (directory / "latest.ckpt").read_bytes() == latest_before_rejection
+    assert not (directory / "latest.ckpt").is_symlink()
+    latest_after_rejection = load_checkpoint(directory / "latest.ckpt")
+    assert dill.loads(latest_after_rejection["pickles"]["optimizer_step"]) == 6
+    assert latest_after_rejection["state_dicts"]["ema_model"]["weight"].item() == 200.0
     assert (directory / "best.ckpt").resolve() == best
     assert not list(directory.glob("step=00000006-*.ckpt"))
     assert snapshots == []
@@ -230,6 +238,123 @@ def test_independent_inference_cadence_preserves_best_and_periodic_resume(tmp_pa
     assert (directory / "best.ckpt").resolve() == best
     selected, selected_metrics = select_action_mse_teacher(tmp_path)
     assert selected == best and selected_metrics["optimizer_step"] == 4
+
+
+class _NoisyPolicy(_Policy):
+    def predict_action(self, obs, generator):
+        assert not self.training and not torch.is_grad_enabled()
+        assert isinstance(generator, list) and len(generator) == len(obs["prediction"])
+        noise = torch.stack([torch.randn(obs["prediction"].shape[1:], generator=value) for value in generator])
+        self.prediction_calls.extend(
+            (float(row[1, 0]), value.initial_seed()) for row, value in zip(obs["prediction"], generator)
+        )
+        return {"model_action_pred": obs["prediction"] + noise + self.weight}
+
+
+def test_full_checkpoint_mse_uses_every_window_and_stable_noise_across_batch_order_step(tmp_path):
+    workspace = _workspace(tmp_path)
+    workspace.cfg.checkpoint.action_mse.episode_selection = "all"
+    workspace.cfg.checkpoint.action_mse.seed = 123
+    workspace.ema_model = _NoisyPolicy()
+    dataset = workspace._checkpoint_eval_dataset
+    original_indices = dataset.indices.copy()
+    rng_before = torch.get_rng_state().clone()
+    metrics_by_pass, noise_ids = [], []
+    for step, batch_size, reverse in [(2, 3, False), (4, 7, False), (6, 5, True)]:
+        workspace.optimizer_step = step
+        workspace.cfg.checkpoint.action_mse.batch_size = batch_size
+        dataset.indices = original_indices[::-1].copy() if reverse else original_indices.copy()
+        dataset.seen_rows.clear()
+        workspace.ema_model.prediction_calls.clear()
+        metrics = workspace._checkpoint_action_mse_and_log(
+            workspace.cfg, torch.device("cpu"), _Logger(), _Logger(),
+        )
+        metrics_by_pass.append(metrics)
+        noise_ids.append(sorted(workspace.ema_model.prediction_calls))
+        assert dataset.seen_rows == list(range(len(dataset)))
+        assert metrics["episode_ids"] == list(range(6))
+        assert metrics["num_windows"] == 21 and metrics["num_action_values"] == 21 * 2 * 2
+        assert metrics["inference_seed"] == 123
+        assert metrics["action_mse_protocol"] == _action_mse_protocol(workspace.cfg)
+    assert noise_ids[0] == noise_ids[1] == noise_ids[2]
+    assert metrics_by_pass[0][ACTION_MSE_KEY] == pytest.approx(metrics_by_pass[1][ACTION_MSE_KEY], abs=1e-12)
+    assert metrics_by_pass[0][ACTION_MSE_KEY] == pytest.approx(metrics_by_pass[2][ACTION_MSE_KEY], abs=1e-12)
+    # Explicit sample identities use episode-local anchors, not absolute rows.
+    assert dict(noise_ids[0])[1.0] == _action_mse_window_seed(123, 0, 0)
+    assert dict(noise_ids[0])[2.0] == _action_mse_window_seed(123, 1, 0)
+    assert dict(noise_ids[0])[3.0] == _action_mse_window_seed(123, 1, 1)
+    torch.testing.assert_close(torch.get_rng_state(), rng_before)
+    assert workspace.model.training and workspace.ema_model.training
+
+
+def test_full_checkpoint_mse_is_element_mean_not_episode_mean(tmp_path):
+    workspace = _workspace(tmp_path)
+    workspace.cfg.checkpoint.action_mse.episode_selection = "all"
+    metrics = workspace._checkpoint_action_mse_and_log(
+        workspace.cfg, torch.device("cpu"), _Logger(), _Logger(),
+    )
+    dataset = workspace._checkpoint_eval_dataset
+    values = torch.stack([dataset[row]["obs"]["prediction"][1:3] for row in range(len(dataset))]).double()
+    assert metrics[ACTION_MSE_KEY] == pytest.approx(values.square().mean().item())
+    episode_mean = np.mean([values[dataset.episode_index == episode].square().mean().item() for episode in range(6)])
+    assert metrics[ACTION_MSE_KEY] != pytest.approx(episode_mean)
+
+
+def test_changing_action_mse_protocol_invalidates_same_step_cache_and_old_topk(tmp_path):
+    workspace = _workspace(tmp_path)
+    workspace.optimizer_step = 2
+    logger = _Logger()
+    old_manager = workspace._make_topk_manager(workspace.cfg)
+    old_metrics = workspace._checkpoint_action_mse_and_log(
+        workspace.cfg, torch.device("cpu"), _Logger(), logger,
+    )
+    workspace._save_optimizer_step_checkpoint(workspace.cfg, old_manager, old_metrics)
+    old_checkpoint = (tmp_path / "checkpoints/best.ckpt").resolve()
+    assert old_checkpoint.is_file()
+    workspace.cfg.checkpoint.action_mse.episode_selection = "all"
+    workspace.cfg.checkpoint.action_mse.seed = 42
+    new_manager = workspace._make_topk_manager(workspace.cfg)
+    assert not new_manager.path_value_map
+    assert not (tmp_path / "checkpoints/best.ckpt").exists()
+    assert old_checkpoint.is_file()  # Protocol changes do not delete old weights.
+    new_metrics = workspace._checkpoint_action_mse_and_log(
+        workspace.cfg, torch.device("cpu"), _Logger(), logger,
+    )
+    assert len(new_metrics["episode_ids"]) == 6 and len(logger.records) == 2
+    assert new_metrics["action_mse_protocol"] != old_metrics["action_mse_protocol"]
+    # A seed change is also a protocol change, even at the same optimizer step.
+    workspace.cfg.checkpoint.action_mse.seed = 43
+    changed = workspace._checkpoint_action_mse_and_log(
+        workspace.cfg, torch.device("cpu"), _Logger(), logger,
+    )
+    assert changed["inference_seed"] == 43 and len(logger.records) == 3
+
+
+def test_action_mse_records_reject_mixed_protocols_and_refresh_full_data_png(tmp_path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    workspace.cfg.checkpoint.action_mse.episode_selection = "all"
+    protocol = _action_mse_protocol(workspace.cfg)
+    legacy = tmp_path / "legacy"
+    record_checkpoint_action_mse(legacy, {"optimizer_step": 2, ACTION_MSE_KEY: 0.5}, None)
+    previous = (legacy / "checkpoints/action_mse.json").read_bytes()
+    with pytest.raises(ValueError, match="protocol changed"):
+        record_checkpoint_action_mse(legacy, {
+            "optimizer_step": 4, ACTION_MSE_KEY: 0.3, "action_mse_protocol": protocol,
+        }, None)
+    assert (legacy / "checkpoints/action_mse.json").read_bytes() == previous
+
+    import diffusion_policy.scripts.plot_checkpoint_action_mse as plotting
+    plots = []
+    monkeypatch.setattr(plotting, "plot_scores", lambda scores, output: plots.append((copy.deepcopy(scores), output)))
+    full = tmp_path / "full"
+    for step, value in [(2, 0.4), (4, 0.2)]:
+        record_checkpoint_action_mse(full, {
+            "optimizer_step": step, ACTION_MSE_KEY: value, "action_mse_protocol": protocol,
+        }, None)
+    records = json.loads((full / "checkpoints/action_mse.json").read_text())
+    assert records["action_mse_protocol"] == protocol
+    assert [row["optimizer_step"] for row in records["records"]] == [2, 4]
+    assert len(plots) == 2 and plots[-1][1] == full / "action_mse.png"
 
 
 def test_student_reads_teacher_yaml_paths_and_selects_mse_instead_of_latest(tmp_path):
