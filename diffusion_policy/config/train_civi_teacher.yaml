@@ -45,7 +45,7 @@ phase_resampling:
   precontact_seconds: 1.0
   weights:
     free: 1.0
-    precontact: 1.0
+    precontact: 7.0
     contact: 5.0
 freeze_dino_backbone: true
 freeze_modules: []

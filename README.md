@@ -126,3 +126,23 @@ python train_civi.py --stage student --gpus 0 \
 ```
 
 如果教师保存在其他目录，替换上述教师 `output_dir`。这次修复不要求重新构建 Docker 镜像或复制训练数据。
+
+
+(fdp) lcy@lcy-RTX5090:~/code/dp_hirol_main$ CUDA_VISIBLE_DEVICES=0 \
+HF_HOME=/tmp/hf_home \
+HF_DATASETS_CACHE=/tmp/hf_home/datasets \
+TRANSFORMERS_CACHE=/tmp/hf_home/transformers \
+python -u sim_force_aware_dp_train.py \
+  --config diffusion_policy/config/train_civi_teacher.yaml \
+  dataloader.batch_size=128 \
+  dataloader.num_workers=16 \
+  dataloader.prefetch_factor=8 \
+  val_dataloader.batch_size=128 \
+  task.dataset.image_cache_chunk_frames=512 \
+  training.resume=true \
+  training.num_optimizer_steps=200000 \
+  training.checkpoint_every_optimizer_steps=20000 \
+  training.validation_start_optimizer_step=100001 \
+  checkpoint.topk.k=4 \
+  hydra.run.dir=data/outputs/civi/teacher_bs128_100k_topk4_20261109 \
+  hydra.job.chdir=false
