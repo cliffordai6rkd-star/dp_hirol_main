@@ -123,6 +123,15 @@ def _coerce_image(image_value, expected_shape: Sequence[int]) -> np.ndarray:
 
 
 class LeRobotV3ImageDataset(BaseImageDataset):
+    """Shared loader for image/action datasets with optional contact sampling.
+
+    When phase resampling is enabled, ``phase_source_key`` selects the measured
+    force or torque channel and the configured threshold confirms contact.
+    By default, pre-contact covers approximately 0.5 seconds before each
+    episode's first confirmed contact. The duration rounds to the nearest
+    recorded frame interval, with half frames rounded up, then uses timestamps.
+    """
+
     def __init__(
         self,
         shape_meta: dict,
@@ -169,12 +178,12 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         contact_exit_frames: int = 1,
         contact_force_dims: Sequence[int] = (0, 1, 2),
         contact_norm: str = "l1",
-        precontact_seconds: float = 1.0,
+        precontact_seconds: float = 0.5,
         observation_validity_key: Optional[str] = None,
         episode_warmup_steps: int = 0,
         wrench_filter: Optional[Mapping] = None,
         contact_label_config: Optional[Mapping] = None,
-        phase_label_mode: str = "window_contact",
+        phase_label_mode: str = "current_wrench",
     ):
         super().__init__()
         if window_sampling_strategy not in {"idx", "timestamp"}:
@@ -910,7 +919,9 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         can promote an anchor to contact. ``window_contact`` reproduces the
         historical rule that any contact in an observation window qualifies.
         Non-contact anchors before the first confirmed episode contact are
-        pre-contact for the configured duration. Debounce is not backfilled.
+        pre-contact for the configured duration. In ``current_wrench`` mode,
+        that duration rounds to the nearest recorded frame interval within
+        each episode; half frames round up. Debounce is not backfilled.
         """
         if not self.phase_resampling_enabled:
             return np.zeros((len(indices),), dtype=np.int8)
@@ -944,7 +955,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                 frame_contact[start:stop] = self._debounced_contact(
                     frame_magnitude[start:stop][None, :]
                 )[0]
-        timestamps = self._timestamp_seconds(self.timestamps)
+        timestamps = self._timestamp_seconds(self.timestamps, key=self.timestamp_key)
         contact_onset = np.full((len(self.episode_ranges),), np.nan, dtype=np.float64)
         for episode_idx, episode_range in enumerate(self.episode_ranges):
             local = frame_contact[episode_range.start : episode_range.stop]
@@ -963,17 +974,36 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         labels = np.zeros((len(indices),), dtype=np.int8)
         contact = frame_contact if self.phase_label_mode == "current_wrench" else window_contact
         labels[contact[anchors]] = 2
-        # Recorded timestamps are float32 seconds. Include the exact left
-        # endpoint of a 1 s interval despite subtraction/quantization error.
+        # Recorded timestamps may be float32 seconds. Include the exact left
+        # endpoint despite subtraction/quantization error.
         time_epsilon = 1e-6 if self.phase_label_mode == "current_wrench" else 0.0
         precontact = np.zeros_like(labels, dtype=bool)
         for episode_idx, onset in enumerate(contact_onset):
             if not np.isfinite(onset):
                 continue
+            duration = self.precontact_seconds
+            if duration <= 0:
+                continue
+            boundary_epsilon = time_epsilon
+            if self.phase_label_mode == "current_wrench":
+                rows = self.episode_ranges[episode_idx]
+                intervals = np.diff(timestamps[rows.start : rows.stop])
+                intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+                if intervals.size:
+                    frame_interval = float(np.median(intervals))
+                    frame_ratio = duration / frame_interval
+                    # Median interval quantization can accumulate over several
+                    # frames. Keep exact half-frame ties rounding upward.
+                    ratio_epsilon = time_epsilon * max(1.0, frame_ratio) / frame_interval
+                    frame_count = int(np.floor(frame_ratio + 0.5 + ratio_epsilon))
+                    if frame_count == 0:
+                        continue
+                    duration = frame_count * frame_interval
+                    boundary_epsilon *= max(1, frame_count)
             in_window = episodes == episode_idx
             precontact |= (
                 in_window
-                & (anchor_timestamps >= onset - self.precontact_seconds - time_epsilon)
+                & (anchor_timestamps >= onset - duration - boundary_epsilon)
                 & (anchor_timestamps < onset)
             )
         labels[(labels == 0) & precontact] = 1

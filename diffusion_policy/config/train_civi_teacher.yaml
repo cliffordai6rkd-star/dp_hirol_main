@@ -42,7 +42,7 @@ contact_threshold: 10.0
 contact_norm: l2
 phase_resampling:
   enabled: true
-  precontact_seconds: 1.0
+  precontact_seconds: 0.5
   weights:
     free: 1.0
     precontact: 1.0
@@ -382,7 +382,7 @@ task:
     - 1
     - 2
     contact_norm: l2
-    precontact_seconds: 1.0
+    precontact_seconds: ${phase_resampling.precontact_seconds}
     image_randomer_config:
       shared_across_sequence: true
       resize: false

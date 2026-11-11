@@ -563,7 +563,9 @@ def test_ddp_reuses_one_shared_image_cache_after_ram_is_filled(tmp_path, monkeyp
     torch.testing.assert_close(batch["obs"]["side"][1], torch.full((1, 3, 2, 2), 1 / 255))
 
 
-def _phase_label_fixture(force, *, episode_length=None, mode="current_wrench"):
+def _phase_label_fixture(
+    force, *, episode_length=None, mode="current_wrench", precontact_seconds=1.0
+):
     """Exercise sampler semantics independently of image decoding/window padding."""
     force = np.asarray(force, dtype=np.float32)
     length = len(force)
@@ -576,7 +578,7 @@ def _phase_label_fixture(force, *, episode_length=None, mode="current_wrench"):
     dataset.contact_exit_frames = 5
     dataset.contact_force_dims = (0, 1, 2)
     dataset.contact_norm = "l2"
-    dataset.precontact_seconds = 1.0
+    dataset.precontact_seconds = precontact_seconds
     dataset.dataset_length = length
     dataset.anchor_position = 0
     dataset._phase_source_data = np.zeros((length, 6), dtype=np.float32)
@@ -589,6 +591,7 @@ def _phase_label_fixture(force, *, episode_length=None, mode="current_wrench"):
                               for start in range(0, length, episode_length)]
     dataset.episode_index = np.arange(length) // episode_length
     # Float32 timestamps match the real Parquet dataset, including boundary error.
+    dataset.timestamp_key = "timestamp"
     dataset.timestamps = ((np.arange(length) % episode_length) / 20).astype(np.float32)
     indices = np.array([[row, row + 1, 0, 1] for row in range(length)])
     return dataset, indices
@@ -651,15 +654,111 @@ def test_current_wrench_precontact_includes_float32_one_second_boundary():
     assert labels[43] == 2
 
 
-def test_saved_configs_default_to_legacy_window_contact_labels(monkeypatch):
+@pytest.mark.parametrize("fps", [10, 15, 20, 25, 50])
+@pytest.mark.parametrize("time_origins", [(0.0, 0.0), (0.0, 7.25), (7.25, 0.0)])
+@pytest.mark.parametrize("timestamp_key", ["timestamp", "timing.state_timestamp_ns"])
+def test_half_second_precontact_uses_episode_time_and_only_first_onset(
+    fps, time_origins, timestamp_key
+):
+    episode_length = 4 * fps
+    force = np.zeros(episode_length, dtype=np.float32)
+    first_high = int(1.5 * fps)
+    force[first_high : 2 * fps] = 10
+    force[3 * fps : int(3.5 * fps)] = 10
+    dataset, indices = _phase_label_fixture(
+        np.tile(force, 2), episode_length=episode_length, precontact_seconds=0.5
+    )
+    # Episodes can reset their clocks or start at different absolute times.
+    seconds = np.concatenate([
+        origin + np.arange(episode_length) / fps
+        for origin in time_origins
+    ])
+    dataset.timestamp_key = timestamp_key
+    dataset.timestamps = (
+        np.rint(seconds * 1e9).astype(np.int64)
+        if timestamp_key.endswith("_ns") else seconds.astype(np.float32)
+    )
+    labels = dataset._build_phase_labels(indices)
+    first_onset = first_high + dataset.contact_enter_frames - 1
+    expected_frames = int(np.floor(0.5 * fps + 0.5))
+    expected_precontact = np.arange(first_onset - expected_frames, first_onset)
+    second_onset = 3 * fps + dataset.contact_enter_frames - 1
+    for episode in range(2):
+        local = labels[episode * episode_length : (episode + 1) * episode_length]
+        np.testing.assert_array_equal(np.flatnonzero(local == 1), expected_precontact)
+        assert local[expected_precontact[0] - 1] == 0
+        assert local[first_onset] == 2
+        # Round duration to the nearest frame, with exact half frames upward.
+        first_pre_time = seconds[episode * episode_length + expected_precontact[0]]
+        onset_time = seconds[episode * episode_length + first_onset]
+        assert onset_time - first_pre_time == pytest.approx(expected_frames / fps)
+        assert abs(onset_time - first_pre_time - 0.5) <= 0.5 / fps + 1e-9
+        # The existing rule marks only the first confirmed contact in an episode.
+        assert local[second_onset - 1] == 0
+        assert local[second_onset] == 2
+    # Future predictions and overlapping/stale history must not change labels.
+    for windows in dataset.windowed_lowdim_data.values():
+        windows[..., 0] = 100
+    np.testing.assert_array_equal(dataset._build_phase_labels(indices), labels)
+
+
+@pytest.mark.parametrize("duration,expected_frames", [(0.0, 0), (0.01, 0), (1.0, 25)])
+def test_nearest_frame_precontact_preserves_zero_and_whole_second(duration, expected_frames):
+    force = np.zeros(100, dtype=np.float32)
+    force[50:75] = 10
+    dataset, indices = _phase_label_fixture(force, precontact_seconds=duration)
+    dataset.timestamps = (np.arange(len(force)) / 25).astype(np.float32)
+    labels = dataset._build_phase_labels(indices)
+    onset = 50 + dataset.contact_enter_frames - 1
+    np.testing.assert_array_equal(
+        np.flatnonzero(labels == 1), np.arange(onset - expected_frames, onset)
+    )
+    assert labels[onset] == 2
+
+
+def test_legacy_window_contact_keeps_unrounded_half_second_boundary():
+    force = np.zeros(100, dtype=np.float32)
+    force[37:50] = 10
+    dataset, indices = _phase_label_fixture(
+        force, mode="window_contact", precontact_seconds=0.5
+    )
+    dataset.timestamps = np.arange(len(force)) / 25
+    onset = 37 + dataset.contact_enter_frames - 1
+    np.testing.assert_array_equal(
+        np.flatnonzero(dataset._build_phase_labels(indices) == 1),
+        np.arange(onset - 12, onset),
+    )
+    dataset.phase_label_mode = "current_wrench"
+    np.testing.assert_array_equal(
+        np.flatnonzero(dataset._build_phase_labels(indices) == 1),
+        np.arange(onset - 13, onset),
+    )
+
+
+@pytest.mark.parametrize("timestamps,expected", [([0.0], [2]), ([0.0, np.nan, 0.2], [1, 0, 2])])
+def test_precontact_without_valid_episode_interval_keeps_time_window(timestamps, expected):
+    force = np.zeros(len(timestamps), dtype=np.float32)
+    force[-1] = 10
+    dataset, indices = _phase_label_fixture(force, precontact_seconds=0.5)
+    dataset.contact_enter_frames = 1
+    dataset.contact_exit_frames = 1
+    dataset.timestamps = np.asarray(timestamps)
+    np.testing.assert_array_equal(dataset._build_phase_labels(indices), expected)
+
+
+@pytest.mark.parametrize("mode", [None, "current_wrench", "window_contact"])
+def test_phase_defaults_are_current_wrench_and_half_second_with_legacy_opt_in(monkeypatch, mode):
     monkeypatch.setattr(_FakeLeRobotV3Dataset, "columns", _columns(np.zeros((4, 7))))
     monkeypatch.setattr(v3_dataset, "LeRobotV3Dataset", _FakeLeRobotV3Dataset)
+    kwargs = {} if mode is None else {"phase_label_mode": mode}
     dataset = LeRobotV3ImageDataset(
         shape_meta=_shape_meta(), dataset_path="unused", horizon=2,
         n_obs_steps=2, preload_images=False,
         action_feature_fields=["action.ee_pose"],
+        **kwargs,
     )
-    assert dataset.phase_label_mode == "window_contact"
+    assert dataset.phase_label_mode == (mode or "current_wrench")
+    assert dataset.precontact_seconds == 0.5
 
 
 if __name__ == "__main__":

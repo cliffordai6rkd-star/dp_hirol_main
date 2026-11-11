@@ -29,7 +29,7 @@ contact_norm: ${task.contact_norm}
 # FIRST-style phase resampling weights: free : pre-contact : contact.
 phase_resampling:
   enabled: true
-  precontact_seconds: 1.0
+  precontact_seconds: 0.5
   weights:
     free: 1.0
     precontact: 1.0

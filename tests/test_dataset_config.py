@@ -1,8 +1,11 @@
 """Renamed dataset modules still accept targets stored in earlier checkpoints."""
 
+from pathlib import Path
+
 import dill
 import hydra
 from omegaconf import OmegaConf
+import pytest
 import torch
 
 from diffusion_policy.common.dataset_config import V3_IMAGE_DATASET_TARGET, canonical_dataset_config
@@ -12,6 +15,22 @@ from diffusion_policy.workspace.train_distill_render_net_workspace import TrainD
 
 
 LEGACY_TARGET = "diffusion_policy.dataset.legacy_lerobot_v3_dataset.LegacyLeRobotV3Dataset"
+
+
+@pytest.mark.parametrize("name", [
+    "train_civi_teacher", "train_civi_teacher_joint", "sim_force_aware_dp_train",
+    "train_dp_insert_usb_force_aware", "train_dp_cucumber_nero_force_aware",
+])
+def test_force_aware_configs_share_causal_phase_labels_and_configurable_duration(name):
+    config_dir = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
+    with hydra.initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        default = hydra.compose(config_name=name)
+        overridden = hydra.compose(
+            config_name=name, overrides=["phase_resampling.precontact_seconds=0.25"]
+        )
+    assert default.task.dataset.phase_label_mode == "current_wrench"
+    assert default.task.dataset.precontact_seconds == 0.5
+    assert overridden.task.dataset.precontact_seconds == 0.25
 
 
 def test_current_target_resolves_and_other_dataset_types_are_preserved():

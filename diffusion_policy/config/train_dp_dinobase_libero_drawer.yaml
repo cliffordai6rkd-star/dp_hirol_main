@@ -1,0 +1,53 @@
+# @package _global_
+defaults:
+  - train_civi_teacher
+  - _self_
+
+name: train_dp_dinobase_libero_drawer
+exp_name: ${name}
+output_dir: data/outputs/civi/dino_dp_bs64_200k/teacher
+
+phase_resampling:
+  enabled: true
+  precontact_seconds: 0.5
+  weights:
+    free: 1.0
+    precontact: 1.0
+    contact: 1.0
+
+# Keep the teacher's data windows and action targets. Only RGB patch tokens
+# condition the action DiT; force metadata is retained for the shared loader.
+policy:
+  _target_: diffusion_policy.policy.dino_token_baseline_policy.DinoTokenBaselinePolicy
+  baseline_mode: dino
+  force_temporal_encoder: none
+  force_encoder_layers: 0
+  pre_cross_self_attn_layers: 0
+  cross_attn_layers: 0
+  camera_attention_mode: joint
+  image_blur_schedule: null
+
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64
+
+training:
+  resume: false
+  num_epochs: null
+  num_optimizer_steps: 200000
+  validation_start_optimizer_step: 200001
+
+checkpoint:
+  topk:
+    k: 4
+  action_mse:
+    enabled: true
+    every_optimizer_steps: 10000
+    episode_selection: all
+    batch_size: 16
+
+logging:
+  name: ${name}
+  tags: [baseline, dinov3, image-only, libero, 20hz, dual-camera, ee-pose, gripper]
+  group: libero_20hz_dino_dp_baseline

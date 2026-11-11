@@ -109,11 +109,12 @@ dataset:
   image_cache_dtype: uint8
   image_cache_chunk_frames: 64
   phase_resampling_enabled: ${oc.select:phase_resampling.enabled,false}
+  phase_label_mode: current_wrench
   phase_source_key: ${task.phase_source_key}
   contact_threshold: ${contact_threshold}
   contact_force_dims: ${task.contact_force_dims}
   contact_norm: ${contact_norm}
-  precontact_seconds: ${oc.select:phase_resampling.precontact_seconds,1.0}
+  precontact_seconds: ${oc.select:phase_resampling.precontact_seconds,0.5}
   image_randomer_config:
     shared_across_sequence: true
     resize: false

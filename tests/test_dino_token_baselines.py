@@ -81,6 +81,22 @@ def test_visual_baseline_preserves_patches_and_never_reads_force(mode):
     assert prediction["action"].shape == (2, 8, 7)
 
 
+def test_dino_action_sampling_is_invariant_to_missing_or_corrupted_force():
+    policy = make_policy("dino").eval()
+    full = observations()
+    images = {key: full[key] for key in ("side", "wrist")}
+    corrupted = {
+        key: value if key in images else torch.full_like(value, float("nan"))
+        for key, value in full.items()
+    }
+    corrupted["contact_alpha"] = torch.full((2, 2), float("nan"))
+    reference = policy.predict_action(images, generator=torch.Generator().manual_seed(42))
+    for supplied in (full, corrupted):
+        actual = policy.predict_action(supplied, generator=torch.Generator().manual_seed(42))
+        for key in ("action", "action_pred", "model_action_pred"):
+            torch.testing.assert_close(actual[key], reference[key], rtol=0, atol=0)
+
+
 def test_self_attention_uses_direct_normalized_force_and_changes_image_tokens():
     policy = make_policy("self_attn").eval()
     obs = observations()
@@ -224,3 +240,42 @@ def test_baseline_configs_inherit_corrected_data_and_separate_run_names():
             assert config.training.num_optimizer_steps > 0
             assert config.training.num_epochs is None
             assert config.horizon == original.horizon
+
+
+def test_libero_dino_baseline_matches_requested_training_and_checkpoint_protocol():
+    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
+    with initialize_config_dir(config_dir=str(root), version_base=None):
+        config = compose(config_name="train_dp_dinobase_libero_drawer")
+
+    assert config.dataset_path == "data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3"
+    assert config.task.dataset.dataset_path == config.dataset_path
+    assert list(config.policy.shape_meta.action.shape) == [8]
+    assert list(config.task.dataset.shape_meta.action.shape) == [8]
+    assert list(config.task.dataset.action_feature_fields) == ["observation.ee_pose", "action"]
+    assert list(config.task.dataset.action_feature_columns.action) == [6]
+    assert config.horizon == config.policy.horizon == 9
+    assert config.n_obs_steps == config.policy.n_obs_steps == 2
+    assert config.n_action_steps == config.policy.n_action_steps == 8
+    assert config.dataloader.batch_size == config.val_dataloader.batch_size == 64
+    assert config.training.num_optimizer_steps == 200000
+    assert config.training.num_epochs is None and not config.training.resume
+
+    assert config.phase_resampling.enabled and config.task.dataset.phase_resampling_enabled
+    assert dict(config.phase_resampling.weights) == {"free": 1, "precontact": 1, "contact": 1}
+    assert config.phase_resampling.precontact_seconds == config.task.dataset.precontact_seconds == 0.5
+    assert config.task.dataset.phase_label_mode == "current_wrench"
+    assert config.policy._target_.endswith("DinoTokenBaselinePolicy")
+    assert config.policy.baseline_mode == "dino"
+    assert config.policy.force_temporal_encoder == "none"
+    assert config.policy.force_encoder_layers == 0
+    assert config.policy.pre_cross_self_attn_layers == config.policy.cross_attn_layers == 0
+    assert config.policy.image_blur_schedule is None
+
+    assert config.checkpoint.action_mse.enabled
+    assert config.checkpoint.action_mse.episode_selection == "all"
+    assert config.checkpoint.action_mse.every_optimizer_steps == 10000
+    assert config.checkpoint.action_mse.batch_size == 16
+    assert config.checkpoint.topk.monitor_key == "checkpoint_action_mse"
+    assert config.checkpoint.topk.mode == "min" and config.checkpoint.topk.k == 4
+    assert config.checkpoint.save_last_ckpt
+    assert config.output_dir == "data/outputs/civi/dino_dp_bs64_200k/teacher"
