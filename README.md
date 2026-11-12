@@ -2,7 +2,9 @@
 
 通过 RenderNet 将机器人当前的接触状态表征到 RGB 图像中，再交给原有视觉策略。教师读取双摄像头图像和当前 `tau_ext` 外部关节力矩观测；学生学习渲染与教师接触表征对应的图像，保持后续视觉编码器与动作策略的网络架构。
 
-默认 `tau_ext` 输入是每个观察时刻截至当前帧的 8 个七轴观测，即 `[t-7, ..., t]`，经过因果 2 Hz 低通滤波。接触标签、教师融合和学生渲染均使用这些已观测信号，不读取未来力矩，也不需要世界模型预测。接触判定使用全部七轴的 L2 范数，阈值沿用现有配置数值，可按力矩数据调整。保留两个图像观察时刻、原有 LSTM、交叉注意力和动作 Transformer 的隐藏维度及层数。
+默认 `tau_ext` 输入是每个观察时刻截至当前帧的 8 个七轴观测，即 `[t-7, ..., t]`，经过因果 2 Hz 低通滤波。教师和学生输入均不读取未来力矩，也不需要世界模型预测。离线训练标签使用确认接触前 0.5 秒的线性 alpha：从 0 逐步增加到接触时的 1，接触期间保持 1，其余时刻为 0；阶段标签对应 free、pre-contact、contact。学生从图像和已观测力矩预测阶段与 alpha，推理时不需要离线标签。保留两个图像观察时刻、原有 LSTM、交叉注意力和动作 Transformer 的隐藏维度及层数。
+
+启用 pre-contact 后保留阈值以下的连续力矩，不再把非接触输入硬置零。`train_civi_teacher_xarm_clean.yaml` 从 `observation.tau_ext_unthresholded` 读取该信号，接触阈值只用于生成标签。
 
 ## 本机训练教师并蒸馏学生
 
@@ -45,9 +47,11 @@ python train_civi.py --stage student --gpus 0 \
 
 需要锁定某份使用当前 `tau_ext` 训练的教师时，可显式传入 `--teacher-checkpoint /path/to/current_tau_ext_teacher.ckpt`。
 
-教师默认每 10000 个 optimizer step 进行全量动作推理评估。所有轨迹的有效窗口各评估一次，EMA 模型使用按 episode 和窗口固定的推理噪声；总平方误差除以动作元素数得到 action MSE。最低分更新 `best.ckpt` 并保留 Top-K，每次评估更新 `latest.ckpt` 和 `action_mse.png`。当前教师使用全部 50 条轨迹，因此该指标衡量训练集拟合程度。
+教师默认每 10000 个 optimizer step 进行全量动作推理评估。所有轨迹的有效窗口各评估一次，EMA 模型使用按 episode 和窗口固定的推理噪声；总平方误差除以动作元素数得到 action MSE。最低分更新 `best.ckpt` 并保留 Top-K，每次评估更新 `latest.ckpt` 和 `action_mse.png`。当前教师使用全部 50 条轨迹，且 pre-contact 模式使用离线 alpha，因此该指标衡量带接触时刻标签的训练集拟合程度。
 
-学生使用 `token_mse`，默认关闭 `distillation.use_teacher_ffn`，以融合 FFN 之前的 context token 作为监督。先学习接触强度场，再冻结独立 Gate 训练 RGB 分支。学生验证集按 episode 单独划分，选择 checkpoint 时使用 EMA 和主目标误差，辅助强度场损失不计入该验证指标。
+学生使用 CNN 下采样、图像自注意力、图像查询力矩的交叉注意力和 U-Net 解码器。共享条件特征经过一个五通道条件头，输出空间区域、三个阶段 logits 和 alpha；阶段用 CE、alpha 用 MSE 监督。学生复制并冻结教师的力矩投影、LSTM 和相关嵌入，FiLM 实现保留，默认关闭。
+
+默认先 warmup 条件分支 1 个 epoch，再联合优化条件分支与 RGB 渲染分支，条件头保持可训练。联合损失为 token MSE、阶段 CE、alpha MSE 和区域损失。`distillation.use_teacher_ffn: true` 让渲染图像复用冻结教师的融合 FFN，对齐教师的“Cross-Attention＋视觉残差 → FFN＋残差 → Context Norm”最终 token。教师融合使用离线 alpha；学生渲染使用自己预测的 alpha。学生验证集按 episode 单独划分，checkpoint 按 EMA 的 token MSE 选择，辅助损失单独记录。
 
 ## 从 U 盘安装到服务器
 

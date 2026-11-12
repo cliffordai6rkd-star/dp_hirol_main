@@ -44,7 +44,7 @@ from diffusion_policy.model.vision.render_net_attention import (
     validate_percentiles,
 )
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor,
+    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor, validate_precontact_seconds,
 )
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
     instantiate_policy, load_checkpoint_payload, patch_grid,
@@ -89,8 +89,9 @@ class _NullTrainingLogger:
 
 def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
                            return_contact=False, image_context_encoder=None,
-                           use_teacher_ffn=False):
-    """Render RGB with the shared alpha, then encode it with the frozen visual path."""
+                           use_teacher_ffn=False, return_phase=False,
+                           condition_only=False):
+    """Render and encode with teacher supervision; student alpha is predicted causally."""
     prepare_with_future = getattr(teacher, "prepare_context_inputs_with_future_contact", None)
     if prepare_with_future is not None:
         images, wrench, contact, future_contact = prepare_with_future(obs)
@@ -100,24 +101,41 @@ def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
         images, wrench, contact, future_contact = teacher.prepare_context_inputs(obs)
         if future_contact is None:
             future_contact = contact
-    # The Dataset alpha is shared with the teacher; the complete future mask
-    # also lets render-only callers compute the same continuous blend weight.
+    # Offline labels supervise the condition field; the student predicts the
+    # blend weight from the observations that are available at inference.
     renderer_impl = getattr(render_net, "module", render_net)
     if isinstance(renderer_impl, RenderNet):
-        rendered, masks = render_net(
-            images, wrench, future_contact=future_contact, return_aux=True,
-            contact_alpha=(obs["contact_alpha"][:, :teacher.n_obs_steps]
-                           if "contact_alpha" in obs else None),
+        # Offline alpha is the teacher target. A phase-enabled student must
+        # learn and use its own causal alpha for both training and deployment.
+        student_alpha = (
+            obs["contact_alpha"][:, :teacher.n_obs_steps]
+            if "contact_alpha" in obs and not renderer_impl.phase_prediction_enabled
+            else None
         )
+        result = render_net(
+            images, wrench, future_contact=future_contact, return_aux=True,
+            contact_alpha=student_alpha, return_phase=return_phase or condition_only,
+            condition_only=condition_only,
+        )
+        if return_phase or condition_only:
+            rendered, masks, phase_predictions = result
+        else:
+            rendered, masks = result
+            phase_predictions = None
+        if condition_only:
+            return None, masks, future_contact, phase_predictions
     else:
         # Lightweight test/render adapters from older checkpoints may expose
         # only the original two-input signature.
         rendered, masks = render_net(images, wrench, return_aux=True)
+        phase_predictions = None
     encode = teacher.obs_encoder.encode_image_context if image_context_encoder is None else image_context_encoder
     if use_teacher_ffn:
         tokens = encode(rendered, input_grad=True, apply_fusion_ffn=True)
     else:
         tokens = encode(rendered, input_grad=True)
+    if return_phase:
+        return tokens, masks, future_contact, phase_predictions
     if return_aux and return_contact:
         return tokens, masks, future_contact
     if return_aux:
@@ -134,7 +152,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     "best_epoch", "best_step", "epochs_without_improvement",
                     "early_stopping_best_loss", "stop_reason", "training_stage", "stage_step",
                     "stage_epoch", "stage_transition_reason", "render_stages_enabled",
-                    "intensity_epochs", "resume_architecture_report")
+                    "condition_warmup_epochs", "resume_architecture_report")
 
     def __init__(self, cfg, output_dir=None, distributed=None):
         super().__init__(cfg, output_dir)
@@ -178,6 +196,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         log.info("Student token supervision: frozen image encoder%s; deployment uses RenderNet only",
                  " + teacher fusion FFNs" if self.use_teacher_ffn else "")
         self.normalizer = self.teacher_policy.normalizer
+        if cfg.render_net.get("phase_prediction", {}).get("enabled", False):
+            source_policy = (self.teacher_source_cfg.policy
+                             if self.teacher_source_cfg is not None else self.teacher_cfg.policy)
+            duration = validate_precontact_seconds(source_policy.get("precontact_seconds"))
+            if duration is None:
+                raise ValueError(
+                    "Phase-enabled student requires policy.precontact_seconds in the teacher source config; "
+                    "set it to 0.5 to construct offline pre-contact ramp targets"
+                )
+            if self.teacher_policy.future_phase_wrench_key is not None:
+                raise ValueError("Pre-contact distillation requires a teacher with causal current wrench history")
+            # This changes the frozen teacher's data path and alpha labels,
+            # not its learned weights. Persist the effective configuration so
+            # cached targets cannot be mistaken for the legacy binary gate.
+            self.teacher_policy.precontact_seconds = duration
+            with open_dict(self.teacher_cfg.policy):
+                self.teacher_cfg.policy.precontact_seconds = duration
+            log.info("Frozen teacher pre-contact fusion: %.3gs linear ramp; retain causal measured tau_ext", duration)
         self.wrench_preprocessor = WrenchPreprocessor.from_policy(self.teacher_policy).eval().requires_grad_(False)
         with open_dict(self.cfg):
             self.cfg.wrench_preprocessing = self.wrench_preprocessor.get_config()
@@ -213,6 +249,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if (isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher
                 and hasattr(self.teacher_policy.obs_encoder, "force_encoder")):
             self.model.initialize_wrench_encoder(self.teacher_policy.obs_encoder)
+        phase_config = cfg.render_net.get("phase_prediction", {})
+        if (isinstance(self.model, RenderNet)
+                and phase_config.get("freeze_wrench_encoder", False)
+                and hasattr(self.model, "freeze_wrench_encoder")):
+            self.model.freeze_wrench_encoder()
         self.ema_model = self.ema = None
         if cfg.training.get("use_ema", False):
             self.ema_model = copy.deepcopy(self.model)
@@ -266,21 +307,22 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self._student_image_encoder = None
         self._training_model = None
         stage_config = cfg.training.get("render_stages", {})
-        # A staged run needs a supervised gate.  If high-attention rendering
-        # is disabled, there is no intensity objective to warm up, so retain a
-        # single joint RGB training stage.
+        # Warm up the condition/region branch before enabling joint RGB and
+        # condition optimization. Legacy intensity->frozen-RGB staging is
+        # intentionally retired for this training path.
         self.render_stages_enabled = (
             bool(stage_config.get("enabled", True)) and self.attention_enabled
+            and bool(getattr(self.model, "phase_prediction_enabled", False))
             and hasattr(self.model, "set_training_stage")
         )
-        self.intensity_epochs = int(stage_config.get(
-            "intensity_epochs", cfg.training.get("intensity_warmup_epochs", 2),
+        self.condition_warmup_epochs = int(stage_config.get(
+            "condition_warmup_epochs", stage_config.get("warmup_epochs", 1),
         ))
-        if self.intensity_epochs < 0:
-            raise ValueError("training.render_stages.intensity_epochs must be nonnegative")
+        if self.condition_warmup_epochs < 0:
+            raise ValueError("training.render_stages.condition_warmup_epochs must be nonnegative")
         self.training_stage = (
-            "intensity" if self.render_stages_enabled and self.intensity_epochs > 0
-            else ("rgb" if self.render_stages_enabled else "joint")
+            "condition_warmup" if self.render_stages_enabled and self.condition_warmup_epochs > 0
+            else "joint"
         )
         self.stage_step = 0
         self.stage_epoch = 0
@@ -386,15 +428,14 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                          "validation as baseline, and start plateau counting at zero")
             if "training_stage" not in restored.get("pickles", {}):
                 self.training_stage = (
-                    "intensity" if self.render_stages_enabled and self.epoch < self.intensity_epochs
-                    else "rgb"
+                    "condition_warmup" if self.render_stages_enabled
+                    and self.epoch < self.condition_warmup_epochs else "joint"
                 )
                 self.stage_transition_reason = "legacy_checkpoint_epoch_inference"
             if hasattr(self.model, "set_training_stage"):
                 self.model.set_training_stage(self.training_stage)
             if getattr(self, "ema", None) is not None:
-                # A resumed checkpoint may have been written before the stage
-                # transition fix.  Make the frozen gate snapshot identical in
+                # Keep frozen teacher-initialized encoders identical in the
                 # online and EMA models before validation or another update.
                 self.ema.sync_frozen_parameters(self.model)
             self.resume_from = str(resume_path)
@@ -404,19 +445,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             log.info("Resuming RenderNet from %s: epoch=%d step=%d best_val_mse=%.8f",
                      resume_path, self.epoch, self.global_step, self.best_val_loss)
         self.num_epochs = int(cfg.training.num_epochs)
-        self.intensity_warmup_epochs = int(cfg.training.get("intensity_warmup_epochs", 2))
         self.max_steps = cfg.training.max_steps
         self.max_val_batches = cfg.training.max_val_batches
         self.early_stopping_enabled = bool(cfg.training.early_stopping.enabled)
         self.patience = int(cfg.training.early_stopping.patience)
         self.min_delta = float(cfg.training.early_stopping.min_delta)
-        if self.num_epochs < 1 or self.intensity_warmup_epochs < 0 or any(
+        if self.num_epochs < 1 or any(
                 value is not None and int(value) < 1
                 for value in (self.max_steps, self.max_val_batches)):
-            raise ValueError("num_epochs must be positive; intensity_warmup_epochs nonnegative; "
+            raise ValueError("num_epochs must be positive; "
                              "max_steps/max_val_batches must be positive or null")
-        if self.render_stages_enabled and self.intensity_epochs > self.num_epochs:
-            raise ValueError("training.render_stages.intensity_epochs cannot exceed training.num_epochs")
+        if self.render_stages_enabled and self.condition_warmup_epochs > self.num_epochs:
+            raise ValueError("training.render_stages.condition_warmup_epochs cannot exceed training.num_epochs")
+        if (self.distributed_context.enabled and self.render_stages_enabled
+                and self.condition_warmup_epochs > 0
+                and not bool(cfg.training.get("distributed", {}).get("find_unused_parameters", False))):
+            raise ValueError(
+                "Condition-only warmup with DDP requires training.distributed.find_unused_parameters=true"
+            )
         if not resume_path:
             if hasattr(self.model, "set_training_stage"):
                 self.model.set_training_stage(self.training_stage)
@@ -473,8 +519,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         log.info(f"Device={self.device}; AMP={self.amp_enabled} {self.amp_dtype}; "
               f"GPU={torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else 'CPU'}")
         log.info(f"Max epochs={self.num_epochs}; max steps={self.max_steps}; "
-                 f"render stages={self.render_stages_enabled} "
-                 f"(intensity={self.intensity_epochs}, current={self.training_stage}); "
+                 f"condition warmup={self.render_stages_enabled} "
+                 f"(epochs={self.condition_warmup_epochs}, current={self.training_stage}); "
               f"validation={'all batches' if self.max_val_batches is None else self.max_val_batches}; "
               f"early stopping={self.early_stopping_enabled}, patience={self.patience} epochs, "
               f"min_delta={self.min_delta}")
@@ -514,7 +560,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     def _validate_distillation_config(self):
         if self.objective not in {"token_mse", "denoiser_mse"}:
             raise ValueError("distillation.objective must be token_mse or denoiser_mse")
-        for name in ("token_loss_weight", "demo_loss_weight"):
+        for name in ("token_loss_weight", "demo_loss_weight", "phase_ce_weight", "alpha_loss_weight"):
             value = float(self.distillation_config.get(name, 0.0))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"distillation.{name} must be finite and nonnegative")
@@ -600,12 +646,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if not self.distributed_context.enabled:
             return
         config = self.cfg.training.get("distributed", {})
+        # Register DDP reducer hooks for the joint graph before the condition
+        # warmup temporarily freezes RGB-only parameters. They are re-enabled
+        # after warmup and need reducer hooks already installed.
+        if hasattr(self.model, "set_training_stage"):
+            self.model.set_training_stage("joint")
         self._training_model = DistributedDataParallel(
             self.model,
             device_ids=[self.distributed_context.local_rank] if self.device.type == "cuda" else None,
             broadcast_buffers=False,
             find_unused_parameters=bool(config.get("find_unused_parameters", False)),
         )
+        if hasattr(self.model, "set_training_stage"):
+            self.model.set_training_stage(self.training_stage)
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -731,7 +784,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return torch.stack(values).mean() if values else torch.zeros(())
 
     def _joint_training_active(self):
-        return (not self.model.training) or getattr(self, "training_stage", "joint") in {"rgb", "joint"}
+        return (not self.model.training) or getattr(self, "training_stage", "joint") == "joint"
 
     @staticmethod
     def _contact_token_metrics(student_tokens, teacher_tokens, contact_mask):
@@ -768,17 +821,14 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         }
 
     def _maybe_transition_stage(self, completed_epochs=None):
-        """Apply the configured boundary before the next optimizer epoch."""
+        """Enable joint RGB/condition optimization after the condition warmup."""
         if not getattr(self, "render_stages_enabled", False):
             desired = "joint"
         else:
             completed = self.epoch if completed_epochs is None else int(completed_epochs)
-            # A saved RGB stage is authoritative on resume.  An intensity
-            # checkpoint saved exactly at the boundary transitions before the
-            # next optimizer epoch.
             desired = (
-                "rgb" if self.training_stage == "intensity"
-                and completed >= getattr(self, "intensity_epochs", 0)
+                "joint" if self.training_stage == "condition_warmup"
+                and completed >= getattr(self, "condition_warmup_epochs", 0)
                 else self.training_stage
             )
         if desired == self.training_stage:
@@ -792,14 +842,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.stage_step = 0
         self.stage_epoch = 0
         self.stage_transition_reason = f"epoch_boundary:{previous}->{desired}"
-        reset_rgb = False
-        if (previous == "intensity" and desired == "rgb"
+        initialized_rgb = False
+        if (previous == "condition_warmup" and desired == "joint"
                 and hasattr(self.model, "initialize_rgb_from_gate")):
-            # Transfer the completed gate representation once.  The gate
-            # branch remains independent and frozen after this snapshot;
-            # RGB then owns and updates its full encoder/decoder path.
+            # Warm-start the RGB branch from the condition branch, then update
+            # both branches jointly in the following stage.
             self.model.initialize_rgb_from_gate()
-            reset_rgb = True
+            initialized_rgb = True
         if hasattr(self.model, "set_training_stage"):
             self.model.set_training_stage(desired)
             gate_count = sum(p.numel() for p in self.model.gate_parameters())
@@ -807,27 +856,21 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         else:
             gate_count = rgb_count = 0
         if getattr(self, "ema", None) is not None:
-            # The newly frozen gate must use one exact snapshot in both
-            # online and EMA models.  If RGB was copied from the gate, also
-            # reset its EMA branch to that same boundary state.
-            if reset_rgb:
+            # A copied RGB initialization must also start from the same
+            # state in EMA; conditions remain trainable after this boundary.
+            if initialized_rgb:
                 self.ema.sync_parameters(self.model)
             else:
                 self.ema.sync_frozen_parameters(self.model)
         log.info("RenderNet training stage transition: %s -> %s at completed_epoch=%d; "
-                 "gate_parameters=%d, rgb_parameters=%d",
+                 "condition_parameters=%d, rgb_parameters=%d",
                  previous, desired, self.epoch, gate_count, rgb_count)
         return True
 
     def _loss(self, obs, cached_targets=None, *, action=None):
-        # Region targets are used for the warm-up loss and retained as
-        # diagnostics during RGB training and validation.  Model selection
-        # still uses only the primary objective.
-        supervise_regions = (
-            self.attention_enabled and self.model.training and torch.is_grad_enabled()
-            and (not getattr(self, "render_stages_enabled", False)
-                 or getattr(self, "training_stage", "joint") == "intensity")
-        )
+        training = self.model.training and torch.is_grad_enabled()
+        condition_warmup = training and getattr(self, "training_stage", "joint") == "condition_warmup"
+        supervise_regions = self.attention_enabled and training
         measure_regions = bool(self.attention_enabled)
         with self._autocast():
             with torch.no_grad():
@@ -860,16 +903,32 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     renderer = getattr(self, "ema_model", None)
                     if renderer is None:
                         renderer = self.model
-            student_tokens, masks, contact_mask = student_context_tokens(
+            phase_enabled = bool(getattr(self.model, "phase_prediction_enabled", False))
+            student_result = student_context_tokens(
                 self.teacher_policy, renderer, obs,
                 return_aux=True, return_contact=True, image_context_encoder=compiled_encoder,
                 use_teacher_ffn=self.use_teacher_ffn,
+                return_phase=phase_enabled,
+                condition_only=condition_warmup,
             )
-            if student_tokens.shape != teacher_tokens.shape:
-                raise RuntimeError(f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}")
-            token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
+            phase_predictions = None
+            if phase_enabled:
+                student_tokens, masks, contact_mask, phase_predictions = student_result
+            else:
+                student_tokens, masks, contact_mask = student_result
+            if condition_warmup:
+                token_mse = teacher_tokens.new_zeros(())
+            else:
+                if student_tokens.shape != teacher_tokens.shape:
+                    raise RuntimeError(
+                        f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}"
+                    )
+                token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
+            if phase_enabled and "contact_alpha" in obs:
+                contact_mask = obs["contact_alpha"][:, :self.teacher_policy.n_obs_steps] > 0
             contact_metrics = self._contact_token_metrics(
-                student_tokens, teacher_tokens, contact_mask,
+                teacher_tokens if condition_warmup else student_tokens,
+                teacher_tokens, contact_mask,
             )
             mask_mse = token_mse.new_zeros(())
             patch_mse = token_mse.new_zeros(())
@@ -892,51 +951,65 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         patch_losses.append(F.smooth_l1_loss(predicted_patches[key], target))
                     patch_mse = torch.stack(patch_losses).mean()
             denoiser_mse = demo_mse = token_mse.new_zeros(())
-            if self.objective == "denoiser_mse" and not getattr(self, "render_stages_enabled", False):
+            if self.objective == "denoiser_mse" and not condition_warmup:
                 denoiser_mse, demo_mse = self._denoiser_losses(
                     action, student_tokens, teacher_tokens.to(student_tokens.dtype),
                 )
-                active_denoiser = (denoiser_mse if self._joint_training_active()
-                                   else denoiser_mse.detach() * 0)
-                loss = (active_denoiser
-                        + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
-                        + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse)
-            else:
-                loss = token_mse
-            intensity_loss = (
+            region_loss = (
                 float(getattr(self, "context_patch_loss_weight", 1.0)) * patch_mse
                 + float(getattr(self, "intensity_loss_weight", 1.0)) * mask_mse * float(
                     self.attention_config.get("pixel_loss_weight", 0.0)
                 )
                 + float(getattr(self, "smoothness_loss_weight", 0.02)) * smoothness
             ) if measure_regions else token_mse.new_zeros(())
-            if not supervise_regions:
-                # Diagnostics must not create a second RGB-stage gradient path.
-                intensity_loss = intensity_loss.detach()
-                mask_mse = mask_mse.detach()
-                patch_mse = patch_mse.detach()
-                smoothness = smoothness.detach()
-            if supervise_regions:
-                loss = loss + intensity_loss
-            if getattr(self, "render_stages_enabled", False) and self.model.training and torch.is_grad_enabled():
-                if getattr(self, "training_stage", "joint") == "intensity":
-                    if not self.attention_enabled:
-                        raise RuntimeError(
-                            "RenderNet intensity stage requires high_attention_render.enabled=true "
-                            "so the teacher context-effect field can supervise the gate"
-                        )
-                    loss = intensity_loss
-                elif self.training_stage == "rgb":
-                    # RGB stage updates the complete RGB branch; the
-                    # independently trained gate path is frozen.
-                    loss = token_mse
+            phase_ce = alpha_mse = alpha_mae = token_mse.new_zeros(())
+            phase_accuracy = token_mse.new_zeros(())
+            if phase_enabled:
+                if phase_predictions is None:
+                    raise RuntimeError("Phase-enabled RenderNet did not return condition predictions")
+                if "contact_phase" not in obs or "contact_alpha" not in obs:
+                    raise KeyError(
+                        "Phase prediction training requires offline contact_phase/contact_alpha targets"
+                    )
+                phase_logits = phase_predictions["phase_logits"].float()
+                alpha_prediction = phase_predictions["contact_alpha"].float()
+                phase_target = obs["contact_phase"][:, :phase_logits.shape[1]].long()
+                alpha_target = obs["contact_alpha"][:, :alpha_prediction.shape[1]].float()
+                if phase_target.shape != phase_logits.shape[:2] or alpha_target.shape != alpha_prediction.shape:
+                    raise ValueError("Phase and alpha labels must match [B, To] predictions")
+                phase_ce = F.cross_entropy(phase_logits.flatten(0, 1), phase_target.flatten())
+                alpha_mse = F.mse_loss(alpha_prediction, alpha_target)
+                alpha_mae = F.l1_loss(alpha_prediction, alpha_target)
+                phase_accuracy = (phase_logits.argmax(dim=-1) == phase_target).float().mean()
+            condition_loss = (
+                float(self.distillation_config.get("phase_ce_weight", 1.0)) * phase_ce
+                + float(self.distillation_config.get("alpha_loss_weight", 1.0)) * alpha_mse
+            )
+            if condition_warmup:
+                # Warmup trains the condition field; the renderer is bypassed.
+                loss = condition_loss + region_loss
+            elif self.objective == "denoiser_mse":
+                loss = (denoiser_mse
+                        + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
+                        + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse
+                        + (condition_loss + region_loss if training else 0))
+            else:
+                # During joint optimization retain condition supervision so
+                # the shared feature trunk and all condition outputs adapt
+                # alongside the RGB residual network.
+                loss = token_mse + (condition_loss + region_loss if training else 0)
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
+                                 "token_mse_measured": not condition_warmup,
                                  "denoiser_mse": float(denoiser_mse.detach()),
                                  "demo_mse": float(demo_mse.detach()),
                                  "mask_mse": float(mask_mse.detach()),
                                  "context_patch_mse": float(patch_mse.detach()),
                                  "intensity_smoothness": float(smoothness.detach()),
-                                 "intensity_loss": float(intensity_loss.detach()),
+                                 "intensity_loss": float(region_loss.detach()),
+                                 "phase_ce": float(phase_ce.detach()),
+                                 "alpha_mse": float(alpha_mse.detach()),
+                                 "alpha_mae": float(alpha_mae.detach()),
+                                 "phase_accuracy": float(phase_accuracy.detach()),
                                  "contact_open_ratio": float(contact_metrics["contact_open_ratio"].detach()),
                                  "open_token_mse": float(contact_metrics["open_token_mse"].detach()),
                                  "closed_token_mse": float(contact_metrics["closed_token_mse"].detach()),
@@ -950,7 +1023,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
-                "student_token_shape": list(student_tokens.shape),
+                "student_token_shape": list(teacher_tokens.shape if condition_warmup else student_tokens.shape),
                 "camera_keys": list(self.teacher_policy.obs_encoder.image_keys),
                 "camera_count": len(self.teacher_policy.image_keys),
                 "observation_steps": self.teacher_policy.n_obs_steps,
@@ -1003,10 +1076,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
 
     def _token_mse(self, loss):
         # Fallback permits lightweight callers that replace _loss in loop tests.
-        return getattr(self, "loss_metrics", {}).get("token_mse", float(loss.detach()))
+        metrics = getattr(self, "loss_metrics", {})
+        if not metrics.get("token_mse_measured", True):
+            return float(loss.detach())
+        return metrics.get("token_mse", float(loss.detach()))
 
     def _selection_mse(self, loss):
-        return getattr(self, "loss_metrics", {}).get(self.objective, float(loss.detach()))
+        metrics = getattr(self, "loss_metrics", {})
+        if not metrics.get("token_mse_measured", True):
+            return float(loss.detach())
+        return metrics.get(self.objective, float(loss.detach()))
 
     def _obs(self, batch):
         return dict_apply(batch["obs"], lambda value: value.to(self.device, non_blocking=True))
@@ -1260,7 +1339,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         component_keys = (
             "token_mse", "denoiser_mse", "demo_mse", "mask_mse",
             "context_patch_mse", "intensity_smoothness", "intensity_loss",
-            "contact_open_ratio",
+            "phase_ce", "alpha_mse", "alpha_mae", "phase_accuracy", "contact_open_ratio",
         )
         component_totals = {key: 0.0 for key in component_keys}
         open_token_sum = closed_token_sum = open_token_count = closed_token_count = 0.0
@@ -1318,10 +1397,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         summary = {
             "status": status, "global_step": self.global_step,
             "epoch": self.epoch, "max_epochs": self.num_epochs,
-            "intensity_warmup_epochs": self.intensity_warmup_epochs,
             "render_stages": {
                 "enabled": self.render_stages_enabled,
-                "intensity_epochs": self.intensity_epochs,
+                "condition_warmup_epochs": self.condition_warmup_epochs,
                 "current_stage": self.training_stage,
                 "stage_step": self.stage_step,
                 "stage_epoch": self.stage_epoch,
@@ -1553,7 +1631,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     epoch_loss_total = epoch_mask_total = 0.0
                     epoch_components = {key: 0.0 for key in (
                         "token_mse", "denoiser_mse", "demo_mse", "context_patch_mse",
-                        "intensity_smoothness", "intensity_loss", "contact_open_ratio",
+                        "intensity_smoothness", "intensity_loss", "phase_ce", "alpha_mse",
+                        "alpha_mae", "phase_accuracy", "contact_open_ratio",
                     )}
                     epoch_open_token_sum = epoch_closed_token_sum = 0.0
                     epoch_open_token_count = epoch_closed_token_count = 0.0
@@ -1618,9 +1697,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         epoch_open_token_count += open_count_total
                         epoch_closed_token_sum += closed_total
                         epoch_closed_token_count += closed_count_total
+                        token_measured = metrics_for_batch.get("token_mse_measured", True)
                         metrics = {"global_step": self.global_step, "epoch": epoch_number,
-                                   "objective": self.objective,
+                                   "objective": self.objective if token_measured else "condition_warmup",
                                    "train_mse": primary_total / global_size, "train_loss": loss_total / global_size,
+                                   "train_token_mse_measured": token_measured,
                                    "train_mask_mse": mask_total / global_size,
                                    "train_per_rank_batch_size": size,
                                    "train_global_batch_size": global_size,
@@ -1656,7 +1737,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     self.stage_epoch += 1
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
-                                "objective": self.objective,
+                                "objective": (self.objective if token_measured else "condition_warmup"),
+                                "epoch_train_token_mse_measured": token_measured,
                                 "epoch_train_mse": epoch_total / epoch_samples,
                                 "epoch_train_loss": epoch_loss_total / epoch_samples,
                                 "epoch_train_mask_mse": epoch_mask_total / epoch_samples,

@@ -21,6 +21,7 @@ from diffusion_policy.common.memory_budget import (
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.common.pose_util import absolute_pose_to_relative_pose
 from diffusion_policy.common.wrench_filter import first_order_lowpass, relative_time_seconds
+from diffusion_policy.common.contact_phase import contact_phase_alpha
 from diffusion_policy.common.sampler import create_indices, downsample_mask, get_val_mask
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.dataset.image_result_cache import (
@@ -679,8 +680,41 @@ class LeRobotV3ImageDataset(BaseImageDataset):
             if config is not None else None
         )
         self._contact_alpha_cache = {}
+        self._frame_contact_phase = None
+        self._frame_contact_alpha = None
+        duration = self.contact_label_config.get("precontact_seconds") if config is not None else None
+        if duration is not None:
+            self._build_frame_contact_targets(duration)
+        # Workspaces install the teacher's label rules after dataset creation.
+        # Rebuild sampling labels at that point so supervision and resampling
+        # use the same contact onsets, including repeated contacts.
+        if hasattr(self, "indices"):
+            self.phase_labels = self._build_phase_labels(self.indices)
+
+    def _build_frame_contact_targets(self, precontact_seconds):
+        preprocessor = self.contact_label_preprocessor
+        key = preprocessor.phase_wrench_key
+        group = self.windowed_lowdim_feature_groups.get(key, {})
+        source_key = group.get("source_key", self.phase_source_key)
+        source = self._load_column(source_key, dtype=np.float32)
+        contact = np.zeros(self.dataset_length, dtype=bool)
+        # One token per frame scans each measured sample exactly once. The
+        # state resets at episode boundaries; overlapping observation histories
+        # cannot duplicate debounce counts or provide future input features.
+        with torch.no_grad():
+            for rows in self.episode_ranges:
+                values = torch.from_numpy(source[rows.start:rows.stop].copy())[None, :, None, :]
+                if preprocessor.phase_wrench_key == preprocessor.wrench_key:
+                    values = preprocessor.input_gate(values)
+                contact[rows.start:rows.stop] = preprocessor.contact_detector(values).squeeze(0).numpy()
+        times = self._timestamp_seconds(self.timestamps, key=self.timestamp_key)
+        self._frame_contact_phase, self._frame_contact_alpha = contact_phase_alpha(
+            times, contact, self.episode_ranges, precontact_seconds,
+        )
 
     def _sample_contact_alpha(self, obs_indices, obs):
+        if self._frame_contact_alpha is not None:
+            return self._frame_contact_alpha[obs_indices]
         # The complete observation index tuple matters: legacy rollout carries
         # contact state across observation windows, including padded histories.
         key = tuple(int(index) for index in obs_indices)
@@ -923,6 +957,11 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         that duration rounds to the nearest recorded frame interval within
         each episode; half frames round up. Debounce is not backfilled.
         """
+        if getattr(self, "_frame_contact_phase", None) is not None:
+            anchors = np.asarray(
+                [self._anchor_index_from_sampler_row(row) for row in indices], dtype=np.int64,
+            )
+            return self._frame_contact_phase[anchors].astype(np.int8)
         if not self.phase_resampling_enabled:
             return np.zeros((len(indices),), dtype=np.int8)
         if self.contact_threshold is None:
@@ -1396,6 +1435,8 @@ class LeRobotV3ImageDataset(BaseImageDataset):
 
         if getattr(self, "contact_label_preprocessor", None) is not None:
             obs_dict["contact_alpha"] = self._sample_contact_alpha(obs_indices, obs_dict)
+            if self._frame_contact_phase is not None:
+                obs_dict["contact_phase"] = self._frame_contact_phase[obs_indices]
 
         action = self._sample_action(sequence_indices)
         if self.relative_pose_actions:

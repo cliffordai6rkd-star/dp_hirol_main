@@ -26,6 +26,7 @@ from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsE
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.vision.wrench_preprocessing import (
     fill_future_wrench_prefix, preprocess_wrench, validate_future_contact_mode,
+    validate_precontact_seconds,
 )
 
 
@@ -89,11 +90,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
         future_contact_mode: str = "legacy_rollout",
+        precontact_seconds: Optional[float] = None,
         action_representation: str = "ee_pose",
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
+        self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
+        if self.precontact_seconds is not None and future_phase_wrench_key is not None:
+            raise ValueError("Pre-contact gating requires current wrench history and future_phase_wrench_key=None")
         obs_shape_meta = shape_meta.get("obs", {})
         configured_image_keys = tuple(
             sorted(
@@ -461,6 +466,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             future_contact_mode=getattr(self, "future_contact_mode", "legacy_rollout"),
             return_processed_wrench=True,
             return_future_contact=return_future_contact,
+            precontact_seconds=getattr(self, "precontact_seconds", None),
         )
         self._latest_processed_wrench = processed_wrench.detach()
         self._latest_normalized_wrench = normalized_wrench.detach()

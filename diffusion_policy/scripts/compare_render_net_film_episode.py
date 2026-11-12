@@ -88,10 +88,18 @@ def compare_observations(model, preprocessor, obs, image_keys):
     if not model.spatial_modulation_enabled or not len(model.spatial_modulations):
         raise ValueError("This checkpoint has no enabled FiLM path (render_net.spatial_modulation.enabled)")
     images = {key: obs[key][:, :preprocessor.n_obs_steps] for key in image_keys}
-    wrench, contact, future_contact = preprocessor(obs, return_future_contact=True)
+    predict_phase = bool(getattr(model, "phase_prediction_enabled", False))
+    preprocessing_obs = ({key: value for key, value in obs.items()
+                          if key not in {"contact_alpha", "contact_phase"}}
+                         if predict_phase else obs)
+    wrench, contact, future_contact = preprocessor(preprocessing_obs, return_future_contact=True)
     contact_gate = future_contact if future_contact is not None else contact
-    alpha = (obs["contact_alpha"][:, :preprocessor.n_obs_steps] if "contact_alpha" in obs else
-             compute_contact_alpha(contact_gate if contact_gate.ndim == 3 else contact_gate.unsqueeze(-1)))
+    if predict_phase:
+        # Share one causal prediction so the comparison changes only FiLM.
+        alpha = model.predict_contact_phase(images, wrench)["contact_alpha"]
+    else:
+        alpha = (obs["contact_alpha"][:, :preprocessor.n_obs_steps] if "contact_alpha" in obs else
+                 compute_contact_alpha(contact_gate if contact_gate.ndim == 3 else contact_gate.unsqueeze(-1)))
     branches = {}
     original_setting = model.spatial_modulation_enabled
     try:

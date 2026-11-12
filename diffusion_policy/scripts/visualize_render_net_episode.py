@@ -119,11 +119,18 @@ def load_render_net(checkpoint, device=None):
 def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, use_attention_mask=None):
     """Use the same physical gating and normalization as teacher and student training."""
     images = {key: obs[key][:, :n_obs_steps] for key in image_keys}
-    wrench, contact, future_contact = preprocessor(obs, return_future_contact=True)
+    predict_phase = bool(getattr(model, "phase_prediction_enabled", False))
+    # Dataset phase/alpha targets use future contact onset.  Deployment must
+    # infer its gate from the causal RGB and measured wrench observations.
+    preprocessing_obs = ({key: value for key, value in obs.items()
+                          if key not in {"contact_alpha", "contact_phase"}}
+                         if predict_phase else obs)
+    wrench, contact, future_contact = preprocessor(preprocessing_obs, return_future_contact=True)
     contact_gate = future_contact if future_contact is not None else contact
     return images, model(
         images, wrench, future_contact=contact_gate,
-        contact_alpha=(obs["contact_alpha"][:, :n_obs_steps] if "contact_alpha" in obs else None),
+        contact_alpha=(obs["contact_alpha"][:, :n_obs_steps]
+                       if not predict_phase and "contact_alpha" in obs else None),
         use_attention_mask=use_attention_mask,
     )
 

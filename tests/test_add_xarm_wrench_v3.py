@@ -76,7 +76,8 @@ def test_payload_gravity_matches_independent_point_mass_jacobian(tmp_path):
     np.testing.assert_allclose(actual, expected, atol=1e-10)
 
 
-def test_export_updates_data_hf_global_and_episode_stats_without_touching_source(tmp_path):
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_export_updates_data_hf_global_and_episode_stats_without_touching_source(tmp_path, monkeypatch, overwrite):
     args = options(tmp_path)
     root = args.dataset
     (root / "data/chunk-000").mkdir(parents=True)
@@ -109,7 +110,11 @@ def test_export_updates_data_hf_global_and_episode_stats_without_touching_source
     (root / "meta/info.json").write_text(json.dumps(info))
     (root / "meta/stats.json").write_text(json.dumps({"keep_existing": {"count": [2*n]}}))
     before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
-    output = export_dataset(args)
+    if overwrite:
+        args.output.mkdir()
+        (args.output / "stale_video.mp4").write_bytes(b"previous output")
+    output = export_dataset(args, overwrite=overwrite)
+    assert not (output / "stale_video.mp4").exists()
     after = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
     assert before == after
     result = pa.concat_tables([pq.read_table(p) for p in sorted((output / "data").rglob("*.parquet"))])
@@ -133,6 +138,18 @@ def test_export_updates_data_hf_global_and_episode_stats_without_touching_source
     assert "fingerprint" not in new_hf
     assert (output / "videos/example.mp4").read_bytes() == b"copied video fixture"
     assert (output / "visualizations/episode_000_tau_ext_l1.png").read_bytes().startswith(b"\x89PNG")
+    if overwrite:
+        import scripts.add_xarm_wrench_v3 as exporter
+
+        saved = {str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+
+        def fail_plot(*args, **kwargs):
+            raise RuntimeError("plot failed")
+
+        monkeypatch.setattr(exporter, "plot_episode", fail_plot)
+        with pytest.raises(RuntimeError, match="plot failed"):
+            export_dataset(args, overwrite=True)
+        assert saved == {str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*") if p.is_file()}
 
 
 def test_filter_resets_at_episode_boundary_and_keeps_static_gravity_zero(tmp_path):

@@ -7,7 +7,7 @@ name: train_civi_teacher_xarm_clean
 exp_name: ${name}
 dataset_path: null
 task_name: ${task.name}
-# The clean datasets already gate the complete tau_ext vector at L1=14 Nm.
+# Thresholds label confirmed contact; the network reads unthresholded torque.
 free_threshold: 14.0
 contact_threshold: 14.0
 contact_norm: l1
@@ -50,6 +50,7 @@ task:
   free_threshold: 14.0
   contact_threshold: 14.0
   contact_norm: l1
+  phase_source_key: observation.tau_ext_unthresholded
   image_shape: [3, 224, 224]
   shape_meta: ${shape_meta}
   dataset:
@@ -67,10 +68,15 @@ task:
     observation_validity_key: null
     contact_threshold: 14.0
     contact_norm: l1
+    phase_source_key: observation.tau_ext_unthresholded
+    windowed_lowdim_feature_groups:
+      tau_ext:
+        source_key: observation.tau_ext_unthresholded
     wrench_filter:
       # The saved online bundle already applies causal 3 Hz physics filtering.
-      # Preserve its gated tau_ext without an additional 2 Hz post-filter.
+      # Keep continuous measured torque without an additional 2 Hz post-filter.
       enabled: false
+      source_key: observation.tau_ext_unthresholded
       timestamp_key: timestamp
 
 logging:

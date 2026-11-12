@@ -53,7 +53,8 @@ def test_existing_output_is_rejected_before_any_conversion(tmp_path):
         validate_outputs([{"input": str(source), "output": str(output)}])
 
 
-def test_pipeline_finishes_both_datasets_before_video(tmp_path, monkeypatch):
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_pipeline_finishes_both_datasets_before_video(tmp_path, monkeypatch, overwrite):
     pytest.importorskip("pinocchio")
     import data_process.process_tau_ext as pipeline
     import data_process.tau_ext_video as video
@@ -70,8 +71,10 @@ def test_pipeline_finishes_both_datasets_before_video(tmp_path, monkeypatch):
         "tau_ext_smoothing_window": 7, "contact_threshold_l1": 12.5,
     }, "visualization": {"episodes": [2], "cameras": ["observation.images.front"]}}))
     events = []
+    calls = []
 
-    def export(args):
+    def export(args, *, overwrite=False):
+        calls.append(overwrite)
         assert args.tau_ext_smoothing_window == 7
         assert args.contact_threshold_l1 == 12.5
         events.append(("data", args.output.name))
@@ -86,7 +89,37 @@ def test_pipeline_finishes_both_datasets_before_video(tmp_path, monkeypatch):
 
     monkeypatch.setattr(exporter, "export_dataset", export)
     monkeypatch.setattr(video, "export_tau_ext_video", render)
-    outputs = pipeline.run_pipeline(config_path)
+    outputs = pipeline.run_pipeline(config_path, overwrite=overwrite)
+    assert calls == [overwrite, overwrite]
     assert [item[0] for item in events] == ["data", "data", "video", "video"]
     for output in outputs:
         assert (output / "meta/data_process_config.json").is_file()
+
+
+def test_overwrite_accepts_existing_output_but_rejects_input_paths(tmp_path):
+    source = tmp_path / "input"
+    (source / "meta").mkdir(parents=True)
+    (source / "meta/info.json").write_text("{}")
+    output = tmp_path / "output"
+    output.mkdir()
+    validate_outputs([{"input": str(source), "output": str(output)}], overwrite=True)
+    for target in (source, tmp_path):
+        with pytest.raises(ValueError, match="outside all input"):
+            validate_outputs([{"input": str(source), "output": str(target)}], overwrite=True)
+    other_source = tmp_path / "other_input"
+    (other_source / "meta").mkdir(parents=True)
+    (other_source / "meta/info.json").write_text("{}")
+    with pytest.raises(ValueError, match="outside all input"):
+        validate_outputs([
+            {"input": str(source), "output": str(other_source)},
+            {"input": str(other_source), "output": str(output)},
+        ], overwrite=True)
+
+
+def test_main_passes_overwrite_flag(monkeypatch):
+    import data_process.process_tau_ext as pipeline
+
+    calls = []
+    monkeypatch.setattr(pipeline, "run_pipeline", lambda config, **kwargs: calls.append((config, kwargs)))
+    pipeline.main(["--overwrite"])
+    assert calls == [(DEFAULT_CONFIG, {"overwrite": True})]

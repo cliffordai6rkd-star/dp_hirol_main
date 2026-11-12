@@ -65,37 +65,41 @@ def build_export_args(dataset, processing):
     return args
 
 
-def validate_outputs(datasets):
-    """Check all targets before starting either dataset; never replace old data."""
+def validate_outputs(datasets, *, overwrite=False):
+    """Check all targets before starting either dataset."""
     outputs = set()
+    sources = [Path(dataset["input"]) for dataset in datasets]
     for dataset in datasets:
         source, target = Path(dataset["input"]), Path(dataset["output"])
         if not (source / "meta/info.json").is_file():
             raise FileNotFoundError(f"Missing input dataset metadata: {source / 'meta/info.json'}")
-        if target.exists():
-            raise FileExistsError(f"Output already exists; choose a new output path in the config: {target}")
-        if source == target or source in target.parents:
-            raise ValueError("Output must be outside the input dataset")
+        if any(target == root or root in target.parents or target in root.parents for root in sources):
+            raise ValueError("Output must be outside all input datasets")
+        if target.exists() and not overwrite:
+            raise FileExistsError(f"Output already exists; choose a new output path in the config or use --overwrite: {target}")
+        if target.exists() and not target.is_dir():
+            raise ValueError(f"Output must be a dataset directory: {target}")
         if target in outputs:
             raise ValueError(f"Duplicate dataset output: {target}")
         outputs.add(target)
 
 
-def run_pipeline(config_file=DEFAULT_CONFIG):
+def run_pipeline(config_file=DEFAULT_CONFIG, *, overwrite=False):
     from scripts.add_xarm_wrench_v3 import export_dataset
 
     config_file = Path(config_file).expanduser().resolve()
     config = load_config(config_file)
-    validate_outputs(config["datasets"])
+    validate_outputs(config["datasets"], overwrite=overwrite)
     jobs = [build_export_args(dataset, config["processing"]) for dataset in config["datasets"]]
     outputs = []
     # Finish both data conversions before rendering any video.
     for args in jobs:
         print(f"\nProcessing: {args.dataset} -> {args.output}", flush=True)
-        output = export_dataset(args)
+        output = export_dataset(args, overwrite=overwrite)
         record = {
             "config_file": str(config_file),
             "configuration": config,
+            "overwrite": overwrite,
             "resolved_export_parameters": vars(args),
         }
         (output / "meta/data_process_config.json").write_text(
@@ -137,8 +141,9 @@ def run_pipeline(config_file=DEFAULT_CONFIG):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="YAML config file")
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing output datasets")
     args = parser.parse_args(argv)
-    run_pipeline(args.config)
+    run_pipeline(args.config, overwrite=args.overwrite)
 
 
 if __name__ == "__main__":

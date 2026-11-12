@@ -435,12 +435,13 @@ class GaussianGlowBackbone(ConvAttentionBackbone):
 
 
 class RenderNet(nn.Module):
-    """Wrench-conditioned renderer with independent gate and RGB paths.
+    """Wrench-conditioned renderer with condition and RGB paths.
 
-    The gate branch predicts the spatial intensity field.  The RGB branch owns
-    its complete wrench/image encoder and decoder, so freezing the gate after
-    the warm-up stage does not freeze the RGB representation that must match
-    the teacher tokens.
+    The condition path shares its spatial-temporal feature and output head
+    across the region map, phase logits, and alpha. Condition warm-up trains
+    that path; joint training updates both paths while teacher-initialized
+    force encoders can remain frozen. Legacy intensity/RGB stages are kept
+    for existing checkpoints.
     """
 
     def __init__(self, wrench_dim, base_channels=16, conditioning_dim=256, residual_scale=0.1,
@@ -452,7 +453,7 @@ class RenderNet(nn.Module):
                  initialize_wrench_from_teacher=True, conv_block="standard",
                  rendering_mode="residual", glow=None, patch_residual_refine=True,
                  spatial_modulation=None, backbone=None, architecture_version=None,
-                 separate_gate_path=False, transformer=None):
+                 separate_gate_path=False, transformer=None, phase_prediction=None):
         super().__init__()
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints.  The active implementation is the CNN
@@ -507,6 +508,16 @@ class RenderNet(nn.Module):
         self.initialize_wrench_from_teacher = bool(initialize_wrench_from_teacher)
         self.wrench_history_steps = int(wrench_history_steps)
         self.max_obs_steps = int(max_obs_steps)
+        phase_config = dict(phase_prediction or {})
+        unknown_phase = set(phase_config) - {"enabled", "hidden_dim", "freeze_wrench_encoder"}
+        if unknown_phase:
+            raise ValueError(f"Unknown phase_prediction options: {sorted(unknown_phase)}")
+        self.phase_prediction_enabled = bool(phase_config.get("enabled", False))
+        self.phase_hidden_dim = int(phase_config.get("hidden_dim", 64))
+        self.freeze_wrench_encoder_on_init = bool(phase_config.get("freeze_wrench_encoder", False))
+        self._wrench_encoder_frozen = False
+        if self.phase_prediction_enabled and self.phase_hidden_dim < 1:
+            raise ValueError("phase_prediction.hidden_dim must be positive")
         self.wrench_projection = nn.Linear(wrench_dim, conditioning_dim)
         self.wrench_position = nn.Parameter(torch.zeros(1, 1, wrench_history_steps, conditioning_dim))
         self.obs_position = nn.Parameter(torch.zeros(1, max_obs_steps, 1, conditioning_dim))
@@ -574,7 +585,6 @@ class RenderNet(nn.Module):
             self.gate_wrench_encoder = copy.deepcopy(self.wrench_encoder)
             self.gate_backbone = copy.deepcopy(self.backbone)
             self.gate_camera_embedding = copy.deepcopy(self.camera_embedding)
-            self._gate_compiled_backbone_forward = None
         else:
             self.gate_wrench_projection = None
             self.gate_wrench_position = None
@@ -583,20 +593,37 @@ class RenderNet(nn.Module):
             self.gate_wrench_encoder = None
             self.gate_backbone = None
             self.gate_camera_embedding = None
-            self._gate_compiled_backbone_forward = None
         mask_feature_dim = (self.gate_backbone.feature_dim if self.gate_backbone is not None
                             else self.backbone.feature_dim)
-        self.mask_head = (nn.Conv2d(mask_feature_dim, 1, 1)
-                          if self.high_attention_enabled else None)
+        self.phase_temporal_encoder = (
+            nn.GRU(mask_feature_dim, self.phase_hidden_dim, batch_first=True)
+            if self.phase_prediction_enabled else None
+        )
+        # One spatial head predicts the region field, phase-logit maps, and
+        # alpha map from the same per-camera decoder feature plus causal
+        # temporal context.  Old checkpoints retain the original 1-channel
+        # head when phase_prediction is disabled.
+        needs_gate_head = self.high_attention_enabled or self.phase_prediction_enabled
+        head_channels = 5 if self.phase_prediction_enabled else 1
+        head_input_dim = mask_feature_dim + (self.phase_hidden_dim if self.phase_prediction_enabled else 0)
+        self.mask_head = nn.Conv2d(head_input_dim, head_channels, 1) if needs_gate_head else None
         if self.mask_head is not None:
             if self.region_activation == "sigmoid":
                 initial_strength = float(region_config.get("initial_strength", 0.1))
                 if not math.isfinite(initial_strength) or not 0 < initial_strength < 1:
                     raise ValueError("Sigmoid region initial_strength must be finite and between 0 and 1")
                 nn.init.zeros_(self.mask_head.weight)
-                nn.init.constant_(self.mask_head.bias, math.log(initial_strength / (1 - initial_strength)))
+                nn.init.zeros_(self.mask_head.bias)
+                self.mask_head.bias.data[0] = math.log(initial_strength / (1 - initial_strength))
+                if self.phase_prediction_enabled:
+                    nn.init.normal_(self.mask_head.weight.data[1:], std=0.01)
+                    self.mask_head.bias.data[4] = math.log(initial_strength / (1 - initial_strength))
             else:
-                nn.init.constant_(self.mask_head.bias, 0.1)
+                nn.init.zeros_(self.mask_head.weight)
+                nn.init.zeros_(self.mask_head.bias)
+                self.mask_head.bias.data[0] = 0.1
+                if self.phase_prediction_enabled:
+                    nn.init.normal_(self.mask_head.weight.data[1:], std=0.01)
         self.spatial_modulations = nn.ModuleList()
         if self.spatial_modulation_enabled:
             decoder_channels = [module.body[-2].out_channels
@@ -627,22 +654,30 @@ class RenderNet(nn.Module):
             # Compatibility mode shares the feature path between the field and
             # RGB head.  Keep its output head in the RGB-only set so the
             # historical two-stage behavior remains well-defined.
-            return (
-                self.wrench_projection, self.wrench_encoder,
+            modules = [
                 self.backbone.stem, self.backbone.encoders,
                 self.backbone.image_self_attention, self.backbone.cross_attention,
                 self.backbone.norm, self.backbone.decoders, self.camera_embedding,
-                self.wrench_position, self.obs_position, self.force_modality,
-                self.mask_head,
-            )
-        return (
-            self.gate_wrench_projection, self.gate_wrench_encoder,
+                self.mask_head, self.phase_temporal_encoder,
+            ]
+            if not self._wrench_encoder_frozen:
+                modules.extend([
+                    self.wrench_projection, self.wrench_encoder,
+                    self.wrench_position, self.obs_position, self.force_modality,
+                ])
+            return tuple(modules)
+        modules = [
             self.gate_backbone.stem, self.gate_backbone.encoders,
             self.gate_backbone.image_self_attention, self.gate_backbone.cross_attention,
             self.gate_backbone.norm, self.gate_backbone.decoders,
-            self.gate_camera_embedding, self.mask_head,
-            self.gate_wrench_position, self.gate_obs_position, self.gate_force_modality,
-        )
+            self.gate_camera_embedding, self.mask_head, self.phase_temporal_encoder,
+        ]
+        if not self._wrench_encoder_frozen:
+            modules.extend([
+                self.gate_wrench_projection, self.gate_wrench_encoder,
+                self.gate_wrench_position, self.gate_obs_position, self.gate_force_modality,
+            ])
+        return tuple(modules)
 
     def _rgb_modules(self):
         if not self.separate_gate_path:
@@ -655,36 +690,67 @@ class RenderNet(nn.Module):
                 if module is not None:
                     rgb_only.append(module)
             return tuple(rgb_only)
-        return (
-            self.wrench_projection, self.wrench_encoder, self.backbone,
-            self.camera_embedding, self.wrench_position, self.obs_position,
-            self.force_modality, self.spatial_modulations,
-        )
+        modules = [self.backbone, self.camera_embedding, self.spatial_modulations]
+        if not self._wrench_encoder_frozen:
+            modules.extend([
+                self.wrench_projection, self.wrench_encoder,
+                self.wrench_position, self.obs_position, self.force_modality,
+            ])
+        return tuple(modules)
+
+    def _wrench_conditioning_parameters(self):
+        modules = [self.wrench_projection, self.wrench_encoder]
+        parameters = [self.wrench_position, self.obs_position, self.force_modality]
+        if self.separate_gate_path:
+            modules.extend([self.gate_wrench_projection, self.gate_wrench_encoder])
+            parameters.extend([
+                self.gate_wrench_position, self.gate_obs_position, self.gate_force_modality,
+            ])
+        return modules, parameters
+
+    def freeze_wrench_encoder(self):
+        """Freeze teacher-initialized force encoders and their embeddings."""
+        self._wrench_encoder_frozen = True
+        modules, parameters = self._wrench_conditioning_parameters()
+        for module in modules:
+            module.requires_grad_(False)
+            module.eval()
+        for parameter in parameters:
+            parameter.requires_grad_(False)
+
+    def _enforce_wrench_freeze(self):
+        if self._wrench_encoder_frozen:
+            self.freeze_wrench_encoder()
 
     def set_training_stage(self, stage):
-        """Select which independent path receives gradients.
+        """Select the condition/RGB paths that receive gradients.
 
-        ``intensity`` trains only the gate branch.  ``rgb`` freezes that
-        branch and trains the complete RGB wrench encoder, image encoder,
-        attention stack, decoder and RGB head.  ``joint`` trains both paths.
+        ``condition_warmup`` trains the condition branch while RGB and FiLM
+        stay frozen. ``joint`` trains both paths, except explicitly frozen
+        force encoders. Legacy ``intensity`` aliases condition warm-up and
+        legacy ``rgb`` trains RGB while freezing the condition branch.
         """
         stage = str(stage)
-        if stage not in {"intensity", "rgb", "joint"}:
-            raise ValueError("RenderNet stage must be intensity, rgb or joint")
+        if stage not in {"intensity", "rgb", "condition_warmup", "joint"}:
+            raise ValueError("RenderNet stage must be intensity, rgb, condition_warmup or joint")
         self.training_stage = stage
         self.requires_grad_(False)
-        if stage in {"intensity", "joint"}:
+        if stage in {"intensity", "condition_warmup", "joint"}:
+            # The conditioning phase keeps its visual/wrench-conditioned gate
+            # branch trainable; RGB decoder and FiLM stay frozen.
             for module in self._gate_modules():
                 self._set_requires_grad(module, True)
         if stage in {"rgb", "joint"}:
             for module in self._rgb_modules():
                 self._set_requires_grad(module, True)
+        self._enforce_wrench_freeze()
 
     def set_stage_mode(self, training=True):
-        """Set mode while keeping the frozen branch deterministic."""
+        """Set mode while keeping inactive paths and frozen force encoders deterministic."""
         self.train(bool(training))
         if not training:
             return
+        self._enforce_wrench_freeze()
         if self.training_stage == "joint":
             return
         frozen = self._gate_modules() if self.training_stage == "rgb" else self._rgb_modules()
@@ -705,11 +771,24 @@ class RenderNet(nn.Module):
 
     def gate_parameters(self):
         """Return parameters whose updates can change the predicted gate."""
-        return list(self._parameters_from_modules(self._gate_modules()))
+        params = list(self._parameters_from_modules(self._gate_modules()))
+        frozen_ids = self._frozen_wrench_parameter_ids()
+        return [parameter for parameter in params if id(parameter) not in frozen_ids]
 
     def rgb_parameters(self):
         """Return parameters updated by the RGB stage."""
-        return list(self._parameters_from_modules(self._rgb_modules()))
+        params = list(self._parameters_from_modules(self._rgb_modules()))
+        frozen_ids = self._frozen_wrench_parameter_ids()
+        return [parameter for parameter in params if id(parameter) not in frozen_ids]
+
+    def _frozen_wrench_parameter_ids(self):
+        if not self._wrench_encoder_frozen:
+            return set()
+        modules, parameters = self._wrench_conditioning_parameters()
+        frozen = {id(parameter) for parameter in parameters}
+        for module in modules:
+            frozen.update(id(parameter) for parameter in module.parameters())
+        return frozen
 
     @property
     def output(self):
@@ -776,18 +855,86 @@ class RenderNet(nn.Module):
         """Return frozen gate-branch [B*To,K,D] LSTM outputs."""
         return self._encode_wrench_history(wrench_history, gate=True)
 
-    def _predict_mask(self, features, use_mask):
-        if not use_mask:
-            return torch.ones(
-                features.shape[0], 1, features.shape[-2], features.shape[-1],
-                device=features.device, dtype=features.dtype,
-            )
-        logits = self.mask_head(features)
+    def predict_contact_phase(self, images, wrench_history):
+        """Predict causal phase logits/alpha through the shared spatial head.
+
+        The gate decoder features are pooled across image locations and
+        cameras, then a GRU processes observation steps in order. Its state is
+        broadcast back onto each camera's spatial feature map; the same 5-way
+        convolution that predicts the region field produces phase-logit and
+        alpha maps. Phase IDs are 0=free, 1=pre-contact, and 2=contact.
+        """
+        if not self.phase_prediction_enabled:
+            raise ValueError("RenderNet phase_prediction.enabled is false")
+        gate_wrench_tokens = self.encode_gate_wrench_history(wrench_history)
+        _, predictions = self._gate_head_outputs(images, gate_wrench_tokens, wrench_history.shape[:2])
+        return predictions
+
+    def _gate_head_outputs(self, images, gate_wrench_tokens, batch_steps):
+        """Run the shared per-camera spatial-temporal gate feature and head."""
+        batch, steps = (int(batch_steps[0]), int(batch_steps[1]))
+        gate_camera_embedding = (self.gate_camera_embedding
+                                 if self.separate_gate_path else self.camera_embedding)
+        gate_backbone = self.gate_backbone if self.separate_gate_path else self.backbone
+        feature_maps = {}
+        pooled = []
+        unknown_cameras = set(images) - set(self.image_keys)
+        if unknown_cameras:
+            raise KeyError(f"Cameras {sorted(unknown_cameras)!r} are absent from configured image_keys {self.image_keys}")
+        camera_keys = tuple(key for key in self.image_keys if key in images)
+        if not camera_keys:
+            raise ValueError("RenderNet requires at least one configured camera observation")
+        for key in camera_keys:
+            image = images[key]
+            if image.ndim != 5 or image.shape[:3] != (batch, steps, 3):
+                raise ValueError("RenderNet requires matching [B, To, 3, H, W] images")
+            flat_image = image.flatten(0, 1)
+            camera = gate_camera_embedding.weight[self.image_keys.index(key)].reshape(1, 1, -1)
+            _, features = gate_backbone(flat_image, gate_wrench_tokens, camera)
+            feature_maps[key] = features.reshape(batch, steps, *features.shape[1:])
+            pooled.append(feature_maps[key].mean(dim=(-2, -1)))
+
+        predictions = None
+        masks = {}
+        temporal = None
+        if self.phase_prediction_enabled:
+            # Camera-average summaries give one chronological state stream
+            # shared by all views.  GRU is causal across the To axis.
+            summary = torch.stack(pooled, dim=0).mean(dim=0)
+            temporal, _ = self.phase_temporal_encoder(summary)
+            phase_maps, alpha_maps = [], []
+            for key in camera_keys:
+                features = feature_maps[key]
+                context = temporal[..., None, None].expand(
+                    -1, -1, -1, features.shape[-2], features.shape[-1]
+                )
+                head_input = torch.cat([features, context], dim=2).flatten(0, 1)
+                output = self.mask_head(head_input).reshape(batch, steps, 5,
+                                                            features.shape[-2], features.shape[-1])
+                masks[key] = self._activate_region(output[:, :, :1].flatten(0, 1))
+                phase_maps.append(output[:, :, 1:4].mean(dim=(-2, -1)))
+                alpha_maps.append(output[:, :, 4].mean(dim=(-2, -1)))
+            predictions = {
+                "phase_logits": torch.stack(phase_maps, dim=0).mean(dim=0),
+                "contact_alpha": torch.stack(alpha_maps, dim=0).mean(dim=0).float().sigmoid(),
+            }
+
+        for key, features in feature_maps.items():
+            if self.phase_prediction_enabled:
+                continue
+            flat_features = features.flatten(0, 1)
+            if self.mask_head is None:
+                mask = torch.ones(batch * steps, 1, *features.shape[-2:],
+                                  device=features.device, dtype=features.dtype)
+            else:
+                mask = self._activate_region(self.mask_head(flat_features))
+            masks[key] = mask
+        return masks, predictions
+
+    def _activate_region(self, logits):
         if self.region_activation == "relu":
-            mask = F.relu(logits).clamp(max=1.0)
-        else:
-            mask = logits.float().sigmoid()
-        return mask
+            return F.relu(logits).clamp(max=1.0)
+        return logits.float().sigmoid()
 
     def _mask_gate(self, mask, image):
         """Convert a predicted field into the spatial support used by RGB."""
@@ -810,16 +957,43 @@ class RenderNet(nn.Module):
         return torch.where(mask > self.region_threshold, mask, torch.zeros_like(mask))
 
     def forward(self, images, wrench_history, *, return_aux=False, use_attention_mask=None,
-                future_contact=None, contact_alpha=None):
+                future_contact=None, contact_alpha=None, return_phase=False,
+                condition_only=False):
         """Output RGB only; downstream DINO receives no student token adapter."""
         use_mask = self.high_attention_enabled if use_attention_mask is None else bool(use_attention_mask)
         if use_mask and self.mask_head is None:
             raise ValueError("Attention rendering was disabled during training; no trained mask head exists")
-        wrench_tokens = self.encode_wrench_history(wrench_history)
-        gate_wrench_tokens = (self.encode_gate_wrench_history(wrench_history)
-                              if use_mask else None)
         batch, steps = wrench_history.shape[:2]
+        if condition_only and not (self.phase_prediction_enabled and return_aux and return_phase):
+            raise ValueError(
+                "condition_only requires phase prediction, return_aux=True, and return_phase=True"
+            )
+        needs_gate_features = use_mask or self.phase_prediction_enabled
+        gate_wrench_tokens = (self.encode_gate_wrench_history(wrench_history)
+                              if needs_gate_features else None)
+        if needs_gate_features:
+            gate_masks, phase_predictions = self._gate_head_outputs(
+                images, gate_wrench_tokens, (batch, steps),
+            )
+        else:
+            gate_masks, phase_predictions = {}, None
+        if condition_only:
+            masks = {}
+            for key, flat_mask in gate_masks.items():
+                height, width = images[key].shape[-2:]
+                mask = flat_mask
+                if self.rendering_mode in {"gaussian_glow", "patch_residual"} and use_mask:
+                    patch = self.backbone.patch_size
+                    padded_size = (height + (-height) % patch, width + (-width) % patch)
+                    mask = F.interpolate(flat_mask, size=padded_size, mode="bilinear",
+                                         align_corners=False)
+                    mask = mask[:, :, :height, :width]
+                masks[key] = mask.reshape(batch, steps, 1, height, width)
+            return None, masks, phase_predictions
+        wrench_tokens = self.encode_wrench_history(wrench_history)
         alpha = contact_alpha
+        if alpha is None and phase_predictions is not None:
+            alpha = phase_predictions["contact_alpha"]
         if alpha is None and future_contact is not None:
             if future_contact.ndim == 2:
                 future_contact = future_contact.unsqueeze(-1)
@@ -834,18 +1008,7 @@ class RenderNet(nn.Module):
                 raise ValueError("RenderNet requires matching [B, To, 3, H, W] images")
             flat_image = image.flatten(0, 1)
             if use_mask:
-                gate_camera_embedding = (self.gate_camera_embedding
-                                         if self.separate_gate_path
-                                         else self.camera_embedding)
-                gate_backbone = (self.gate_backbone
-                                 if self.separate_gate_path else self.backbone)
-                gate_camera = gate_camera_embedding.weight[
-                    self.image_keys.index(key)
-                ].reshape(1, 1, -1)
-                _, gate_features = gate_backbone(
-                    flat_image, gate_wrench_tokens, gate_camera,
-                )
-                flat_mask = self._predict_mask(gate_features, True)
+                flat_mask = gate_masks[key]
             else:
                 flat_mask = torch.ones(
                     flat_image.shape[0], 1, *flat_image.shape[-2:],
@@ -899,6 +1062,8 @@ class RenderNet(nn.Module):
                 rendered[key] = (image + self.residual_scale * image_alpha * residual).clamp(0, 1)
             if alpha is not None:
                 rendered[key] = torch.where(image_alpha > 0, rendered[key], image)
+        if return_phase:
+            return rendered, masks, phase_predictions
         return (rendered, masks) if return_aux else rendered
 
 

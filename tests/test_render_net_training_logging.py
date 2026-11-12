@@ -63,3 +63,26 @@ def test_denoiser_objective_and_token_diagnostic_survive_offline_plot_rebuild(tm
     np.testing.assert_allclose(history.points("train_demo_mse")[1], [0.03])
     save_training_plot(history, tmp_path / "rebuilt.png")
     assert (tmp_path / "rebuilt.png").is_file()
+
+
+def test_condition_warmup_never_plots_unmeasured_token_mse(tmp_path):
+    with RenderNetTrainingLogger(tmp_path, plot_every_steps=0) as logger:
+        logger.log({"global_step": 1, "epoch": 1, "objective": "condition_warmup",
+                    "train_mse": .7, "train_token_mse": 0., "train_token_mse_measured": False,
+                    "train_open_token_mse": 0., "train_closed_token_mse": 0.,
+                    "train_phase_ce": .5, "train_alpha_mse": .2, "train_loss": .7})
+        logger.log({"global_step": 1, "epoch": 1, "objective": "condition_warmup",
+                    "epoch_train_mse": .7, "epoch_train_token_mse_measured": False})
+        assert logger.history.objective == "token_mse"
+        assert not len(logger.history.points("train_mse")[1])
+        assert not len(logger.history.points("train_token_mse")[1])
+        assert not len(logger.history.points("train_open_token_mse")[1])
+        assert not len(logger.history.points("epoch_train_mse")[1])
+        logger.log({"global_step": 2, "epoch": 2, "objective": "token_mse",
+                    "train_mse": .3, "train_token_mse": .3, "train_token_mse_measured": True})
+        logger.save_plot()
+    history = MetricHistory.from_json(tmp_path / "logs.json.txt")
+    np.testing.assert_allclose(history.points("train_mse")[1], [.3])
+    np.testing.assert_allclose(history.points("train_token_mse")[1], [.3])
+    np.testing.assert_allclose(history.points("train_condition_loss")[1], [.7])
+    np.testing.assert_allclose(history.points("train_phase_ce")[1], [.5])

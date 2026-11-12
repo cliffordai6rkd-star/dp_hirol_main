@@ -198,10 +198,14 @@ def plot_episode(path, episode_id, times, columns, args):
     plt.close(fig)
 
 
-def export_dataset(args):
+def export_dataset(args, *, overwrite=False):
     source, target = args.dataset.resolve(), args.output.resolve()
-    if target.exists() or source == target or source in target.parents:
-        raise ValueError("Output must be a new directory outside the input dataset")
+    if source == target or source in target.parents or target in source.parents:
+        raise ValueError("Output must be outside the input dataset")
+    if target.exists() and not overwrite:
+        raise ValueError("Output already exists; enable overwrite to replace it")
+    if target.exists() and not target.is_dir():
+        raise ValueError("Output must be a dataset directory")
     info = json.loads((source / "meta/info.json").read_text())
     if info["codebase_version"] != "v3.0":
         raise ValueError("Expected a LeRobot v3.0 dataset")
@@ -344,9 +348,20 @@ def export_dataset(args):
         plot_dir.mkdir(exist_ok=True)
         plot_episode(plot_dir / f"episode_{args.plot_episode:03d}_wrench.png", args.plot_episode,
                      timestamps[plot_rows], {k: v[plot_rows] for k, v in columns.items()}, args)
-        staging.rename(target)
+        if target.exists():
+            # Keep the old dataset until the complete replacement is ready.
+            with tempfile.TemporaryDirectory(prefix=f".{target.name}-old-", dir=target.parent) as backup_dir:
+                backup = Path(backup_dir) / "dataset"
+                target.rename(backup)
+                try:
+                    staging.rename(target)
+                except BaseException:
+                    backup.rename(target)
+                    raise
+        else:
+            staging.rename(target)
     except BaseException:
-        shutil.rmtree(staging)
+        shutil.rmtree(staging, ignore_errors=True)
         raise
     print(f"Saved {len(table)} frames / {len(episodes)} episodes to {target}")
     print(f"Plot: {target}/visualizations/episode_{args.plot_episode:03d}_tau_ext_l1.png")

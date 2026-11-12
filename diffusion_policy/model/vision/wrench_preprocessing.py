@@ -1,5 +1,7 @@
 """Shared physical-unit gating and normalization, before any wrench encoder."""
 
+import math
+
 import torch
 from torch import nn
 
@@ -9,7 +11,16 @@ from diffusion_policy.model.vision.contact_curriculum import (
 )
 
 
-WRENCH_PREPROCESSING_VERSION = 4
+WRENCH_PREPROCESSING_VERSION = 5
+
+
+def validate_precontact_seconds(value):
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("precontact_seconds must be positive and finite, or None for legacy gating")
+    return value
 
 
 def validate_future_contact_mode(mode):
@@ -85,7 +96,7 @@ def detect_wrench_contact(raw_wrench, raw_phase_wrench, raw_future_phase_wrench,
 def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
                       shared_phase_signal, contact_detector, input_gate, normalizer, wrench_key,
                       future_contact_mode="legacy_rollout", return_processed_wrench=False,
-                      return_future_contact=False):
+                      return_future_contact=False, precontact_seconds=None):
     """The teacher's exact wrench data flow; also used by RenderNet inference."""
     contact, future_contact, gate_mask = detect_wrench_contact(
         raw_wrench, raw_phase_wrench, raw_future_phase_wrench,
@@ -93,7 +104,15 @@ def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
         input_gate=input_gate, future_contact_mode=future_contact_mode,
     )
     future_has_contact = None
-    if future_contact is not None:
+    if precontact_seconds is not None:
+        # Continuous causal measurements must reach the phase predictor even
+        # before the high contact threshold. Alpha gates the fusion/render
+        # update, not its input; multiplying here would attenuate it twice.
+        if raw_future_phase_wrench is not None:
+            raise ValueError("Pre-contact gating requires causal wrench history, without future phase observations")
+        gated_wrench = raw_wrench
+        model_wrench_mask = torch.ones_like(raw_wrench[..., :1], dtype=torch.bool)
+    elif future_contact is not None:
         gated_wrench, future_has_contact = fill_future_wrench_prefix(raw_wrench, future_contact)
         model_wrench_mask = future_has_contact[:, :, None, None]
     else:
@@ -123,13 +142,17 @@ class WrenchPreprocessor(nn.Module):
     """Save just the teacher's preprocessing state, without DINO/fusion/DiT."""
 
     def __init__(self, n_obs_steps, wrench_key, phase_wrench_key, future_phase_wrench_key,
-                 contact_detector, input_gate, normalizer, future_contact_mode="legacy_rollout"):
+                 contact_detector, input_gate, normalizer, future_contact_mode="legacy_rollout",
+                 precontact_seconds=None):
         super().__init__()
         self.n_obs_steps = int(n_obs_steps)
         self.wrench_key = str(wrench_key)
         self.phase_wrench_key = str(phase_wrench_key)
         self.future_phase_wrench_key = future_phase_wrench_key
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
+        self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
+        if self.precontact_seconds is not None and future_phase_wrench_key is not None:
+            raise ValueError("Pre-contact gating requires current wrench observations")
         self.contact_detector = contact_detector
         self.input_gate = input_gate
         self.normalizer = normalizer
@@ -139,7 +162,8 @@ class WrenchPreprocessor(nn.Module):
         return cls(policy.n_obs_steps, policy.wrench_key, policy.phase_wrench_key,
                    policy.future_phase_wrench_key, policy.contact_detector,
                    policy.input_gate, policy.normalizer,
-                   future_contact_mode=getattr(policy, "future_contact_mode", "legacy_rollout"))
+                   future_contact_mode=getattr(policy, "future_contact_mode", "legacy_rollout"),
+                   precontact_seconds=getattr(policy, "precontact_seconds", None))
 
     @property
     def required_keys(self):
@@ -178,6 +202,7 @@ class WrenchPreprocessor(nn.Module):
             normalizer=self.normalizer, wrench_key=self.wrench_key,
             future_contact_mode=self.future_contact_mode,
             return_future_contact=return_future_contact,
+            precontact_seconds=self.precontact_seconds,
         )
 
     def get_config(self):
@@ -196,6 +221,7 @@ class WrenchPreprocessor(nn.Module):
         else:
             raise TypeError(f"Unsupported contact detector: {type(detector)}")
         return {"version": WRENCH_PREPROCESSING_VERSION,
+                "precontact_seconds": self.precontact_seconds,
                 "future_contact_mode": self.future_contact_mode,
                 "n_obs_steps": self.n_obs_steps, "wrench_key": self.wrench_key,
                 "phase_wrench_key": self.phase_wrench_key,
@@ -211,4 +237,5 @@ class WrenchPreprocessor(nn.Module):
         return cls(config["n_obs_steps"], config["wrench_key"], config["phase_wrench_key"],
                    config["future_phase_wrench_key"], detector_cls(**config["contact_detector"]),
                    VectorThresholdGate(**config["input_gate"]), LinearNormalizer(),
-                   future_contact_mode=config.get("future_contact_mode", "legacy_rollout"))
+                   future_contact_mode=config.get("future_contact_mode", "legacy_rollout"),
+                   precontact_seconds=config.get("precontact_seconds"))

@@ -12,7 +12,9 @@ output_dir: data/outputs/civi/current_tau_ext/student
 # 冻结当前 tau_ext 教师，以其 context tokens 监督学生 RGB 渲染。
 distillation:
   objective: token_mse
-  use_teacher_ffn: false # 教师和学生都使用融合 FFN 之前的 context token。
+  use_teacher_ffn: true # 学生复用冻结教师的融合 FFN，对齐教师最终 context token。
+  phase_ce_weight: 1.0
+  alpha_loss_weight: 1.0
   token_loss_weight: 0.0
   demo_loss_weight: 0.0
   validation_seed: 42
@@ -29,6 +31,10 @@ teacher_cache:
   only: false
 
 render_net:
+  phase_prediction:
+    enabled: true
+    hidden_dim: 64
+    freeze_wrench_encoder: true
   backbone:
     image_encoder: cnn
     wrench_encoder: lstm
@@ -43,9 +49,9 @@ render_net:
     base_channels: 32
     conv_block: bottleneck
   rendering_mode: residual
-  separate_gate_path: true # 独立 gate 路径；RGB 阶段训练完整 RGB 主干。
+  separate_gate_path: true # 条件分支与 RGB 分支独立；warmup 后同时优化。
   spatial_modulation:
-    enabled: true # 在 /8、/4 decoder 插入空间调制。
+    enabled: false # 暂时关闭 FiLM，保留实现供后续对比。
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
   wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
@@ -69,7 +75,7 @@ render_net:
     context_patch_loss_weight: 1.0
     pixel_loss_weight: 0.0
     smoothness_loss_weight: 0.02
-    detach_for_rgb: true
+    detach_for_rgb: false # 联合阶段的 token 蒸馏同时更新条件图与 RGB 分支。
     teacher_seed: 42
 
 # 数据集和时间窗口读取 teacher-config；normalizer 读取所选教师 checkpoint。
@@ -133,13 +139,13 @@ training:
     enabled: false
     backend: nccl
     batch_size_is_global: true
-    find_unused_parameters: false
+    # The condition-only warmup intentionally skips the RGB residual branch.
+    find_unused_parameters: true
     timeout_seconds: 86400
   num_epochs: 1000
-  intensity_warmup_epochs: 5 # Legacy alias；render_stages.intensity_epochs 为准。
   render_stages:
     enabled: true
-    intensity_epochs: 5 # 前 5 个 epoch 学强度场，随后冻结 gate 并训练 RGB。
+    condition_warmup_epochs: 1 # 先预热条件头，再联合优化条件头与 RGB 渲染分支。
   max_steps: null
   max_grad_norm: 1.0
   log_every: 10

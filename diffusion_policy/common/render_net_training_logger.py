@@ -18,6 +18,7 @@ class MetricHistory:
 
     step_keys = ("train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
                  "train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                 "train_phase_ce", "train_alpha_mse",
                  "train_contact_open_ratio", "train_open_token_mse", "train_closed_token_mse",
                  "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
@@ -39,14 +40,23 @@ class MetricHistory:
             ys.append(y)
 
     def record(self, metrics):
-        if "objective" in metrics:
+        warmup = metrics.get("objective") == "condition_warmup"
+        if "objective" in metrics and not warmup:
             self.objective = metrics["objective"]
         step, epoch = metrics.get("global_step", self.step), metrics.get("epoch", self.epoch)
         self.step, self.epoch = step, epoch
+        token_measured = metrics.get("train_token_mse_measured", not warmup)
+        if warmup and "train_mse" in metrics:
+            self._append("train_condition_loss", step, metrics["train_mse"])
         for key in self.step_keys:
+            if (not token_measured and key in {
+                    "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+                    "train_open_token_mse", "train_closed_token_mse"}):
+                continue
             if key in metrics:
                 self._append(key, step, metrics[key])
-        if "epoch_train_mse" in metrics:
+        if ("epoch_train_mse" in metrics
+                and metrics.get("epoch_train_token_mse_measured", not warmup)):
             self._append("epoch_train_mse", epoch, metrics["epoch_train_mse"])
         val = metrics.get("val_mse", metrics.get("initial_val_mse"))
         if val is not None:
@@ -105,6 +115,9 @@ def save_training_plot(history, destination):
         curve(axes[2], "train_token_mse", "Token MSE (diagnostic)", linewidth=0.8, alpha=0.65)
         curve(axes[2], "train_demo_mse", "Demonstration loss", linewidth=0.8, alpha=0.65)
     curve(axes[2], "train_mask_mse", "Region MSE", linewidth=0.9)
+    curve(axes[2], "train_condition_loss", "Condition warmup loss", linewidth=0.9)
+    curve(axes[2], "train_phase_ce", "Contact phase CE", linewidth=0.8, alpha=0.8)
+    curve(axes[2], "train_alpha_mse", "Alpha MSE", linewidth=0.8, alpha=0.8)
     curve(axes[2], "train_loss", "Total loss", linewidth=0.9)
     curve(axes[2], "train_contact_open_ratio", "Contact open ratio", linewidth=0.8,
           color="tab:orange", alpha=0.8)

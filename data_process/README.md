@@ -9,7 +9,13 @@ python data_process/process_tau_ext.py
 
 默认读取同目录的 `tau_ext_config.yaml`。均值窗口、检测阈值、数据路径和视频设置均在配置中修改，不需要传命令行参数。指定另一份配置时可运行 `python data_process/process_tau_ext.py --config 路径/config.yaml`。
 
-默认分别从两个原始 25 Hz 数据集重新计算，输出到 `*_clean_ma5_l1_12p5`。原始数据、旧的 `*_clean` 数据和已有训练文件不会被覆盖。输出目录已经存在时，脚本会报错；重新处理时请在配置中指定新的输出路径。
+默认分别从两个原始 25 Hz 数据集重新计算，输出到 `*_clean_ma5_l1_12p5`。输出目录已经存在时，脚本默认报错；加上 `--overwrite` 可直接覆盖配置中 `output` 指定的整个数据集，并按当前配置重新生成视频：
+
+```bash
+python data_process/process_tau_ext.py --overwrite
+```
+
+如需覆盖之前的 `*_clean` 数据集，将配置中的两个 `output` 分别改为对应的旧 `*_clean` 路径，再运行上述命令。`input` 仍指向原始数据集，输入和输出必须是不同目录。均值窗口、检测阈值和数据路径仍通过 YAML 配置控制；也可组合使用 `--config 路径/config.yaml --overwrite`。
 
 处理顺序：
 
