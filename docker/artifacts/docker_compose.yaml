@@ -36,20 +36,13 @@ services:
       DP_DATASET_PATH: ${DP_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
       DP_BASELINE_DATASET_PATH: ${DP_BASELINE_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
       DINOV3_MODEL_PATH: ${DINOV3_MODEL_PATH:-/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m}
-      TEACHER_CHECKPOINT: ${TEACHER_CHECKPOINT:-/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt}
-      # Default deployment command: current structured RenderNet + pure token MSE.
-      # Use TRAIN_COMMAND to run DP, denoiser distillation, or a custom Hydra job.
+      # Train a current-wrench teacher, then distill its selected checkpoint.
+      # Use TRAIN_COMMAND for a different stage or custom Hydra job.
       TRAIN_COMMAND: >-
-        python train_distill_render_net.py
-        --config-name=train_distill_render_net
-        teacher_checkpoint=${TEACHER_CHECKPOINT:-/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt}
-        +dataset.dataset_path=${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
-        dataset.video_backend=pyav
-        distillation.objective=token_mse
-        render_net.high_attention_render.enabled=false
-        training.intensity_warmup_epochs=0
-        teacher_cache.precision=float32
-        teacher_cache.dtype=float32
+        python train_civi.py
+        --teacher-override task.dataset.dataset_path=${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
+        --teacher-override task.dataset.video_backend=pyav
+        --student-override dataset.video_backend=pyav
       NPROC_PER_NODE: ${NPROC_PER_NODE:-}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes:

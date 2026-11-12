@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run RGB rendering inference for the 2026-11-05 RenderNet checkpoint.
+"""Run RGB rendering inference for the current-wrench RenderNet checkpoint.
 
 This is a small user-facing entry point around
 ``diffusion_policy.scripts.visualize_render_net_episode``.  The underlying
@@ -30,8 +30,9 @@ DEFAULT_CHECKPOINT = (
     REPO_ROOT
     / "data"
     / "outputs"
-    / "2026.11.05"
-    / "18.59.30_distill_render_net"
+    / "civi"
+    / "current_wrench"
+    / "student"
     / "checkpoints"
     / "latest.ckpt"
 )

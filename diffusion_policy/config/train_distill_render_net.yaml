@@ -77,16 +77,10 @@ render_net:
     detach_for_rgb: true
     teacher_seed: 42
 
-# Inherit the teacher's dataset class/windows; hold out student validation episodes independently.
+# Inherit the teacher's dataset class/windows/filter; hold out student validation episodes independently.
 # Set val_ratio=0 to train on all episodes without validation/early stopping.
 # Keep RGB identical on teacher and student paths, and use the saved normalizer.
 dataset:
-  # Same episode-level wrench filtering as the teacher and CAD-WM.
-  wrench_filter:
-    enabled: true
-    cutoff_hz: 2.0
-    source_key: observation.wrench
-    timestamp_key: timing.state_timestamp_ns
   val_ratio: 0.1 # Episode split for student early stopping, even if the teacher used all episodes.
   video_backend: null
   video_decode_device: cuda:0

@@ -37,7 +37,6 @@ DATA_DIR=/srv/dp/data
 MODEL_DIR=/srv/dp/model
 DATASET_PATH=/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
 DINOV3_MODEL_PATH=/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
-TEACHER_CHECKPOINT=/workspace/data/outputs/2026.11.01/22.57.02_091072_dp_distill_pipeline/teacher/checkpoints/optimizer_step=00180000.ckpt
 ```
 
 加载镜像并直接启动默认训练：
@@ -47,7 +46,7 @@ docker load -i docker/artifacts/diffusion-policy-train.tar
 docker compose -f docker/docker_compose.yaml up trainer
 ```
 
-默认命令是当前结构化 RenderNet 的纯 token MSE 蒸馏，使用固定的 11/01 教师 checkpoint。默认日志在前台显示；后台运行时使用：
+默认命令运行 `train_civi.py`：先训练使用当前 wrench 的教师，再按动作 MSE 选择权重并进行 RenderNet token MSE 蒸馏。默认输出为 `data/outputs/civi/current_wrench/teacher` 和 `student`。默认日志在前台显示；后台运行时使用：
 
 ```bash
 docker compose -f docker/docker_compose.yaml up -d trainer
@@ -56,11 +55,11 @@ docker compose -f docker/docker_compose.yaml logs -f trainer
 
 ## 覆盖训练命令
 
-Compose 通过 `TRAIN_COMMAND` 控制容器启动后执行的命令。运行 FDP 四卡训练：
+使用 `docker compose run` 覆盖默认命令，运行当前 wrench 教师与学生的四卡训练：
 
 ```bash
-TRAIN_COMMAND='torchrun --standalone --nproc_per_node=4 train.py --config-dir=diffusion_policy/config --config-name=train_dp_insert_usb_force_aware training.distributed.enabled=true' \
-  docker compose -f docker/docker_compose.yaml up trainer
+docker compose -f docker/docker_compose.yaml run --rm trainer \
+  python train_civi.py --gpus 0,1,2,3 --nproc-per-node 4
 ```
 
 进入容器做诊断：

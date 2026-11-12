@@ -1,0 +1,10 @@
+defaults:
+  - train_civi_teacher_xarm_clean
+  - _self_
+
+name: train_civi_teacher_huanggua_clean
+dataset_path: data/huanggua1103_25hz_3cam_lerobotv3_clean
+output_dir: data/outputs/civi/clean_tau_ext_20261111_rounds/huanggua/teacher
+
+task:
+  name: huanggua_clean_25hz_tau_ext

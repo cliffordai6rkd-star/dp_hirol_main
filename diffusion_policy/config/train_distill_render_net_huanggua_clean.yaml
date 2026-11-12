@@ -1,0 +1,14 @@
+defaults:
+  - train_distill_render_net_student
+  - _self_
+
+name: train_distill_render_net_huanggua_clean
+teacher_config: diffusion_policy/config/train_civi_teacher_huanggua_clean.yaml
+output_dir: data/outputs/civi/clean_tau_ext_20261111_rounds/huanggua/student
+
+render_net:
+  # Bound absolute RGB-channel change to 0.1 before the learned gate/clipping.
+  residual_scale: 0.1
+
+dataset:
+  video_decode_device: auto

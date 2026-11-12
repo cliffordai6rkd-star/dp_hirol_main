@@ -23,8 +23,8 @@ import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DP_CONFIG = "diffusion_policy/config/sim_force_aware_dp_train_20hz_lstm2_gripper.yaml"
-DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_patch_context.yaml"
+DEFAULT_DP_CONFIG = "diffusion_policy/config/train_civi_teacher.yaml"
+DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_student.yaml"
 
 
 def make_parser():
@@ -126,7 +126,12 @@ def stage_command(name, stage, plan, repo_root=REPO_ROOT):
                    f"--nproc_per_node={plan['nproc_per_node']}", script]
     else:
         command = [sys.executable, "-u", script]
-    command += ["--config", stage["config"], *stage["overrides"]]
+    command += ["--config", stage["config"]]
+    if name == "distill":
+        # This pipeline hands off a checkpoint whose saved config includes
+        # the teacher's actual data windows and overrides.
+        command += ["++teacher_config=null"]
+    command += stage["overrides"]
     if plan["nproc_per_node"] > 1:
         command += ["++training.distributed.enabled=true", "++training.distributed.timeout_seconds=86400"]
     if name == "distill":

@@ -57,6 +57,129 @@ def observations(batch=2):
     }
 
 
+def make_current_teacher():
+    teacher = make_teacher(
+        shape_meta={"obs": {
+            **{key: {"shape": shape, "type": "rgb"} for key, shape in IMAGE_SHAPES.items()},
+            "wrench": {"shape": (8, 6), "type": "low_dim"},
+        }, "action": {"shape": (8,)}},
+        wrench_key="wrench", phase_wrench_key="wrench", future_phase_wrench_key=None,
+        contact_force_dims=(0, 1, 2), contact_norm="l2",
+        contact_threshold=8., free_threshold=8.,
+    )
+    normalizer = LinearNormalizer()
+    normalizer.fit({
+        "wrench": torch.arange(600).reshape(100, 6).float() + 5,
+        "action": torch.randn(100, 8),
+    }, mode="gaussian")
+    teacher.set_normalizer(normalizer)
+    return teacher
+
+
+def current_observations():
+    wrench = torch.zeros(2, 2, 8, 6)
+    # Only the last five observed samples establish contact. Earlier samples
+    # must retain their values instead of receiving the future-prefix fill.
+    wrench[1, ..., 0] = torch.tensor([.1, .2, .3, 9., 10., 11., 12., 13.])
+    wrench[1, ..., 3] = torch.arange(8).float()
+    return {
+        **{key: torch.rand(2, 2, *shape) for key, shape in IMAGE_SHAPES.items()},
+        "wrench": wrench,
+    }
+
+
+def test_current_wrench_preprocessing_uses_only_observed_history_and_preserves_free_zero():
+    teacher = make_current_teacher()
+    obs = current_observations()
+    preprocessor = WrenchPreprocessor.from_policy(teacher)
+    assert preprocessor.required_keys == ("wrench",)
+    assert teacher.future_phase_wrench_key is None
+
+    _, normalized, contact, mask = teacher.prepare_context_inputs_with_future_contact(obs)
+    assert contact.tolist() == [[False, False], [True, True]]
+    assert mask.shape == (2, 2, 1)
+    torch.testing.assert_close(mask.squeeze(-1), contact, rtol=0, atol=0)
+    torch.testing.assert_close(preprocessor.contact_alpha(obs), contact.float(), rtol=0, atol=0)
+    assert teacher.normalizer["wrench"].normalize(obs["wrench"][0]).count_nonzero() > 0
+    assert normalized[0].count_nonzero() == 0
+    assert teacher._latest_processed_wrench[0].count_nonzero() == 0
+    torch.testing.assert_close(teacher._latest_processed_wrench[1], obs["wrench"][1], rtol=0, atol=0)
+    torch.testing.assert_close(
+        normalized[1], teacher.normalizer["wrench"].normalize(obs["wrench"][1]), rtol=0, atol=0,
+    )
+
+    restored = WrenchPreprocessor.from_config(preprocessor.get_config())
+    restored.load_state_dict(preprocessor.state_dict(), strict=True)
+    actual_wrench, actual_contact, actual_mask = restored.forward_with_future_contact(obs)
+    torch.testing.assert_close(actual_wrench, normalized, rtol=0, atol=0)
+    torch.testing.assert_close(actual_contact, contact, rtol=0, atol=0)
+    torch.testing.assert_close(actual_mask, mask, rtol=0, atol=0)
+
+
+def test_current_wrench_teacher_and_student_share_inputs_and_student_backpropagates():
+    from diffusion_policy.model.vision.render_net import RenderNet
+    from diffusion_policy.workspace.train_distill_render_net_workspace import student_context_tokens
+
+    teacher = make_current_teacher().requires_grad_(False)
+    obs = current_observations()
+    obs["contact_alpha"] = WrenchPreprocessor.from_policy(teacher).contact_alpha(obs)
+    renderer = RenderNet(
+        6, base_channels=4, conditioning_dim=16, embed_dim=16, num_heads=4,
+        image_self_attn_layers=1, cross_attn_layers=1, decoder_layers=3,
+        patch_size=8, image_keys=tuple(IMAGE_SHAPES),
+    ).train()
+    with torch.no_grad():
+        renderer.output.bias.fill_(.25)
+    seen = {}
+
+    def capture_teacher(module, args, kwargs):
+        seen["teacher_wrench"] = kwargs["wrench_history"].detach().clone()
+        seen["teacher_mask"] = kwargs["future_contact"].clone()
+        seen["teacher_alpha"] = kwargs["contact_alpha"].clone()
+
+    def capture_student(module, args, kwargs, output):
+        seen["student_wrench"] = args[1].detach().clone()
+        seen["student_mask"] = kwargs["future_contact"].clone()
+        seen["student_alpha"] = kwargs["contact_alpha"].clone()
+        seen["rendered"] = output[0]
+
+    handles = [
+        teacher.obs_encoder.register_forward_pre_hook(capture_teacher, with_kwargs=True),
+        renderer.register_forward_hook(capture_student, with_kwargs=True),
+    ]
+    try:
+        with torch.no_grad():
+            target = teacher._encode_context(obs, apply_curriculum_mask=False)
+        tokens = student_context_tokens(teacher, renderer, obs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    for field in ("wrench", "mask", "alpha"):
+        torch.testing.assert_close(seen[f"student_{field}"], seen[f"teacher_{field}"], rtol=0, atol=0)
+    for key in IMAGE_SHAPES:
+        torch.testing.assert_close(seen["rendered"][key][0], obs[key][0], rtol=0, atol=0)
+        assert not torch.equal(seen["rendered"][key][1], obs[key][1])
+    loss = torch.nn.functional.mse_loss(tokens, target)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert renderer.output.weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in teacher.parameters())
+
+
+def test_current_wrench_teacher_trains_and_predicts_without_future_observations():
+    teacher = make_current_teacher().train()
+    obs = current_observations()
+    loss = teacher.compute_loss({"obs": obs, "action": torch.randn(2, 9, 8)}, optimizer_step=0)
+    assert loss.ndim == 0 and torch.isfinite(loss)
+    loss.backward()
+    assert teacher.obs_encoder.wrench_projection.weight.grad.abs().sum() > 0
+    teacher.eval()
+    with torch.no_grad():
+        prediction = teacher.predict_action(obs)
+    assert prediction["action"].shape == (2, 8, 8)
+    assert torch.isfinite(prediction["action"]).all()
+
+
 def test_contact_alpha_formula_and_monotonicity():
     for token_count in (1, 2, 4, 8):
         values = []

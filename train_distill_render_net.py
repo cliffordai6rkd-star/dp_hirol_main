@@ -19,7 +19,7 @@ CONFIG_DIR = pathlib.Path(__file__).resolve().parent / "diffusion_policy" / "con
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="train_distill_render_net")
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="train_distill_render_net_student")
 def main(cfg):
     OmegaConf.resolve(cfg)
     distributed = initialize_distributed(cfg.training)

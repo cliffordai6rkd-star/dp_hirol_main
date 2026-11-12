@@ -17,6 +17,7 @@ data
 models
 model
 outputs
+cad-wm
 wandb
 docker/artifacts
 *.tar

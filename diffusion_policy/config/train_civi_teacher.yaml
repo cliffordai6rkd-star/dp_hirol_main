@@ -1,5 +1,7 @@
 name: train_civi_teacher
 _target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
+# Training requires observation.tau_ext; the bundled LIBERO dataset lacks it.
+# Override task.dataset.dataset_path with a compatible seven-axis torque dataset.
 dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
 dino_model_path: model/model/dinov3-vitb16-pretrain-lvd1689m
 task_name: libero_open_top_drawer_put_bowl_20hz_force_aware
@@ -17,15 +19,10 @@ shape_meta:
       - 192
       - 256
       type: rgb
-    wrench:
+    tau_ext:
       shape:
       - 8
-      - 6
-      type: low_dim
-    future_wrench:
-      shape:
-      - 8
-      - 6
+      - 7
       type: low_dim
   action:
   # xyz + quaternion + gripper
@@ -65,15 +62,10 @@ policy:
         - 192
         - 256
         type: rgb
-      wrench:
+      tau_ext:
         shape:
         - 8
-        - 6
-        type: low_dim
-      future_wrench:
-        shape:
-        - 8
-        - 6
+        - 7
         type: low_dim
     action:
       shape:
@@ -91,10 +83,9 @@ policy:
   horizon: 9
   n_action_steps: 8
   n_obs_steps: 2
-  wrench_key: future_wrench
-  phase_wrench_key: wrench
-  future_phase_wrench_key: future_wrench
-  future_contact_mode: legacy_rollout
+  wrench_key: tau_ext
+  phase_wrench_key: tau_ext
+  future_phase_wrench_key: null
   wrench_history_steps: 8
   relative_pose_actions: false
   action_reference_key: action_reference
@@ -125,6 +116,10 @@ policy:
   - 0
   - 1
   - 2
+  - 3
+  - 4
+  - 5
+  - 6
   contact_history_reducer: max
   contact_norm: l2
   input_gate_enabled: false
@@ -204,7 +199,7 @@ logging:
   - libero
   - 20hz
   - force-aware
-  - future-wrench
+  - current-tau-ext
   - dinov3
   - image-query
   - lstm2
@@ -227,13 +222,10 @@ checkpoint:
     batch_size: 16
 task:
   name: libero_open_top_drawer_put_bowl_20hz_force_aware
-  wrench_key: future_wrench
-  phase_wrench_key: wrench
-  future_phase_wrench_key: future_wrench
+  wrench_key: tau_ext
+  phase_wrench_key: tau_ext
+  future_phase_wrench_key: null
   wrench_history_steps: 8
-  future_wrench_steps: 8
-  future_wrench_start_offset: 1
-  future_wrench_stride: 1
   phase_wrench_steps: 8
   phase_wrench_stride: 1
   free_threshold: 8.0
@@ -244,9 +236,13 @@ task:
   - 0
   - 1
   - 2
+  - 3
+  - 4
+  - 5
+  - 6
   contact_history_reducer: max
   contact_norm: l2
-  phase_source_key: observation.wrench
+  phase_source_key: observation.tau_ext
   input_gate_enabled: false
   relative_pose_actions: false
   action_reference_key: action_reference
@@ -268,15 +264,10 @@ task:
         - 192
         - 256
         type: rgb
-      wrench:
+      tau_ext:
         shape:
         - 8
-        - 6
-        type: low_dim
-      future_wrench:
-        shape:
-        - 8
-        - 6
+        - 7
         type: low_dim
     action:
       shape:
@@ -301,15 +292,10 @@ task:
           - 192
           - 256
           type: rgb
-        wrench:
+        tau_ext:
           shape:
           - 8
-          - 6
-          type: low_dim
-        future_wrench:
-          shape:
-          - 8
-          - 6
+          - 7
           type: low_dim
       action:
         shape:
@@ -327,27 +313,12 @@ task:
       wrist: observation.images.wrist
       side: observation.images.side
     windowed_lowdim_feature_groups:
-      wrench:
-        source_key: observation.wrench
+      tau_ext:
+        source_key: observation.tau_ext
         steps: 8
+        # Causal measured history ending at each observation: t-7, ..., t.
         start_offset: -7
         stride: 1
-      future_wrench:
-        source_key: observation.wrench
-        steps: 8
-        start_offset: 1
-        stride: 1
-        anchor_timestamp_key: timing.camera_timestamp_ns
-        source_timestamp_key: timing.state_timestamp_ns
-        offsets_sec:
-        - 0.05
-        - 0.1
-        - 0.15
-        - 0.2
-        - 0.25
-        - 0.3
-        - 0.35
-        - 0.4
     action_feature_fields:
     - observation.ee_pose
     - action
@@ -357,7 +328,7 @@ task:
     wrench_filter:
       enabled: true
       cutoff_hz: 2.0
-      source_key: observation.wrench
+      source_key: observation.tau_ext
       timestamp_key: timing.state_timestamp_ns
     timestamp_step_sec: 0.05
     timestamp_tolerance_sec: null
@@ -370,10 +341,9 @@ task:
     image_cache_dtype: uint8
     image_cache_chunk_frames: 64
     phase_resampling_enabled: true
-    # Sampling phase follows the current measured, debounced wrench.
-    # Future-wrench contact does not turn a pre-contact anchor into contact.
+    # Sampling phase follows the current measured, debounced joint torques.
     phase_label_mode: current_wrench
-    phase_source_key: observation.wrench
+    phase_source_key: observation.tau_ext
     contact_threshold: 8.0
     contact_enter_frames: 5
     contact_exit_frames: 5
@@ -381,6 +351,10 @@ task:
     - 0
     - 1
     - 2
+    - 3
+    - 4
+    - 5
+    - 6
     contact_norm: l2
     precontact_seconds: ${phase_resampling.precontact_seconds}
     image_randomer_config:
@@ -397,4 +371,4 @@ task:
     action_feature_columns:
       action:
       - 6
-output_dir: data/outputs/civi/teacher
+output_dir: data/outputs/civi/current_tau_ext/teacher

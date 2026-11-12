@@ -1,15 +1,12 @@
-"""DP teacher/student and CAD-WM must see the same episode-filtered wrench."""
+"""Teacher and student share causal, episode-filtered force/torque observations."""
 
 import copy
-import importlib
 from pathlib import Path
 
-import h5py
 import numpy as np
 from omegaconf import OmegaConf
 import pytest
 import torch
-import yaml
 
 from diffusion_policy.common.wrench_filter import first_order_lowpass, relative_time_seconds
 from diffusion_policy.model.common.normalizer import LinearNormalizer
@@ -20,21 +17,26 @@ from diffusion_policy.workspace.train_distill_render_net_workspace import TrainD
 
 
 ROOT = Path(__file__).resolve().parents[1]
-cad_data = importlib.import_module("cad-wm.data_process.libero_wrench_dataset")
 
 
-@pytest.fixture
-def aligned_datasets(tmp_path, monkeypatch):
+@pytest.fixture(params=[("wrench", 6, (0, 1, 2)), ("tau_ext", 7, tuple(range(7)))],
+                ids=["wrench", "tau_ext"])
+def aligned_datasets(monkeypatch, request):
+    key, dimensions, contact_dims = request.param
+    source_key = "observation." + key
     size = 24
     clocks = np.rint((0.25 + np.arange(size) * .05) * 1e9).astype(np.int64)
-    first = np.zeros((size, 6), dtype=np.float32)
+    first = np.zeros((size, dimensions), dtype=np.float32)
     first[4:8, :3] = [20, 1, -1]
-    first[7, 3:] = [30, -20, 10]
-    second = np.tile(np.array([2, -1, 3, -2, 1, -3], dtype=np.float32), (size, 1))
+    first[7, 3:6] = [30, -20, 10]
+    if key == "tau_ext":
+        first[4:8, 6] = 20
+    resting = np.array([2, -1, 3, -2, 1, -3, 2][:dimensions], dtype=np.float32)
+    second = np.tile(resting, (size, 1))
     raw = np.concatenate((first, second))
     columns = {"timestamp": np.tile(np.arange(size) * .05, 2),
                "timing.state_timestamp_ns": np.tile(clocks, 2),
-               "observation.wrench": raw,
+               source_key: raw,
                "action": np.zeros((size * 2, 7), dtype=np.float32)}
 
     class FakeV3:
@@ -54,92 +56,113 @@ def aligned_datasets(tmp_path, monkeypatch):
 
     monkeypatch.setattr(v3_dataset, "LeRobotV3Dataset", FakeV3)
     config = dict(
-        shape_meta={"obs": {key: {"shape": [8, 6], "type": "low_dim"}
-                            for key in ("wrench", "future_wrench")}, "action": {"shape": [7]}},
+        shape_meta={"obs": {key: {"shape": [8, dimensions], "type": "low_dim"}},
+                    "action": {"shape": [7]}},
         dataset_path="unused", horizon=9, n_obs_steps=2, pad_before=1, val_ratio=.5,
         windowed_lowdim_feature_groups={
-            "wrench": {"source_key": "observation.wrench", "steps": 8, "start_offset": -7},
-            "future_wrench": {"source_key": "observation.wrench", "steps": 8, "start_offset": 1},
+            key: {"source_key": source_key, "steps": 8, "start_offset": -7},
         },
-        phase_resampling_enabled=True, phase_source_key="observation.wrench",
+        phase_resampling_enabled=True, phase_source_key=source_key,
         contact_threshold=8, contact_enter_frames=5, contact_exit_frames=5, contact_norm="l2",
-        wrench_filter={"enabled": True, "cutoff_hz": 2., "source_key": "observation.wrench",
+        contact_force_dims=contact_dims,
+        wrench_filter={"enabled": True, "cutoff_hz": 2., "source_key": source_key,
                        "timestamp_key": "timing.state_timestamp_ns"},
     )
     teacher = v3_dataset.LeRobotV3ImageDataset(**config)
     workspace = TrainDistillRenderNetWorkspace.__new__(TrainDistillRenderNetWorkspace)
     workspace.cfg = OmegaConf.load(ROOT / "diffusion_policy/config/train_distill_render_net_student.yaml")
-    workspace.cfg.dataset = {"val_ratio": .5}
+    workspace.cfg.dataset.val_ratio = .5
     workspace.teacher_cfg = OmegaConf.create({"task": {"dataset": config}})
     workspace.teacher_source_cfg = None
     student_config = OmegaConf.to_container(workspace._dataset_config(), resolve=True)
     student = v3_dataset.LeRobotV3ImageDataset(**student_config)
 
-    h5_path = tmp_path / "demos.hdf5"
-    with h5py.File(h5_path, "w") as file:
-        for episode, values in enumerate((first, second)):
-            demo = file.create_group(f"data/demo_{episode}")
-            demo.create_dataset("states", data=(clocks * 1e-9)[:, None])
-            for key, width in (("joint_states", 7), ("dq", 7), ("tau", 7)):
-                demo.create_dataset(f"obs/{key}", data=np.zeros((size, width), dtype=np.float32))
-            demo.create_dataset("obs/wrenches", data=values)
-    cad_config = yaml.safe_load((ROOT / "cad-wm/config/bench_train_config/libero_drawer_wrench_h5.yaml").read_text())
-    cad_config["dataloader"]["root"] = str(h5_path)
-    cad = cad_data.LiberoWrenchDataset(cad_config)
-    return teacher, student, cad, raw, config
+    return teacher, student, raw, config
 
 
-def test_full_episode_filter_matches_all_three_and_reuses_one_column(aligned_datasets):
-    teacher, student, cad, raw, _ = aligned_datasets
+def test_teacher_student_filter_matches_and_reuses_current_observation_column(aligned_datasets):
+    teacher, student, raw, config = aligned_datasets
+    key = next(iter(config["windowed_lowdim_feature_groups"]))
+    source_key = config["phase_source_key"]
     expected = np.concatenate([
         first_order_lowpass(np.arange(24) * .05, raw[start:start + 24], 2).astype(np.float32)
         for start in (0, 24)
     ])
     for dataset in (teacher, student):
-        actual = dataset._load_column("observation.wrench", np.float32)
+        actual = dataset._load_column(source_key, np.float32)
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
         np.testing.assert_array_equal(dataset._phase_source_data, actual)
-        # Both directions use the same filtered native row, even in overlapping windows.
-        np.testing.assert_array_equal(dataset.windowed_lowdim_data["future_wrench"][5, 0], actual[6])
-        np.testing.assert_array_equal(dataset.windowed_lowdim_data["wrench"][6, -1], actual[6])
-        np.testing.assert_array_equal(dataset._load_column("observation.wrench", np.float32), actual)
+        # Each history ends at the observed row and retains its temporal order.
+        np.testing.assert_array_equal(dataset.windowed_lowdim_data[key][6, -1], actual[6])
+        np.testing.assert_array_equal(dataset.windowed_lowdim_data[key][9], actual[2:10])
+        np.testing.assert_array_equal(dataset._load_column(source_key, np.float32), actual)
         validation = dataset.get_validation_dataset()
         assert validation._filtered_columns is dataset._filtered_columns
         assert validation.windowed_lowdim_data is dataset.windowed_lowdim_data
-    np.testing.assert_array_equal(teacher._filtered_columns["observation.wrench"],
-                                  student._filtered_columns["observation.wrench"])
-    np.testing.assert_allclose(cad.high_tensors["wrench"].numpy(), expected, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(teacher._filtered_columns[source_key],
+                                  student._filtered_columns[source_key])
     # State resets at the second demo, rather than inheriting the first demo's tail.
     np.testing.assert_array_equal(expected[24:], raw[24:])
     assert not np.array_equal(expected, raw)
-    cad.fit_normalizer(range(len(cad)))
-    torch.testing.assert_close(cad.normalizer.stats["wrench"]["mean"], cad.high_tensors["wrench"].mean(0))
-    expected_labels = torch.cat([cad_data.wrench_phase_labels(cad.high_tensors["wrench"][start:start + 24],
-                                                           cad.config, 20) for start in (0, 24)])
-    torch.testing.assert_close(cad.contact, expected_labels)
 
 
 def test_legacy_data_config_without_filter_keeps_original_values(aligned_datasets):
-    _, _, _, raw, config = aligned_datasets
+    _, _, raw, config = aligned_datasets
     legacy_config = copy.deepcopy(config)
     del legacy_config["wrench_filter"]
     dataset = v3_dataset.LeRobotV3ImageDataset(**legacy_config)
-    np.testing.assert_array_equal(dataset._load_column("observation.wrench", np.float32), raw)
+    np.testing.assert_array_equal(dataset._load_column(config["phase_source_key"], np.float32), raw)
 
 
-def test_active_configs_all_select_first_order_two_hz():
+@pytest.mark.parametrize("name,source_key", [
+    ("train_distill_render_net", "observation.tau_ext"),
+    ("train_distill_render_net_student", "observation.tau_ext"),
+    ("train_distill_render_net_student_test", "observation.wrench"),
+])
+def test_student_configs_select_matching_teacher_first_order_two_hz(name, source_key):
     teacher = OmegaConf.load(ROOT / "diffusion_policy/config/train_civi_teacher.yaml")
     assert teacher.task.dataset.wrench_filter.enabled
     assert teacher.task.dataset.wrench_filter.cutoff_hz == 2
-    for name in ("train_distill_render_net", "train_distill_render_net_student",
-                 "train_distill_render_net_student_test"):
-        config = OmegaConf.load(ROOT / f"diffusion_policy/config/{name}.yaml")
-        assert config.dataset.wrench_filter == teacher.task.dataset.wrench_filter
-    for name in ("libero_drawer_wrench_h5", "libero_drawer_wrench_h5_median3"):
-        config = yaml.safe_load((ROOT / f"cad-wm/config/bench_train_config/{name}.yaml").read_text())
-        assert config["dataloader"]["wrench_filter"]["enabled"]
-        assert config["dataloader"]["wrench_filter"]["cutoff_hz"] == 2
-        assert "median3" not in config["dataloader"]["root"]
+    assert teacher.task.dataset.wrench_filter.source_key == "observation.tau_ext"
+    workspace = TrainDistillRenderNetWorkspace.__new__(TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.load(ROOT / f"diffusion_policy/config/{name}.yaml")
+    workspace.teacher_cfg = teacher
+    workspace.teacher_source_cfg = None
+    if source_key == "observation.tau_ext":
+        assert "wrench_filter" not in workspace.cfg.dataset
+        assert workspace._dataset_config().wrench_filter == teacher.task.dataset.wrench_filter
+    else:
+        # The historical student keeps its explicit filter for its wrench checkpoint.
+        assert workspace.cfg.dataset.wrench_filter.source_key == source_key
+    effective_filter = workspace._dataset_config().wrench_filter
+    assert effective_filter.enabled
+    assert effective_filter.cutoff_hz == 2
+    assert effective_filter.source_key == source_key
+
+
+def test_future_measurements_cannot_change_current_observation_or_contact(aligned_datasets):
+    teacher, _, raw, config = aligned_datasets
+    key = next(iter(config["windowed_lowdim_feature_groups"]))
+    raw[10:24] += 100.0
+    changed = v3_dataset.LeRobotV3ImageDataset(**config)
+    np.testing.assert_array_equal(
+        changed.windowed_lowdim_data[key][:10],
+        teacher.windowed_lowdim_data[key][:10],
+    )
+    assert not np.array_equal(
+        changed.windowed_lowdim_data[key][10:24],
+        teacher.windowed_lowdim_data[key][10:24],
+    )
+    preprocessor = WrenchPreprocessor(
+        2, key, key, None,
+        HysteresisContactDetector(8., 8., enter_frames=5, exit_frames=5, norm="l2",
+                                  force_dims=config["contact_force_dims"]),
+        VectorThresholdGate(0., enabled=False), LinearNormalizer(),
+    )
+    labels = [preprocessor.contact_alpha({
+        key: torch.from_numpy(dataset.windowed_lowdim_data[key][8:10]).unsqueeze(0),
+    }) for dataset in (teacher, changed)]
+    torch.testing.assert_close(labels[0], labels[1], rtol=0, atol=0)
 
 
 def test_integer_epoch_nanoseconds_keep_interval_precision():
@@ -148,10 +171,12 @@ def test_integer_epoch_nanoseconds_keep_interval_precision():
 
 
 def test_dataloader_returns_cached_alpha_from_the_teacher_contact_rules(aligned_datasets):
-    teacher, student, _, _, _ = aligned_datasets
+    teacher, student, _, config = aligned_datasets
+    key = next(iter(config["windowed_lowdim_feature_groups"]))
     preprocessor = WrenchPreprocessor(
-        2, "future_wrench", "wrench", "future_wrench",
-        HysteresisContactDetector(8., 8., enter_frames=5, exit_frames=5, norm="l2"),
+        2, key, key, None,
+        HysteresisContactDetector(8., 8., enter_frames=5, exit_frames=5, norm="l2",
+                                  force_dims=config["contact_force_dims"]),
         VectorThresholdGate(0., enabled=False), LinearNormalizer(),
     )
     labels = []
@@ -166,7 +191,8 @@ def test_dataloader_returns_cached_alpha_from_the_teacher_contact_rules(aligned_
             batches.append(obs["contact_alpha"])
         labels.append(torch.cat(batches))
         assert (labels[-1] == 0).any()
-        assert ((labels[-1] > 0) & (labels[-1] < 1)).any()
+        assert (labels[-1] == 1).any()
+        assert torch.all((labels[-1] == 0) | (labels[-1] == 1))
         cache_size = len(dataset._contact_alpha_cache)
         evaluation[0]
         assert len(dataset._contact_alpha_cache) == cache_size

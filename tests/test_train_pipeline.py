@@ -7,6 +7,31 @@ import pytest
 import train_pipeline as pipeline
 
 
+def test_default_student_uses_checkpoint_data_config_and_allows_explicit_source(tmp_path):
+    from diffusion_policy.common.checkpoint_action_mse import resolve_student_teacher
+    from diffusion_policy.common.config_cli import load_config_reference
+
+    checkpoint = tmp_path / "current teacher.ckpt"
+    checkpoint.touch()
+    args = pipeline.make_parser().parse_args([
+        "distill", "--teacher-checkpoint", str(checkpoint),
+        "--output-dir", str(tmp_path / "pipeline"),
+    ])
+    plan = pipeline.build_plan(args)
+    stage = plan["stages"]["distill"]
+    command = pipeline.stage_command("distill", stage, plan)
+    cfg = load_config_reference(stage["config"], command[command.index("--config") + 2:])
+    selected, source = resolve_student_teacher(cfg)
+    assert selected == checkpoint
+    assert source is None  # Workspace will inherit the checkpoint's data config.
+
+    stage["overrides"] = ["teacher_config=" + str(pipeline.REPO_ROOT / pipeline.DEFAULT_DP_CONFIG)]
+    command = pipeline.stage_command("distill", stage, plan)
+    cfg = load_config_reference(stage["config"], command[command.index("--config") + 2:])
+    _, source = resolve_student_teacher(cfg)
+    assert source.policy.wrench_key == "tau_ext"
+
+
 @pytest.fixture
 def repository(tmp_path):
     root = tmp_path / "repo with spaces"

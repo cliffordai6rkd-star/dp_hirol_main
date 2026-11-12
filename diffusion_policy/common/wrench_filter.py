@@ -1,4 +1,4 @@
-"""Episode-local, physical-unit first-order wrench filtering."""
+"""Episode-local, physical-unit first-order force/torque filtering."""
 
 import math
 
@@ -18,16 +18,17 @@ def first_order_lowpass(times, values, cutoff_hz):
     """Causal one-pole: y[0]=x[0], alpha=1-exp(-2*pi*fc*dt).
 
     Call once per complete episode, before constructing observation windows or
-    fitting normalization statistics. Each of the six channels is independent.
+    fitting normalization statistics. Each force/torque channel is independent.
     """
     if not math.isfinite(cutoff_hz) or cutoff_hz <= 0:
         raise ValueError("Wrench filter cutoff_hz (--cutoff-hz) must be positive and finite")
     times = np.asarray(times, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
-    if times.ndim != 1 or not len(times) or values.shape != (len(times), 6):
-        raise ValueError("Expected timestamps [N] and six-axis wrench [N, 6], with N >= 1")
+    if (times.ndim != 1 or not len(times) or values.ndim != 2
+            or values.shape[0] != len(times) or values.shape[1] < 1):
+        raise ValueError("Expected timestamps [N] and force/torque values [N, D], with N, D >= 1")
     if not np.isfinite(times).all() or not np.isfinite(values).all():
-        raise ValueError("Timestamps and wrench must contain only finite values")
+        raise ValueError("Timestamps and force/torque values must contain only finite values")
     intervals = np.diff(times)
     if np.any(intervals <= 0):
         raise ValueError("Timestamps must strictly increase within the selected episode")

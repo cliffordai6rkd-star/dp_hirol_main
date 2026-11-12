@@ -1,5 +1,6 @@
 import os
 import inspect
+from importlib import import_module
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
@@ -34,6 +35,34 @@ def _repo_id_from_root(root: Path, repo_id: Optional[str] = None) -> str:
     if repo_id:
         return repo_id
     return root.name or "local_lerobot_dataset"
+
+
+def _local_reader_dataset_class(dataset_class):
+    class LocalLeRobotDataset(dataset_class):
+        def load_hf_dataset(self):
+            import datasets
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            utils = import_module(dataset_class.__module__.rsplit(".", 1)[0] + ".utils")
+            features = utils.get_hf_features_from_features(self.features)
+            data_root = self.root / "data"
+            paths = sorted(data_root.glob("*/*.parquet"))
+            if paths:
+                schema = pq.read_schema(paths[0])
+                for key, feature in features.items():
+                    if not isinstance(feature, datasets.Value) or key not in schema.names:
+                        continue
+                    arrow_type = schema.field(key).type
+                    # LeRobot maps shape (1,) to a scalar, but local derived
+                    # fields may retain a one-element vector in their Parquet.
+                    if pa.types.is_fixed_size_list(arrow_type) and arrow_type.list_size == 1:
+                        features[key] = datasets.Sequence(feature=feature, length=1)
+            hf_dataset = utils.load_nested_dataset(data_root, features=features)
+            hf_dataset.set_transform(utils.hf_transform_to_torch)
+            return hf_dataset
+
+    return LocalLeRobotDataset
 
 
 def _feature_spec_for_lerobot(features: Mapping[str, Mapping], use_videos: bool) -> OrderedDict:
@@ -162,7 +191,7 @@ class LeRobotV3Dataset:
                     f"Local LeRobot dataset is incomplete at {self.root}. Missing: {missing}"
                 )
 
-        self.dataset = LeRobotDataset(
+        self.dataset = _local_reader_dataset_class(LeRobotDataset)(
             repo_id=_repo_id_from_root(self.root, repo_id),
             root=self.root,
             video_backend=video_backend,

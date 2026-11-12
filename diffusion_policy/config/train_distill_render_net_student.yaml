@@ -7,9 +7,9 @@ teacher_config: diffusion_policy/config/train_civi_teacher.yaml
 teacher_config_overrides: []
 teacher_output_dir: null # 默认读取 teacher-config 的 output_dir。
 teacher_checkpoint: null # 填入 .ckpt 路径可直接指定权重；null 时按 MSE 自动选择。
-output_dir: data/outputs/civi/student
+output_dir: data/outputs/civi/current_tau_ext/student
 
-# 冻结 teacher，以其 context tokens 监督学生 RGB 渲染。
+# 冻结当前 tau_ext 教师，以其 context tokens 监督学生 RGB 渲染。
 distillation:
   objective: token_mse
   use_teacher_ffn: false # 教师和学生都使用融合 FFN 之前的 context token。
@@ -75,11 +75,7 @@ render_net:
 # 数据集和时间窗口读取 teacher-config；normalizer 读取所选教师 checkpoint。
 # 这里只列学生对教师数据配置的覆盖项，单独划分学生验证集。
 dataset:
-  wrench_filter:
-    enabled: true
-    cutoff_hz: 2.0
-    source_key: observation.wrench
-    timestamp_key: timing.state_timestamp_ns
+  # 滤波配置随教师继承，确保 tau_ext 预处理一致。
   val_ratio: 0.1
   video_backend: pyav
   video_decode_device: cuda:0

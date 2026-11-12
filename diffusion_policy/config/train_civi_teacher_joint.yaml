@@ -8,7 +8,7 @@ defaults:
 
 name: train_civi_teacher_joint
 exp_name: train_civi_teacher_joint
-output_dir: data/outputs/civi/teacher_joint_phase111
+output_dir: data/outputs/civi/current_tau_ext/teacher_joint_phase111
 
 phase_resampling:
   weights:

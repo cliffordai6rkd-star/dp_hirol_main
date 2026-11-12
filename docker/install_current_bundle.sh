@@ -27,7 +27,7 @@ destination="$(cd -- "$destination" && pwd)"
 echo '2/3 导入训练环境镜像'
 cat diffusion-policy-train.tar.part-00 diffusion-policy-train.tar.part-01 \
     diffusion-policy-train.tar.part-02 diffusion-policy-train.tar.part-03 | docker load
-echo '3/3 解压当前源码、数据、DINO 和世界模型 H5 到服务器磁盘'
+echo '3/3 解压当前源码、训练数据和 DINO 到服务器磁盘'
 tar --no-same-owner -xzf dp_main-current-source-data-model.tar.gz -C "$destination"
 mkdir -p -- "$destination/dp_main/data/cache" "$destination/dp_main/data/outputs" \
     "$destination/dp_main/.cache/huggingface" "$destination/dp_main/.cache/torch"

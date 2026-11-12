@@ -87,11 +87,11 @@ bash docker/run_portable.sh all
 
 `all` 才会开始正式训练，按顺序运行：
 
-1. 教师：`sim_force_aware_dp_train.yaml`，未来逐点接触 alpha + FACTR 图像模糊课程。
-2. 学生：`train_distill_render_net_patch_context.yaml`，自动读取刚训练的教师 checkpoint，重新生成兼容的教师目标。
+1. 教师：`train_civi_teacher.yaml`，使用截至当前观察帧的八个 wrench 采样与接触标签，保留图像模糊课程。
+2. 学生：`train_distill_render_net_student.yaml`，自动读取刚训练的教师 checkpoint，重新生成接触监督并蒸馏到渲染图像。
 
-两阶段都启动与可见 GPU 数量相同的进程。全局 batch size 保持 32，由各卡平分；默认适用于 1、2、4、8 卡等能整除 32 的数量。
-数据默认使用 `libero_open_top_drawer_put_bowl_20hz_lerobot_v3`。动作、网络层数、未来采样网格和 loss 均沿用现有配置。
+两阶段都启动与可见 GPU 数量相同的进程。教师全局 batch size 为 128，学生为 16，由各卡平分；默认适用于 1、2、4、8 卡等能整除 16 的数量。
+数据默认使用 `libero_open_top_drawer_put_bowl_20hz_lerobot_v3`。wrench 输入只包含当前及过去观测，不需要未来力或世界模型；教师动作网络架构保持不变，学生使用 token MSE。
 部署入口选择 CPU/PyAV 解码，首次迁移关闭学生 `torch.compile`，可在确认运行后用覆盖项启用；这不改变学生网络。
 W&B 使用离线模式，本地 DINO 无需联网下载。
 
@@ -124,7 +124,7 @@ student/checkpoints/           学生权重
 终端退出会中断前台训练；长时间运行可放在 `tmux` 会话中。`Ctrl+C` 会停止当前训练进程。
 学生教师目标缓存位于 `data/cache/render_net_teacher`，当前配置结束时清理。
 
-新预处理和 contact alpha 改变教师的条件表示，需要微调或重训并验证动作性能后再生成蒸馏目标。
+当前 wrench 改变教师的输入语义，需要重训教师后再生成学生蒸馏目标；历史 future-wrench checkpoint 保留其原有语义。
 `all` 自动衔接两阶段；如果要先验收教师的动作表现，使用 `dp` 单独训练，再使用 `distill`：
 
 ```bash

@@ -99,7 +99,10 @@ def preprocess_wrench(raw_wrench, raw_phase_wrench, raw_future_phase_wrench, *,
     else:
         contact_for_wrench = contact[:, :, None, None]
         gated_wrench = torch.where(contact_for_wrench, raw_wrench, torch.zeros_like(raw_wrench))
-        model_wrench_mask = gate_mask.unsqueeze(-1) if shared_phase_signal else contact_for_wrench
+        model_wrench_mask = (
+            contact_for_wrench & gate_mask.unsqueeze(-1)
+            if shared_phase_signal else contact_for_wrench
+        )
     normalized_wrench = normalizer[wrench_key].normalize(gated_wrench)
     # A suppressed physical zero must stay zero after a nonzero-mean normalizer.
     normalized_wrench = torch.where(model_wrench_mask, normalized_wrench,
