@@ -1,4 +1,4 @@
-"""Recorded wrench and contact intervals for offline attention videos."""
+"""Recorded wrench/joint torque and contact intervals for attention videos."""
 
 from __future__ import annotations
 
@@ -45,8 +45,11 @@ def load_episode_wrench(dataset, policy, episode, anchors, dataset_fps):
         source = dataset._load_column(source_key, dtype=np.float32)
     episode_range = dataset.episode_ranges[episode]
     values = np.asarray(source[episode_range.start:episode_range.stop], dtype=np.float32)
-    if values.ndim != 2 or values.shape[1] != 6 or not np.isfinite(values).all():
-        raise ValueError(f"Physical wrench plotting requires finite [N, 6] data in {source_key!r}; got {values.shape}")
+    if values.ndim != 2 or values.shape[1] not in (6, 7) or not np.isfinite(values).all():
+        raise ValueError(f"Physical signal plotting requires finite [N, 6] wrench or [N, 7] joint torques in {source_key!r}; got {values.shape}")
+    joint_torques = values.shape[1] == 7
+    if source_key.rsplit(".", 1)[-1].startswith("tau_ext") and not joint_torques:
+        raise ValueError(f"Joint torque source {source_key!r} requires seven channels; got {values.shape}")
     timestamps = np.asarray(dataset.timestamps[episode_range.start:episode_range.stop], dtype=np.float64)
     timestamp_key = getattr(dataset, "timestamp_key", "timestamp")
     if hasattr(dataset, "_timestamp_seconds"):
@@ -103,14 +106,20 @@ def load_episode_wrench(dataset, policy, episode, anchors, dataset_fps):
     intervals = np.asarray([(time_edges[start], time_edges[stop])
                             for start, stop in zip(starts, stops)], dtype=np.float64).reshape(-1, 2)
     metadata = {
-        "source_key": source_key, "channels": ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"],
-        "units": ["N", "N", "N", "N m", "N m", "N m"],
-        "values": "Recorded current wrench, before model normalization or input gating; not future_wrench",
+        "source_key": source_key,
+        "signal_type": "joint_torque" if joint_torques else "wrench",
+        "channels": ([f"J{index + 1}" for index in range(7)] if joint_torques
+                     else ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]),
+        "units": ["Nm"] * 7 if joint_torques else ["N", "N", "N", "N m", "N m", "N m"],
+        "values": ("Recorded current tau_ext joint torques, before model normalization or input gating"
+                   if joint_torques else
+                   "Recorded current wrench, before model normalization or input gating; not future_wrench"),
         "timestamp_key": timestamp_key,
         "time_axis": "Recorded source timestamp minus the first source timestamp of this episode",
         "source_frames": len(values), "displayed_attention_frames": len(offsets),
         "contact": {
-            "source": "derived_from_recorded_wrench", "rule_source": rule_source,
+            "source": "derived_from_recorded_tau_ext" if joint_torques else "derived_from_recorded_wrench",
+            "rule_source": rule_source,
             "force_dims": list(force_dims), "norm": norm,
             "contact_threshold": contact_threshold, "free_threshold": free_threshold,
             "enter_frames": enter_frames, "exit_frames": exit_frames,
@@ -140,23 +149,30 @@ class WrenchEpisodePlot:
         self.canvas = FigureCanvasAgg(self.figure)
         self.axes = self.figure.subplots(2, 1, sharex=True)
         self.figure.subplots_adjust(left=0.15, right=0.97, bottom=0.12, top=0.84, hspace=0.27)
-        colors = ("#1f77b4", "#ff7f0e", "#2ca02c")
         times, values = timeline["times"], timeline["values"]
+        metadata = timeline["metadata"]
+        self.joint_torques = metadata.get("signal_type") == "joint_torque"
+        labels = metadata["channels"]
+        if self.joint_torques:
+            groups = ((range(4), "Joint torque (Nm)"), (range(4, 7), "Joint torque (Nm)"))
+            colors = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2")
+        else:
+            groups = ((range(3), "Force (N)"), (range(3, 6), "Torque (N m)"))
+            colors = ("#1f77b4", "#ff7f0e", "#2ca02c") * 2
         self.cursors, self.markers = [], []
-        for row, (ax, ylabel, labels) in enumerate(zip(
-            self.axes, ("Force (N)", "Torque (N m)"), (("Fx", "Fy", "Fz"), ("Tx", "Ty", "Tz"))
-        )):
+        for ax, (channels, ylabel) in zip(self.axes, groups):
             for start, stop in timeline["contact_intervals_sec"]:
                 ax.axvspan(start, stop, color="#e9b96e", alpha=0.35, linewidth=0)
-            for channel, (name, color) in enumerate(zip(labels, colors)):
-                ax.plot(times, values[:, row * 3 + channel], label=name, color=color, linewidth=1.25)
+            for channel in channels:
+                name, color = labels[channel], colors[channel]
+                ax.plot(times, values[:, channel], label=name, color=color, linewidth=1.25)
                 marker, = ax.plot([], [], "o", color=color, markersize=3)
                 self.markers.append(marker)
             ax.set_ylabel(ylabel, fontsize=9)
             ax.grid(True, color="#dddddd", linewidth=0.6)
             ax.tick_params(labelsize=8)
             ax.spines[["top", "right"]].set_visible(False)
-            ax.legend(loc="upper right", ncol=3, fontsize=8, framealpha=0.85,
+            ax.legend(loc="upper right", ncol=len(channels), fontsize=8, framealpha=0.85,
                       handlelength=1.2, columnspacing=0.7)
             ax.margins(x=0, y=0.15)
             self.cursors.append(ax.axvline(times[0], color="#303030", linestyle="--", linewidth=1))
@@ -165,18 +181,23 @@ class WrenchEpisodePlot:
             self.axes[-1].set_xlim(times[0] - 0.05, times[0] + 0.05)
         self.status = self.figure.text(0.15, 0.945, "", fontsize=10, weight="bold")
         contact_cfg = timeline["metadata"]["contact"]
-        dims = "xyz" if contact_cfg["force_dims"] == [0, 1, 2] else str(contact_cfg["force_dims"])
+        if self.joint_torques:
+            dims = ",".join(labels[index] for index in contact_cfg["force_dims"])
+            signal = "tau_ext" if contact_cfg["force_dims"] == list(range(7)) else f"tau_ext[{dims}]"
+        else:
+            dims = "xyz" if contact_cfg["force_dims"] == [0, 1, 2] else str(contact_cfg["force_dims"])
+            signal = f"F{dims}"
         norm = "2" if contact_cfg["norm"] == "l2" else "1"
         enter, leave = contact_cfg["contact_threshold"], contact_cfg["free_threshold"]
         thresholds = (f"> {enter:g}, < {leave:g}"
                       if contact_cfg["annotation_mode"] == "offline_backdated_confirmation_windows"
                       else f"> {enter:g}")
-        self.figure.text(0.15, 0.897, f"Shaded: derived contact | ||F{dims}||{norm} {thresholds}",
+        self.figure.text(0.15, 0.897, f"Shaded: derived contact | ||{signal}||{norm} {thresholds}",
                          fontsize=8, color="#555555")
         confirmation_label = (
             f"{contact_cfg['enter_frames']}/{contact_cfg['exit_frames']}-frame confirmation | boundaries backdated to window start"
             if contact_cfg["annotation_mode"] == "offline_backdated_confirmation_windows"
-            else "Per-frame threshold | current raw wrench"
+            else f"Per-frame threshold | current recorded {'tau_ext' if self.joint_torques else 'wrench'}"
         )
         self.figure.text(0.15, 0.862, confirmation_label, fontsize=8, color="#555555")
 
@@ -185,7 +206,10 @@ class WrenchEpisodePlot:
         index = int(np.argmin(np.abs(times - current_time)))
         state = "CONTACT" if self.timeline["contact"][index] else "FREE"
         magnitude = self.timeline["contact_magnitude"][index]
-        self.status.set_text(f"t = {current_time:.2f} s   |   {state}   |   force norm = {magnitude:.2f}")
+        if self.joint_torques:
+            self.status.set_text(f"t={current_time:.2f}s | {state} | tau_ext norm = {magnitude:.2f}")
+        else:
+            self.status.set_text(f"t = {current_time:.2f} s   |   {state}   |   force norm = {magnitude:.2f}")
         for cursor in self.cursors:
             cursor.set_xdata([current_time, current_time])
         for channel, marker in enumerate(self.markers):
@@ -197,7 +221,8 @@ class WrenchEpisodePlot:
         """Export the complete data plot without a selected observation cursor."""
         for artist in (*self.cursors, *self.markers):
             artist.set_visible(False)
-        self.status.set_text("Recorded six-axis wrench and derived contact")
+        self.status.set_text("Recorded seven-axis tau_ext and derived contact" if self.joint_torques
+                             else "Recorded six-axis wrench and derived contact")
         self.figure.savefig(path, dpi=200, facecolor="white")
         for artist in (*self.cursors, *self.markers):
             artist.set_visible(True)

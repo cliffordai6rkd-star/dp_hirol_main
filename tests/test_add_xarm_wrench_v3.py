@@ -161,11 +161,13 @@ def test_threshold_is_joint_vector_l1_and_equality_is_retained():
     np.testing.assert_array_equal(gated, np.zeros(7))
 
 
-def test_causal_export_matches_online_and_future_does_not_change_prefix(tmp_path):
+@pytest.mark.parametrize("window", [1, 5])
+def test_causal_export_matches_online_and_future_does_not_change_prefix(tmp_path, window):
     from diffusion_policy.common.xarm_tau_ext import CausalTauExt, TauExtConfig
     args = options(tmp_path, "--filter-mode", "causal", "--contact-threshold-l1", "14",
                    "--convention", "tool-on-environment", "--cutoff-hz", "3",
                    "--torque-bias", "1", "2", "3", "4", "5", "6", "7")
+    args.tau_ext_smoothing_window = window
     rng = np.random.default_rng(12)
     n = 60
     q0, tau0, _ = physical_sample(args, np.zeros(6))
@@ -191,3 +193,35 @@ def test_causal_export_matches_online_and_future_does_not_change_prefix(tmp_path
     online.reset()
     reset = online.update(q[0], dq[0], tau[0], 0)
     np.testing.assert_array_equal(reset["tau_ext"], samples[0]["tau_ext"])
+
+
+def test_trailing_signed_mean_precedes_threshold_and_resets():
+    from diffusion_policy.common.xarm_tau_ext import CausalTauExt, TauExtConfig
+    config = TauExtConfig(cutoff_hz=0, compensation="none",
+                          tau_ext_smoothing_window=5, contact_threshold_l1=12.5)
+    processor = CausalTauExt(DEFAULT_URDF, config)
+    # Cancellation must happen before taking absolute values; no future/zero padding.
+    torques = np.zeros((9, 7), np.float32)
+    torques[:, 0] = [12.5, -12.5, 30, 40, -5, 60, 70, 80, -100]
+    torques[:, 1] = [0, 0, -2, -3, 4, -5, 6, -7, 8]
+    samples = [processor.update(np.zeros(7), np.zeros(7), tau, i / 25)
+               for i, tau in enumerate(torques)]
+    expected = np.asarray([torques[max(0, i-4):i+1].mean(0, dtype=np.float64)
+                           for i in range(len(torques))], np.float32)
+    np.testing.assert_array_equal([s["tau_ext_unthresholded"] for s in samples], expected)
+    assert samples[0]["contact"]  # Equality retained, first sample not divided by five.
+    assert not samples[1]["contact"]  # Opposite signed vectors cancel.
+    for sample, raw in zip(samples, expected):
+        l1 = np.abs(raw.astype(np.float64)).sum()
+        assert sample["tau_ext_l1"] == l1
+        np.testing.assert_array_equal(sample["tau_ext"], raw if l1 >= 12.5 else np.zeros(7))
+    processor.reset()
+    reset = processor.update(np.zeros(7), np.zeros(7), torques[0], 0)
+    np.testing.assert_array_equal(reset["tau_ext_unthresholded"], torques[0])
+
+
+@pytest.mark.parametrize("window", [0, -1, 2.5, True])
+def test_invalid_tau_ext_smoothing_window_is_rejected(window):
+    from diffusion_policy.common.xarm_tau_ext import CausalTauExt, TauExtConfig
+    with pytest.raises(ValueError, match="positive integer"):
+        CausalTauExt(DEFAULT_URDF, TauExtConfig(tau_ext_smoothing_window=window))

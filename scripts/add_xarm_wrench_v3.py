@@ -56,6 +56,8 @@ def solve_wrench(jacobian, tau_ext, damping):
 class WrenchEstimator:
     def __init__(self, args):
         self.args = args
+        if args.filter_mode != "causal" and getattr(args, "tau_ext_smoothing_window", 1) != 1:
+            raise ValueError("tau_ext smoothing requires filter_mode=causal")
         self.model = build_arm_model(args.urdf, TauExtConfig.from_args(args))
         frame = self.model.frames[self.model.getFrameId(args.ee_frame)]
         tcp = frame.placement * pin.SE3(np.eye(3), np.asarray(args.tcp_offset))
@@ -204,6 +206,7 @@ def export_dataset(args):
     if info["codebase_version"] != "v3.0":
         raise ValueError("Expected a LeRobot v3.0 dataset")
     args.fps = float(info["fps"])
+    processing_config = TauExtConfig.from_args(args)
     if not 0 <= args.cutoff_hz < args.fps / 2:
         raise ValueError("Cutoff must be zero (disabled), or below Nyquist")
     files = sorted((source / "data").rglob("*.parquet"))
@@ -307,7 +310,7 @@ def export_dataset(args):
                             "Torque reconstruction RMS is not a ground-truth wrench accuracy measurement"],
         }
         write_json(staging / "meta/tau_ext_processing.json", {
-            "config": TauExtConfig.from_args(args).to_dict(),
+            "config": processing_config.to_dict(),
             "filter_mode": args.filter_mode,
             "urdf_sha256": manifest["urdf_sha256"],
             "sos_coefficients": (butter(2, args.cutoff_hz, fs=args.fps, output="sos").tolist()
@@ -318,7 +321,16 @@ def export_dataset(args):
             "ddq_processing": ("backward difference of filtered dq using current minus previous timestamp; first sample zero"
                                if args.filter_mode == "causal" else "np.gradient(filtered dq, timestamps), central inside, one-sided at endpoints"),
             "causal_filter_initialization": "sosfilt_zi multiplied by first sample, independently for dq and tau; reset per episode/rollout",
-            "postprocessing": "no tau_ext smoothing, clipping, normalization or abs per component; gate entire seven-vector when its L1 < threshold; equality retained",
+            "tau_ext_smoothing": {
+                "window_samples": processing_config.tau_ext_smoothing_window,
+                "causal": True,
+                "stage": "signed tau_ext after dynamics compensation, before L1 and threshold",
+                "rule": "mean of current and previous window_samples-1 vectors; use available samples at episode start; reset per episode/rollout",
+            },
+            "postprocessing": (
+                f"causal trailing mean of signed tau_ext over {processing_config.tau_ext_smoothing_window} samples; "
+                "no clipping, normalization or abs per component; gate entire seven-vector when its L1 < threshold; equality retained"
+            ),
             "pre_gate_field": "observation.tau_ext_unthresholded",
             "pre_gate_l1_field": "observation.tau_ext_l1",
             "online_runtime": "diffusion_policy.common.xarm_tau_ext.CausalTauExt.from_bundle(dataset_root)",

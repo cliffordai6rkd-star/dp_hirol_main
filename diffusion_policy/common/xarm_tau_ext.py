@@ -4,6 +4,7 @@ No dataset/plotting dependencies. Use CausalTauExt.from_bundle(dataset_root),
 then update(q_rad, dq_rad_s, tau_Nm, timestamp_seconds) at the saved sample rate.
 """
 from dataclasses import asdict, dataclass
+from collections import deque
 import hashlib
 import json
 from pathlib import Path
@@ -19,6 +20,7 @@ class TauExtConfig:
     fps: float = 25.
     cutoff_hz: float = 3.
     contact_threshold_l1: float = 14.
+    tau_ext_smoothing_window: int = 1
     convention: str = "tool-on-environment"
     compensation: str = "dynamics"
     ee_frame: str = "link_eef"
@@ -31,7 +33,7 @@ class TauExtConfig:
     @classmethod
     def from_args(cls, args):
         return cls(**{name: getattr(args, name) for name in cls.__dataclass_fields__
-                      if name != "version"})
+                      if name != "version" and hasattr(args, name)})
 
     def to_dict(self):
         return asdict(self)
@@ -72,6 +74,10 @@ class CausalTauExt:
                 or config.fps <= 0 or not 0 <= config.cutoff_hz < config.fps / 2
                 or config.contact_threshold_l1 < 0):
             raise ValueError("Invalid FPS, cutoff or threshold")
+        if (isinstance(config.tau_ext_smoothing_window, bool)
+                or not isinstance(config.tau_ext_smoothing_window, (int, np.integer))
+                or config.tau_ext_smoothing_window < 1):
+            raise ValueError("tau_ext_smoothing_window must be a positive integer")
         if config.convention not in {"tool-on-environment", "environment-on-tool"}:
             raise ValueError("Invalid torque sign convention")
         if config.compensation not in {"dynamics", "gravity", "none"}:
@@ -98,6 +104,7 @@ class CausalTauExt:
         self.last_time = None
         self.last_dq = None
         self.dq_state = self.tau_state = None
+        self.tau_ext_history = deque(maxlen=self.config.tau_ext_smoothing_window)
 
     def update(self, q, dq, tau, timestamp_s):
         q, dq, tau = [np.asarray(x, dtype=np.float64) for x in (q, dq, tau)]
@@ -135,6 +142,10 @@ class CausalTauExt:
             raw = -raw
         if not np.isfinite(raw).all():
             raise ValueError("Non-finite external torque")
+        # Average signed torque vectors before taking the L1 norm or gating.
+        # Only current/past samples participate; early frames use available history.
+        self.tau_ext_history.append(raw.astype(np.float32))
+        raw = np.mean(self.tau_ext_history, axis=0, dtype=np.float64).astype(np.float32)
         gated, l1, contact = gate_tau_ext(raw, self.config.contact_threshold_l1)
         self.last_time, self.last_dq = t, filtered_dq.copy()
         self.dq_state, self.tau_state = dq_state, tau_state

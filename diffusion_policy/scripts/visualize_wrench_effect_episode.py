@@ -9,6 +9,9 @@ probabilities, physical force units, or final-action attribution. No diffusion
 sampling is needed. Original values and preprocessing diagnostics are saved.
 The captured update includes the same deterministic contact alpha used by the
 teacher encoder, so zero-alpha observations contribute no wrench residual.
+
+Use --metrics context_effect for final image-token differences with any number
+of image-query fusion layers. Residual-U diagnostics still require one CA layer.
 """
 
 from __future__ import annotations
@@ -71,12 +74,14 @@ def make_zero_wrench_obs(policy, obs):
 class WrenchEffectCapture:
     """Capture ordinary encoder outputs without changing attention kernels.
 
-    Supports the current image-query, one-CA-layer, no-preceding-SA structure.
-    Both outputs have [observation, all_camera_patches, channels], batch one.
+    Context-only capture supports multiple fusion layers. Capturing a residual
+    U requires one CA layer without preceding SA, so its meaning is unambiguous.
+    Outputs have [observation, all_camera_patches, channels], batch one.
     """
 
-    def __init__(self, policy):
+    def __init__(self, policy, *, capture_residuals=True):
         self.policy = policy
+        self.capture_residuals = bool(capture_residuals)
         self.encoder = policy.obs_encoder
         self.steps = int(policy.n_obs_steps)
         self.handles = []
@@ -89,9 +94,9 @@ class WrenchEffectCapture:
             raise RuntimeError("Wrench effect capture is already active")
         if getattr(self.encoder, "cross_attn_query", None) != "image":
             raise ValueError("Wrench residual maps require image-query cross-attention")
-        if int(getattr(self.encoder, "cross_attn_layers", 0)) != 1:
-            raise ValueError("Wrench residual maps currently support a single cross-attention layer")
-        if int(getattr(self.encoder, "pre_cross_self_attn_layers", 0)):
+        if self.capture_residuals and int(getattr(self.encoder, "cross_attn_layers", 0)) != 1:
+            raise ValueError("Wrench residual maps support a single cross-attention layer; use --metrics context_effect for multi-layer fusion")
+        if self.capture_residuals and int(getattr(self.encoder, "pre_cross_self_attn_layers", 0)):
             raise ValueError("Preceding joint self-attention is not supported by this residual-only diagnostic")
         if getattr(self.policy, "training", False) or getattr(self.encoder, "training", False):
             raise ValueError("Wrench effect capture requires an eval-mode policy and encoder")
@@ -99,7 +104,8 @@ class WrenchEffectCapture:
         if mode not in {"joint", "per_camera"}:
             raise ValueError(f"Unsupported camera attention mode {mode!r}")
         self.mode = mode
-        self.handles.append(self.encoder.cross_attention.register_forward_hook(self._capture))
+        if self.capture_residuals:
+            self.handles.append(self.encoder.cross_attention.register_forward_hook(self._capture))
         self.active = True
         return self
 
@@ -148,6 +154,14 @@ class WrenchEffectCapture:
             context = self.policy._encode_context(obs, apply_curriculum_mask=False)
         finally:
             replacement.remove()
+        if not self.capture_residuals:
+            patches = sum(int(count) for count in self.encoder.patch_counts.values())
+            if context.ndim != 3 or context.shape[:2] != (1, self.steps * patches):
+                raise ValueError("Final context does not preserve the expected observation/image-patch layout")
+            context = context.detach().float().cpu().reshape(self.steps, patches, context.shape[-1])
+            if not torch.isfinite(context).all():
+                raise ValueError("Encoder produced non-finite context")
+            return {"context": context}
         expected = 1 if self.mode == "joint" else len(self.encoder.image_keys)
         if len(self._updates) != expected:
             raise RuntimeError(f"Expected {expected} CA calls, captured {len(self._updates)}")
@@ -185,13 +199,8 @@ def capture_pair(policy, obs, capture=None, *, baseline="raw_zero", save_vectors
         _, normalized_baseline, _, _ = policy.prepare_context_inputs(zero_obs)
     else:
         normalized_baseline = torch.zeros_like(normalized)
-    full_update, zero_update = applied_ca_update(full), applied_ca_update(zero)
-    delta_u = full_update - zero_update
     delta_z = full["context"] - zero["context"]
     pair = {
-        "ca_update": torch.linalg.vector_norm(full_update, dim=-1).numpy(),
-        "baseline_ca_update": torch.linalg.vector_norm(zero_update, dim=-1).numpy(),
-        "injection_effect": torch.linalg.vector_norm(delta_u, dim=-1).numpy(),
         "context_effect": torch.linalg.vector_norm(delta_z, dim=-1).numpy(),
         "normalized_wrench": normalized[0].detach().float().cpu().numpy(),
         "baseline_normalized_wrench": normalized_baseline[0].detach().float().cpu().numpy(),
@@ -199,6 +208,16 @@ def capture_pair(policy, obs, capture=None, *, baseline="raw_zero", save_vectors
         "future_has_contact": None if future is None else future[0].detach().cpu().numpy(),
     }
     if save_vectors:
+        pair["delta_z_vector"] = delta_z.numpy()
+    if "ca_update" in full:
+        full_update, zero_update = applied_ca_update(full), applied_ca_update(zero)
+        delta_u = full_update - zero_update
+        pair.update(
+            ca_update=torch.linalg.vector_norm(full_update, dim=-1).numpy(),
+            baseline_ca_update=torch.linalg.vector_norm(zero_update, dim=-1).numpy(),
+            injection_effect=torch.linalg.vector_norm(delta_u, dim=-1).numpy(),
+        )
+    if save_vectors and "ca_update" in full:
         pair.update(ca_update_vector=full_update.numpy(),
                     baseline_ca_update_vector=zero_update.numpy(),
                     delta_u_vector=delta_u.numpy(), delta_z_vector=delta_z.numpy())
@@ -249,7 +268,8 @@ def parse_args(argv=None):
     parser.add_argument("--baseline", choices=("raw_zero", "normalized_zero"), default="raw_zero",
                         help="Zero raw wrench+phase inputs, or only zero encoder normalized wrench (preserving preprocessing).")
     parser.add_argument("--metrics", nargs="+", choices=tuple(METRIC_LABELS),
-                        default=("ca_update", "injection_effect"))
+                        default=("ca_update", "injection_effect"),
+                        help="context_effect alone supports multi-layer fusion; residual metrics require one CA layer.")
     parser.add_argument("--camera", choices=("both", "side", "wrist"), default="both")
     parser.add_argument("--observation", choices=("last", "all"), default="last")
     parser.add_argument("--color-scope", choices=("image", "episode"), default="image",
@@ -487,7 +507,11 @@ def run(args):
         timeline = load_episode_wrench(dataset, policy, args.episode,
                                        [anchor for anchor, _ in selected], dataset_fps)
         records = []
-        with WrenchEffectCapture(policy) as capture:
+        capture_residuals = args.metrics != ("context_effect",)
+        metric_fields = (*METRICS, "baseline_ca_update") if capture_residuals else ("context_effect",)
+        vector_fields = (("ca_update_vector", "baseline_ca_update_vector", "delta_u_vector", "delta_z_vector")
+                         if capture_residuals else ("delta_z_vector",))
+        with WrenchEffectCapture(policy, capture_residuals=capture_residuals) as capture:
             # Validate architecture before touching any old output files.
             rendering.prepare_outputs(paths, overwrite=args.overwrite, save_frames=args.save_frames)
             for number, (anchor, sample_index) in enumerate(selected, 1):
@@ -508,15 +532,15 @@ def run(args):
                         camera = {"images": images,
                                   "grid": common.patch_grid(patches, images.shape[1], images.shape[2],
                                                             policy.obs_encoder.backbone)}
-                        for metric in (*METRICS, "baseline_ca_update"):
+                        for metric in metric_fields:
                             camera[metric] = pair[metric][:, offset:end]
                         if args.save_vectors:
-                            for metric in ("ca_update_vector", "baseline_ca_update_vector", "delta_u_vector", "delta_z_vector"):
+                            for metric in vector_fields:
                                 camera[metric] = pair[metric][:, offset:end]
                         cameras[key] = camera
                     offset = end
-                if offset != pair["ca_update"].shape[1]:
-                    raise ValueError("Camera patch counts do not match captured residual token layout")
+                if offset != pair["context_effect"].shape[1]:
+                    raise ValueError("Camera patch counts do not match captured context token layout")
                 records.append({"anchor": anchor, "cameras": cameras,
                                 **{key: pair[key] for key in ("normalized_wrench", "baseline_normalized_wrench", "contact", "future_has_contact")}})
                 if number == 1 or number % 25 == 0 or number == len(selected):
@@ -560,9 +584,9 @@ def run(args):
                 arrays["model_" + field] = np.stack([record[field] for record in records])
         raw_camera_keys = [key for key in all_keys if key in camera_keys]
         for camera_index, key in enumerate(raw_camera_keys):
-            fields = (*METRICS, "baseline_ca_update")
+            fields = metric_fields
             if args.save_vectors:
-                fields += ("ca_update_vector", "baseline_ca_update_vector", "delta_u_vector", "delta_z_vector")
+                fields += vector_fields
             for field in fields:
                 arrays[f"camera_{camera_index}_{field}"] = np.stack([record["cameras"][key][field] for record in records])
             for metric in args.metrics:
@@ -575,12 +599,13 @@ def run(args):
             "checkpoint": str(checkpoint), "episode": args.episode,
             "video_frames": len(records), "fps": output_fps, "dataset_fps": dataset_fps,
             "stride": args.stride, "precision": args.precision, "diffusion_sampling": False,
-            "metrics": {
+            "cross_attn_layers": int(policy.obs_encoder.cross_attn_layers),
+            "metrics": {key: definition for key, definition in {
                 "ca_update": "L2(U(W)) after MHA output projection, before query residual/FFN; includes the zero-wrench encoder bias/position response",
                 "injection_effect": "L2(U(W)-U(W0)); subtract vectors before channel L2",
                 "context_effect": "L2(Z(W)-Z(W0)); final obs_encoder image tokens after FFN and context normalization",
                 "baseline_ca_update": "L2(U(W0)), retained to identify the zero-wrench branch response",
-            },
+            }.items() if key in metric_fields},
             "baseline": args.baseline,
             "baseline_definition": (
                 "All required raw wrench/phase keys are set to zero; both branches use the same complete preprocessing, force encoder and fusion. Contact and future-prefix fill may change."
@@ -606,7 +631,7 @@ def run(args):
             ),
             "units": "Learned feature L2 units; not percentages or physical force units",
             "wrench_plot": timeline["metadata"],
-            "interpretation": "Model-internal residual magnitude and paired wrench-conditioned feature change; not physical contact location or final-action importance. Current physical wrench curves may precede/follow maps because the model uses the recorded future wrench window.",
+            "interpretation": "Model-internal paired force/torque-conditioned feature change; not physical contact location or final-action importance. The raw-zero baseline also recomputes contact gating. Displayed source signals are current; model windows follow the saved checkpoint configuration.",
             "save_vectors": args.save_vectors,
             "videos": {metric: str(paths[metric]) for metric in args.metrics},
         }

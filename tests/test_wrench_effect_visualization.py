@@ -67,7 +67,10 @@ class TinyEncoder(nn.Module):
             update, _ = self.cross_attention(query, value, value)
         else:
             update = torch.cat([self.cross_attention(q, value, value)[0] for q in queries], dim=1)
-        return (query + update).reshape(batch, steps * query.shape[1], 3)
+        context = query + update
+        for layer in self.extra_cross_attention_layers:
+            context = context + layer(context, value, value)[0]
+        return context.reshape(batch, steps * query.shape[1], 3)
 
 
 class TinyPolicy(nn.Module):
@@ -305,6 +308,41 @@ def test_capture_cleans_hooks_and_rejects_non_image_query_or_extra_ca():
         WrenchEffectCapture(policy).__enter__()
 
 
+def test_context_only_two_layer_tau_ext_matches_training_supervision():
+    from diffusion_policy.model.vision.render_net_attention import teacher_context_effect_targets
+
+    class TauPolicy(TinyPolicy):
+        wrench_key = phase_wrench_key = "tau_ext"
+        future_phase_wrench_key = None
+
+        def prepare_context_inputs(self, obs):
+            self.prepare_calls.append(obs)
+            contact = obs["tau_ext"].abs().sum(dim=(-1, -2)) > 0
+            return {key: obs[key] for key in self.image_keys}, obs["tau_ext"] * 2, contact, None
+
+    policy = TauPolicy(extra_layers=1).requires_grad_(False)
+    obs = tiny_obs()
+    obs.pop("future_wrench")
+    obs["tau_ext"] = F.pad(obs.pop("wrench"), (0, 1))
+    obs["tau_ext"][..., 6] = 3.
+    obs["contact_alpha"] = torch.ones(1, policy.n_obs_steps)
+    with WrenchEffectCapture(policy, capture_residuals=False) as capture:
+        pair = capture_pair(policy, obs, capture, save_vectors=True)
+    _, expected = teacher_context_effect_targets(policy, obs)
+    expected = torch.cat([expected[key] for key in policy.image_keys], dim=-1)[0]
+    torch.testing.assert_close(torch.from_numpy(pair["context_effect"]), expected)
+    assert pair["normalized_wrench"].shape == (2, 2, 7)
+    assert np.count_nonzero(pair["baseline_normalized_wrench"]) == 0
+    assert np.any(pair["context_effect"] > 0)
+    assert pair["delta_z_vector"].shape == (2, 3, 3)
+    assert "ca_update" not in pair and "delta_u_vector" not in pair
+    baseline_obs = policy.prepare_calls[1]
+    assert "contact_alpha" not in baseline_obs
+    assert baseline_obs["side"] is obs["side"]
+    assert not policy.obs_encoder._forward_pre_hooks
+    assert not policy.obs_encoder.cross_attention._forward_hooks
+
+
 @pytest.mark.parametrize("mode", ["joint", "per_camera"])
 def test_capture_preserves_observation_then_camera_patch_order_and_detaches(mode):
     policy = TinyPolicy()
@@ -381,11 +419,12 @@ def test_capture_requires_eval_policy_and_encoder():
 
 @pytest.mark.parametrize("stride", [1, 2])
 @pytest.mark.parametrize("scope", ["image", "episode"])
-def test_run_exports_u_and_delta_u_videos_without_diffusion_sampling(monkeypatch, tmp_path, stride, scope):
+@pytest.mark.parametrize("context_only", [False, True])
+def test_run_exports_effect_videos_without_diffusion_sampling(monkeypatch, tmp_path, stride, scope, context_only):
     checkpoint = tmp_path / "teacher" / "checkpoints" / "best.ckpt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.touch()
-    policy = TinyPolicy()
+    policy = TinyPolicy(extra_layers=1 if context_only else 0)
 
     class Dataset:
         fps = 20
@@ -444,24 +483,28 @@ def test_run_exports_u_and_delta_u_videos_without_diffusion_sampling(monkeypatch
     # independent video streams, capture calls, file layout and raw alignment.
     monkeypatch.setattr(visual, "render_frame", lambda *a, **kw: np.zeros((64, 512, 3), dtype=np.uint8))
     args = visual.parse_args(["--checkpoint", str(checkpoint), "--episode", "0", "--stride", str(stride),
-                              "--color-scope", scope])
-    assert args.metrics == ("ca_update", "injection_effect")
+                              "--color-scope", scope] + (["--metrics", "context_effect"] if context_only else []))
+    assert args.metrics == (("context_effect",) if context_only else ("ca_update", "injection_effect"))
     paths = visual.run(args)
     count = len(range(0, 4, stride))
     assert dataset.closed and policy.encode_calls == 2 * count
-    assert len(Writer.instances) == 2
+    assert len(Writer.instances) == len(args.metrics)
     assert all(writer.fps == 20 / stride and len(writer.frames) == count and writer.closed
                for writer in Writer.instances)
-    assert paths["ca_update"].is_file() and paths["injection_effect"].is_file()
+    assert all(paths[metric].is_file() for metric in args.metrics)
     metadata = json.loads(paths["metadata"].read_text())
     assert metadata["diffusion_sampling"] is False and metadata["precision"] == "float32"
     assert metadata["raw_camera_keys"] == ["side", "wrist"]
     assert metadata["color_percentiles"] == [2., 98.]
     assert metadata["color_scope"] == scope
-    assert set(metadata["color_bounds"]) == {"ca_update", "injection_effect"}
-    assert metadata["color_bounds"]["ca_update"] != metadata["color_bounds"]["injection_effect"]
+    assert set(metadata["color_bounds"]) == set(args.metrics)
+    assert metadata["cross_attn_layers"] == (2 if context_only else 1)
+    if not context_only:
+        assert metadata["color_bounds"]["ca_update"] != metadata["color_bounds"]["injection_effect"]
     with np.load(paths["raw"]) as data:
-        for metric in ("ca_update", "baseline_ca_update", "injection_effect", "context_effect"):
+        metric_fields = (("context_effect",) if context_only else
+                         ("ca_update", "baseline_ca_update", "injection_effect", "context_effect"))
+        for metric in metric_fields:
             assert data[f"camera_0_{metric}"].shape == (count, 2, 1)
             assert data[f"camera_1_{metric}"].shape == (count, 2, 2)
         for metric in args.metrics:

@@ -1,0 +1,41 @@
+# All relative dataset/model paths are resolved from the repository root.
+datasets:
+  - input: data/huanggua1103_25hz_3cam_lerobotv3
+    output: data/huanggua1103_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+  - input: data/board_25hz_3cam_lerobotv3
+    output: data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+
+processing:
+  # Mean of tau_ext[t-window+1:t+1], independently for each episode/joint.
+  # At episode start, average only the samples available so far.
+  tau_ext_smoothing_window: 5
+  # Seven-joint L1 norm in N·m. Equality is retained as contact.
+  contact_threshold_l1: 12.5
+  filter_mode: causal
+  cutoff_hz: 3.0
+  compensation: dynamics
+  convention: tool-on-environment
+  urdf: scripts/assets/xarm7/xarm7_dynamics.urdf
+  joint_key: observation.joint
+  velocity_key: observation.velocity
+  torque_key: observation.torque
+  ee_frame: link_eef
+  reference_frame: base
+  tcp_offset: [0.0, 0.0, 0.0]
+  gravity: [0.0, 0.0, -9.81]
+  bio_gripper_g2: true
+  payload_mass: 0.79
+  payload_com: [0.0, 0.0, 0.05]
+  payload_inertia: [0.0, 0.0, 0.0]
+  torque_bias: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  damping: 0.02
+  plot_episode: 0
+
+visualization:
+  enabled: true
+  # Use "all" to export one video for every episode.
+  episodes: [0]
+  cameras: [observation.images.front, observation.images.right_wrist]
+  width_per_camera: 448
+  plot_height: 280
+  codec: libx264

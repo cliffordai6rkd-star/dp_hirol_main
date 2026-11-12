@@ -10,19 +10,19 @@ from diffusion_policy.model.vision.contact_curriculum import ContactDetector, Hy
 from diffusion_policy.scripts.episode_wrench_plot import WrenchEpisodePlot, load_episode_wrench
 
 
-def episode_dataset(values, *, start=5, timestamp_key="timestamp"):
+def episode_dataset(values, *, start=5, timestamp_key="timestamp", source_key="observation.wrench"):
     values = np.asarray(values, dtype=np.float32)
-    raw = np.concatenate((np.zeros((start, 6), dtype=np.float32), values))
+    raw = np.concatenate((np.zeros((start, values.shape[1]), dtype=np.float32), values))
     times = 120.0 + np.arange(len(raw), dtype=np.float64) * .05
     if timestamp_key.endswith("_ns"):
         times *= 1e9
 
     def column(key, dtype):
-        assert key == "observation.wrench"
+        assert key == source_key
         return raw.astype(dtype)
 
     return SimpleNamespace(
-        phase_source_key="observation.wrench", _phase_source_data=None,
+        phase_source_key=source_key, _phase_source_data=None,
         _load_column=column, episode_ranges=[range(start), range(start, len(raw))],
         timestamps=times, timestamp_key=timestamp_key,
         _timestamp_seconds=LeRobotV3ImageDataset._timestamp_seconds,
@@ -48,6 +48,8 @@ def test_recorded_six_channels_and_anchor_time_have_no_future_shift(timestamp_ke
     np.testing.assert_array_equal(timeline["anchor_offsets"], [2, 6])
     np.testing.assert_allclose(timeline["anchor_times"], [.1, .3])
     np.testing.assert_array_equal(timeline["values"][timeline["anchor_offsets"]], values[[2, 6]])
+    assert timeline["metadata"]["channels"] == ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+    assert timeline["metadata"]["units"] == ["N", "N", "N", "N m", "N m", "N m"]
 
 
 def test_contact_scans_full_episode_before_anchor_stride_and_respects_debounce():
@@ -138,6 +140,7 @@ def test_plot_updates_synchronized_cursor_and_exports_static_six_channel_chart(t
     values = np.arange(60, dtype=np.float32).reshape(10, 6) / 10
     timeline = load_episode_wrench(episode_dataset(values), contact_policy(), 1, [5, 12], 20)
     chart = WrenchEpisodePlot(timeline, width=512, height=420)
+    assert len(chart.markers) == 6
     first = chart.render(timeline["anchor_times"][0])
     last = chart.render(timeline["anchor_times"][1])
     assert first.shape == last.shape == (420, 512, 3)
@@ -146,3 +149,52 @@ def test_plot_updates_synchronized_cursor_and_exports_static_six_channel_chart(t
     target = tmp_path / "wrench.png"
     chart.save(target)
     assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_seven_joint_torque_channels_use_teacher_contact_dims_and_keep_anchor_clock(tmp_path):
+    values = np.zeros((10, 7), dtype=np.float32)
+    values[:, :6] = np.arange(6) * .1  # Distinct plotted channels stay below threshold.
+    values[2:7, 6] = 15.  # Only joint 7 establishes contact.
+    dataset = episode_dataset(values, source_key="observation.tau_ext")
+    policy = SimpleNamespace(contact_detector=HysteresisContactDetector(
+        free_threshold=14., contact_threshold=14., force_dims=tuple(range(7)),
+        norm="l1", enter_frames=3, exit_frames=2,
+    ))
+    timeline = load_episode_wrench(dataset, policy, 1, [7, 10, 14], 20)
+    np.testing.assert_array_equal(timeline["values"], values)
+    np.testing.assert_array_equal(timeline["anchor_offsets"], [2, 5, 9])
+    np.testing.assert_allclose(timeline["anchor_times"], [.1, .25, .45])
+    np.testing.assert_allclose(timeline["contact_magnitude"], np.abs(values).sum(axis=1))
+    np.testing.assert_array_equal(timeline["contact"], [False] * 2 + [True] * 5 + [False] * 3)
+    np.testing.assert_array_equal(timeline["causal_contact"], [False] * 4 + [True] * 4 + [False] * 2)
+    np.testing.assert_allclose(timeline["contact_intervals_sec"], [[.1, .35]])
+    metadata = timeline["metadata"]
+    assert metadata["source_key"] == "observation.tau_ext"
+    assert metadata["channels"] == [f"J{index}" for index in range(1, 8)]
+    assert metadata["units"] == ["Nm"] * 7
+    assert metadata["contact"]["force_dims"] == list(range(7))
+    assert metadata["contact"]["source"] == "derived_from_recorded_tau_ext"
+
+    chart = WrenchEpisodePlot(timeline, width=768, height=420)
+    frame = chart.render(timeline["anchor_times"][1])
+    assert frame.shape == (420, 768, 3)
+    assert len(chart.markers) == 7
+    labels = [label for ax in chart.axes for label in ax.get_legend_handles_labels()[1]]
+    assert labels == metadata["channels"]
+    assert all(ax.get_ylabel() == "Joint torque (Nm)" for ax in chart.axes)
+    for channel, marker in enumerate(chart.markers):
+        np.testing.assert_allclose(marker.get_xdata(), [.25])
+        np.testing.assert_allclose(marker.get_ydata(), [values[5, channel]])
+    assert "tau_ext norm = 16.50" in chart.status.get_text()
+    assert not any("Fx" in text.get_text() or "force norm" in text.get_text()
+                   for text in chart.figure.texts)
+    target = tmp_path / "tau_ext.png"
+    chart.save(target)
+    assert "seven-axis tau_ext" in chart.status.get_text()
+    assert target.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_tau_ext_source_rejects_six_channels_instead_of_labelling_them_as_wrench():
+    dataset = episode_dataset(np.zeros((10, 6)), source_key="observation.tau_ext")
+    with pytest.raises(ValueError, match="requires seven channels"):
+        load_episode_wrench(dataset, contact_policy(), 1, [5], 20)
