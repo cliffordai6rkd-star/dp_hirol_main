@@ -25,6 +25,8 @@ class AttentionCapture:
     Layer indices are zero based, with -1 selecting the final available layer.
     ``query_mode='last'`` selects the last wrench position, or the last patch
     query for image-only SA. It never changes the original softmax denominator.
+    Coarse residual fusion supports backbone ``dino`` maps only; this utility
+    does not map pooled fusion attention back through the residual paths.
     """
 
     def __init__(self, policy, mode="auto", layer_index=-1, query_mode="all"):
@@ -60,6 +62,12 @@ class AttentionCapture:
         if mode not in self.available_modes:
             available = ", ".join(f"{name} ({count} layers)" for name, count in self.available_modes.items())
             raise ValueError(f"Attention mode {mode!r} is unavailable; available: {available or 'none'}")
+        if mode == "self-attn" and getattr(self.encoder, "fusion_downsample_factor", 1) > 1:
+            raise ValueError(
+                "Coarse residual fusion attention visualization is not supported: "
+                "this utility assumes full-resolution fusion self-attention. "
+                "Use mode='dino' to inspect backbone attention."
+            )
         self.mode = mode
         self.layer_count = self.available_modes[mode]
         try:

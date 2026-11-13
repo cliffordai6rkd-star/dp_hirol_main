@@ -1,0 +1,182 @@
+# Explicit entry point for visual-output board teachers (784 or 196 tokens).
+# Standalone so the required checkpoint is not merged with a legacy null.
+name: train_distill_render_net_board_selfattn
+_target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
+teacher_config: diffusion_policy/config/train_civi_teacher_board_selfattn.yaml
+teacher_config_overrides: []
+teacher_output_dir: null
+# Pass the new visual-output teacher checkpoint on the command line.
+teacher_checkpoint: ???
+output_dir: model_output/${now:%Y.%m.%d}/${now:%H.%M.%S}_board_selfattn_student/student
+
+distillation:
+  objective: token_mse
+  token_region_phases: null
+  skip_unselected_observations: false
+  use_teacher_ffn: false
+  phase_ce_weight: 0.0
+  alpha_loss_weight: 0.0
+  token_loss_weight: 1.0
+  demo_loss_weight: 0.0
+  validation_seed: 42
+  force_context:
+    enabled: true
+    # Initial weights, not tuned values; both can be overridden on the CLI.
+    difference_weight: 1.0
+    region_weight: 1.0
+    # Resolve once from the TRAIN real/zero teacher pair cache before training.
+    difference_scale: null
+    region_scale: null
+
+teacher_cache:
+  enabled: true
+  cleanup_on_exit: false # Retain real/zero teacher pairs for inspection and reuse.
+  dtype: float32
+  precision: float32
+  directory: model_output/cache/render_net_teacher
+  batch_size: 16
+  num_workers: 4
+  load_into_ram: false
+  only: false
+
+render_net:
+  backbone:
+    image_encoder: cnn
+    wrench_encoder: lstm
+    image_self_attn_layers: 2
+    cross_attn_layers: 2
+    decoder_layers: 3
+    patch_size: 8
+    embed_dim: 96
+    num_heads: 4
+    mlp_ratio: 3.0
+    dropout: 0.0
+    base_channels: 16
+    conv_block: bottleneck
+  # Exchange the camera feature grids at each observation time before
+  # decoding separate RGB images. No adapter follows frozen DINO.
+  cross_camera_attn_layers: 1
+  rendering_mode: residual
+  shared_condition_backbone: false
+  separate_gate_path: false
+  # No separate condition encoder, including when used in composed configs.
+  condition_backbone: null
+  use_contact_alpha: false
+  use_region_gate: false
+  initialize_wrench_from_teacher: true
+  conditioning_dim: 256 # Resolved from the selected teacher checkpoint.
+  wrench_history_steps: 8
+  max_obs_steps: 2
+  image_keys: [side, wrist]
+  residual_scale: 1.0
+  phase_prediction:
+    enabled: false
+    # Freeze the complete force encoder copied from the teacher.
+    freeze_wrench_encoder: true
+  high_attention_render:
+    enabled: false
+    source: context
+    intensity_loss_weight: 0.0
+    context_patch_loss_weight: 0.0
+    pixel_loss_weight: 0.0
+    smoothness_loss_weight: 0.0
+
+dataset:
+  val_ratio: 0.1
+  phase_resampling_enabled: false
+  contact_label_config: null
+  image_randomer_config: null
+  video_decode_device: auto
+  video_backend: pyav
+  preload_images: true
+  load_result_add: ram
+  image_cache_dtype: uint8
+
+dataloader:
+  batch_size: 16
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.999
+
+logging:
+  progress_bar: true
+  progress_bar_non_tty: false
+  tqdm_interval_sec: 1.0
+  tqdm_leave: false
+  status_interval_sec: 60.0
+  plot_every_steps: 100
+  enable_plots: true
+  async_plots: true
+  plot_interval_sec: 20.0
+
+training:
+  seed: 42
+  device: cuda:0
+  use_ema: true
+  lr_scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 8
+    threshold: 0.0001
+    min_lr: 0.00001
+  # One RGB stage with token + force-difference + region losses.
+  # The copied force encoder stays frozen.
+  num_epochs: 100
+  resume_from: null
+  render_stages:
+    enabled: false
+    condition_warmup_epochs: 0
+    rgb_warmup_epochs: 0
+    joint_after_rgb: false
+    condition_early_stopping:
+      enabled: false
+  distributed:
+    enabled: false
+    backend: nccl
+    batch_size_is_global: true
+    find_unused_parameters: false
+    timeout_seconds: 86400
+  max_steps: null
+  max_grad_norm: 1.0
+  log_every: 10
+  max_val_batches: null
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.0001
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  compile:
+    enabled: true
+    render_backbone: true
+    student_dino: true
+    backend: inductor
+    mode: default
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

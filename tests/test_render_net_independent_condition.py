@@ -30,7 +30,6 @@ def _model(*, dropout=.3):
         phase_prediction={"enabled": True, "hidden_dim": 8},
         high_attention_render={"enabled": True, "initial_strength": .4,
                                "threshold": 0., "detach_for_rgb": False},
-        spatial_modulation={"enabled": True},
     )
     model.freeze_wrench_encoder()
     return model
@@ -151,8 +150,6 @@ def test_dynamic_rgb_compile_reuses_graph_for_changing_contact_counts():
     with torch.no_grad():
         # A zero output layer would conceal errors in the encoder's gradients.
         eager.output.weight.normal_(std=.03)
-        for modulation in eager.spatial_modulations:
-            modulation.affine[-1].weight.normal_(std=.02)
     compiled = copy.deepcopy(eager)
     graphs = []
     aot_eager = lookup_backend("aot_eager")

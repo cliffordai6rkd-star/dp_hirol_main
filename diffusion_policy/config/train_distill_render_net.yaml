@@ -39,8 +39,6 @@ render_net:
     conv_block: bottleneck
   rendering_mode: residual
   separate_gate_path: true # Keep the gate representation independent from the RGB encoder/decoder.
-  spatial_modulation:
-    enabled: true # RGB-only /8 and /4 spatial gamma/beta modulation.
   patch_residual_refine: true # Used only by the optional patch_residual ablation.
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # Resolved from teacher when initialization is enabled.

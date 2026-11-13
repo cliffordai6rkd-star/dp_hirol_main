@@ -1,0 +1,21 @@
+# Controlled RGB ablation: remove the context-derived spatial multiplier M,
+# while retaining the same predicted global alpha. The condition branch stays
+# frozen; its spatial output is measured only as a diagnostic.
+defaults:
+  - train_distill_render_net_student_cnnvit_condition_then_render
+  - _self_
+
+name: train_distill_render_net_student_cnnvit_no_region_gate
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_cnnvit_no_region_gate/student
+
+render_net:
+  use_region_gate: false
+  use_contact_alpha: true
+
+dataloader:
+  batch_size: 64
+
+training:
+  # Start the no-FiLM architecture from scratch. Historical FiLM checkpoints
+  # have a different parameter/optimizer layout and cannot be resumed here.
+  resume_from: null

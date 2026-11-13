@@ -14,6 +14,52 @@ from diffusion_policy.scripts.plot_render_net_losses import (
 )
 
 
+def test_force_context_selection_is_never_relabelled_as_token_mse(tmp_path, monkeypatch):
+    from matplotlib.figure import Figure
+
+    history = LossHistory()
+    history.update([
+        {"global_step": 0, "epoch": 0, "objective": "token_mse",
+         "selection_metric": "force context loss", "initial_val_mse": 1.6},
+        {"global_step": 1, "epoch": 1, "train_mse": 1.2,
+         "train_token_mse": .2, "train_force_delta_mse": .004,
+         "train_force_delta_loss": .4, "train_context_region_loss": .6},
+        {"global_step": 1, "epoch": 1, "epoch_train_mse": 1.3,
+         "epoch_train_token_mse": .25, "epoch_train_force_delta_mse": .0045,
+         "epoch_train_force_delta_loss": .45, "epoch_train_context_region_loss": .6},
+        {"global_step": 1, "epoch": 1, "val_mse": 1.4,
+         "val_token_mse": .3, "val_force_delta_mse": .005,
+         "val_force_delta_loss": .5, "val_context_region_loss": .6},
+        {"global_step": 2, "epoch": 2, "val_mse": 1.1},
+    ])
+    assert history.objective == "token_mse"
+    assert history.selection_metric == "force context loss"
+    assert not len(history.points("initial_val_token_mse")[0])
+    np.testing.assert_allclose(history.points("initial_val_loss")[1], [1.6])
+    np.testing.assert_allclose(history.points("val_loss")[1], [1.4, 1.1])
+    np.testing.assert_allclose(history.points("val_token_mse")[1], [.3])
+    np.testing.assert_allclose(history.points("epoch_train_force_delta_mse")[1], [.0045])
+
+    panels = {}
+    savefig = Figure.savefig
+
+    def capture_figure(figure, *args, **kwargs):
+        panels.update({axis.get_title(): {
+            line.get_label(): list(line.get_ydata()) for line in axis.lines
+        } for axis in figure.axes if axis.get_visible()})
+        return savefig(figure, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    save_loss_plot(history, tmp_path / "force_context.png")
+    assert panels["Combined force-context loss"]["Validation"] == [1.4, 1.1]
+    assert panels["Context token MSE"]["Validation"] == [.3]
+    for title in ("Force difference MSE (raw)", "Force difference loss (normalized)",
+                  "Context region RGB loss"):
+        assert {"Train batch", "Train epoch mean", "Validation"} <= panels[title].keys()
+    with Image.open(tmp_path / "force_context.png") as image:
+        assert image.format == "PNG" and np.asarray(image).std() > 10
+
+
 def test_jsonl_reader_waits_for_complete_lines_and_only_returns_new_records(tmp_path):
     source = tmp_path / "logs.json.txt"
     first = {"global_step": 1, "train_loss": .9}

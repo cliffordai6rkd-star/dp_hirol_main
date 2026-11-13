@@ -59,7 +59,7 @@ def test_explicit_dino_joint_preset_retains_pretrained_lora_and_fusion_dimension
     }
     assert backbone.dino.intermediate_layers is None
     assert cfg.render_net.shared_condition_backbone
-    assert cfg.render_net.spatial_modulation.enabled
+    assert "spatial_modulation" not in cfg.render_net
     assert cfg.training.render_stages.condition_warmup_epochs == 1
     assert cfg.dataloader.batch_size == 4 and cfg.val_dataloader.batch_size == 8
     assert list(cfg.distillation.token_region_phases) == [1, 2]

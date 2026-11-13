@@ -46,8 +46,6 @@ render_net:
     mlp_ratio: 2.0
     dropout: 0.0
     conv_block: bottleneck
-  spatial_modulation:
-    enabled: true
   initialize_wrench_from_teacher: true
   conditioning_dim: 256
   wrench_history_steps: 8

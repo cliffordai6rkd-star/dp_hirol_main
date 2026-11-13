@@ -4,6 +4,7 @@ from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
 
@@ -38,7 +39,12 @@ class _CrossAttentionBlock(nn.Module):
 
 
 class ForceAwareObsEncoder(nn.Module):
-    """Fuse frozen DINOv3 patch tokens with high-rate wrench history tokens."""
+    """Fuse DINOv3 patches and wrench history, optionally outputting only vision.
+
+    Joint self-attention always mixes both streams. ``fusion_output_mode``
+    selects which fused tokens the action head receives after that interaction.
+    ``fusion_upsample=False`` keeps the fused visual tokens on the coarse grid.
+    """
 
     def __init__(
         self,
@@ -63,6 +69,10 @@ class ForceAwareObsEncoder(nn.Module):
         cross_attn_query: str = "wrench",
         image_shapes: Optional[Mapping[str, Sequence[int]]] = None,
         cross_attn_query_residual: bool = True,
+        fusion_downsample_factor: int = 1,
+        fusion_highres_skip: bool = True,
+        fusion_output_mode: str = "all",
+        fusion_upsample: bool = True,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -85,6 +95,39 @@ class ForceAwareObsEncoder(nn.Module):
             raise ValueError(
                 "camera_attention_mode must be 'joint' or 'per_camera'"
             )
+        if fusion_output_mode not in ("all", "visual"):
+            raise ValueError("fusion_output_mode must be 'all' or 'visual'")
+        if fusion_output_mode == "visual" and (
+            pre_cross_self_attn_layers < 1 or cross_attn_layers != 0
+        ):
+            raise ValueError(
+                "fusion_output_mode='visual' requires joint self-attention with "
+                "pre_cross_self_attn_layers > 0 and cross_attn_layers = 0"
+            )
+        if (isinstance(fusion_downsample_factor, bool)
+                or not isinstance(fusion_downsample_factor, int)
+                or fusion_downsample_factor < 1):
+            raise ValueError("fusion_downsample_factor must be a positive integer")
+        if not isinstance(fusion_highres_skip, bool):
+            raise ValueError("fusion_highres_skip must be a boolean")
+        if not isinstance(fusion_upsample, bool):
+            raise ValueError("fusion_upsample must be a boolean")
+        if not fusion_upsample and (
+            fusion_downsample_factor <= 1 or fusion_highres_skip
+        ):
+            raise ValueError(
+                "fusion_upsample=false requires fusion_downsample_factor > 1 "
+                "and fusion_highres_skip=false"
+            )
+        if not fusion_highres_skip and fusion_downsample_factor <= 1:
+            raise ValueError("fusion_highres_skip=false requires fusion_downsample_factor > 1")
+        if fusion_downsample_factor > 1 and (
+            pre_cross_self_attn_layers < 1 or cross_attn_layers != 0
+        ):
+            raise ValueError(
+                "Coarse residual fusion requires pre_cross_self_attn_layers > 0 "
+                "and cross_attn_layers = 0"
+            )
 
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.n_emb = int(n_emb)
@@ -98,6 +141,10 @@ class ForceAwareObsEncoder(nn.Module):
         self.cross_attn_layers = int(cross_attn_layers)
         self.cross_attn_query = str(cross_attn_query)
         self.cross_attn_query_residual = bool(cross_attn_query_residual)
+        self.fusion_downsample_factor = fusion_downsample_factor
+        self.fusion_highres_skip = fusion_highres_skip
+        self.fusion_output_mode = fusion_output_mode
+        self.fusion_upsample = fusion_upsample
         self.image_shapes = {
             str(key): tuple(shape) for key, shape in (image_shapes or {}).items()
         }
@@ -130,6 +177,7 @@ class ForceAwareObsEncoder(nn.Module):
             getattr(getattr(backbone, "config", None), "num_register_tokens", 0)
         )
         self.patch_counts = {}
+        self.patch_grid_shapes = {}
         if self.image_shapes:
             patch_size = getattr(backbone.config, "patch_size", None)
             if patch_size is None:
@@ -142,7 +190,14 @@ class ForceAwareObsEncoder(nn.Module):
                 if (len(shape) != 3 or shape[0] != 3 or patch_h < 1 or patch_w < 1
                         or shape[1] % patch_h or shape[2] % patch_w):
                     raise ValueError(f"camera {key!r} shape must be RGB and divisible by DINO patch size")
-                self.patch_counts[key] = (shape[1] // patch_h) * (shape[2] // patch_w)
+                grid_h, grid_w = shape[1] // patch_h, shape[2] // patch_w
+                if grid_h % fusion_downsample_factor or grid_w % fusion_downsample_factor:
+                    raise ValueError(
+                        f"camera {key!r} patch grid {(grid_h, grid_w)} must be divisible "
+                        f"by fusion_downsample_factor={fusion_downsample_factor}"
+                    )
+                self.patch_grid_shapes[key] = (grid_h, grid_w)
+                self.patch_counts[key] = grid_h * grid_w
 
         self.image_projection = nn.Linear(int(hidden_size), self.n_emb)
         self.wrench_projection = nn.Linear(int(wrench_dim), self.n_emb)
@@ -267,12 +322,33 @@ class ForceAwareObsEncoder(nn.Module):
         return self.n_emb
 
     @property
+    def context_patch_counts(self) -> dict[str, int]:
+        """Per-camera visual counts after fusion's optional upsampling."""
+        factor = 1 if self.fusion_upsample else self.fusion_downsample_factor
+        return {key: count // (factor * factor) for key, count in self.patch_counts.items()}
+
+    @property
+    def context_patch_grid_shapes(self) -> dict[str, tuple[int, int]]:
+        """Visual output grids; ``patch_grid_shapes`` retains the DINO layout."""
+        factor = 1 if self.fusion_upsample else self.fusion_downsample_factor
+        return {key: (height // factor, width // factor)
+                for key, (height, width) in self.patch_grid_shapes.items()}
+
+    @property
     def context_tokens_per_observation(self) -> int:
         if not self.cross_attn_layers:
-            return sum(self.patch_counts.values()) + self.wrench_history_steps
+            image_count = sum(self.context_patch_counts.values())
+            return (image_count if self.fusion_output_mode == "visual"
+                    else image_count + self.wrench_history_steps)
         if self.cross_attn_query == "image":
             return sum(self.patch_counts.values())
         return self.wrench_history_steps
+
+    @property
+    def fusion_tokens_per_observation(self) -> int:
+        """Joint self-attention length, before optional visual upsampling."""
+        factor = self.fusion_downsample_factor
+        return sum(count // (factor * factor) for count in self.patch_counts.values()) + self.wrench_history_steps
 
     def _set_backbone_frozen(self) -> None:
         if self.freeze_backbone:
@@ -337,6 +413,55 @@ class ForceAwareObsEncoder(nn.Module):
             fused = query_tokens + fused
         fused = fused + block.cross_ffn(block.cross_output_norm(fused))
         return fused
+
+    def _coarse_residual_self_attention(
+        self, image_tokens, force_tokens, image_keys, patch_counts,
+    ):
+        """Fuse pooled visual tokens, optionally upsample and retain a skip.
+
+        Each camera and observation keeps its own spatial grid. The original
+        high-resolution features bypass pooling by default. Without that skip,
+        return the full fused visual output, upsampling only when requested.
+        All wrench outputs remain available for the final context selection;
+        pooling/interpolation add no checkpoint parameters.
+        """
+        factor = self.fusion_downsample_factor
+        camera_tokens = image_tokens.split(patch_counts, dim=1)
+        coarse_tokens, coarse_counts = [], []
+        for key, tokens in zip(image_keys, camera_tokens):
+            height, width = self.patch_grid_shapes[key]
+            grid = tokens.transpose(1, 2).reshape(-1, self.n_emb, height, width)
+            coarse = F.avg_pool2d(grid, kernel_size=factor, stride=factor)
+            coarse = coarse.flatten(2).transpose(1, 2)
+            coarse_tokens.append(coarse)
+            coarse_counts.append(coarse.shape[1])
+
+        coarse_images = torch.cat(coarse_tokens, dim=1)
+        image_count = coarse_images.shape[1]
+        mixed = self.pre_cross_self_attention(
+            torch.cat([coarse_images, force_tokens], dim=1)
+        )
+        coarse_visual = mixed[:, :image_count]
+        if not self.fusion_upsample:
+            return coarse_visual, mixed[:, image_count:]
+        if self.fusion_highres_skip:
+            # The Transformer already contains residuals. Subtract its visual
+            # input so the high-resolution skip does not add the base twice.
+            coarse_visual = coarse_visual - coarse_images
+        restored_updates = []
+        for key, delta in zip(image_keys, coarse_visual.split(coarse_counts, dim=1)):
+            height, width = self.patch_grid_shapes[key]
+            delta_grid = delta.transpose(1, 2).reshape(
+                -1, self.n_emb, height // factor, width // factor,
+            )
+            restored = F.interpolate(
+                delta_grid, size=(height, width), mode="bilinear", align_corners=False,
+            )
+            restored_updates.append(restored.flatten(2).transpose(1, 2))
+        restored_images = torch.cat(restored_updates, dim=1)
+        if self.fusion_highres_skip:
+            restored_images = image_tokens + restored_images
+        return restored_images, mixed[:, image_count:]
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -430,6 +555,9 @@ class ForceAwareObsEncoder(nn.Module):
 
         This path never runs the wrench encoder or fusion attention. Frozen
         backbone weights can still propagate gradients to rendered RGB inputs.
+        Visual-only teachers without upsampling use independently pooled camera
+        grids after projection/embeddings and before the final normalization,
+        matching their action-head layout. Other teachers retain dense patches.
         Training-only distillation can replay each fusion FFN with a zero
         attention update, matching the image-query teacher when alpha is zero.
         A boolean [B, To] mask skips unselected observations and leaves their
@@ -473,6 +601,18 @@ class ForceAwareObsEncoder(nn.Module):
             images, keys, batch_size, obs_steps, input_grad=input_grad,
             selected_observation_indices=selected_observation_indices,
         )
+        if self.fusion_output_mode == "visual" and not self.fusion_upsample:
+            factor = self.fusion_downsample_factor
+            pooled_tokens = []
+            for key, camera_tokens in zip(keys, tokens):
+                height, width = self.patch_grid_shapes[key]
+                grid = camera_tokens.reshape(batch_size * obs_steps, -1, self.n_emb)
+                grid = grid.transpose(1, 2).reshape(-1, self.n_emb, height, width)
+                pooled = F.avg_pool2d(grid, kernel_size=factor, stride=factor)
+                pooled_tokens.append(pooled.flatten(2).transpose(1, 2).reshape(
+                    batch_size, obs_steps, -1, self.n_emb,
+                ))
+            tokens = pooled_tokens
         context = torch.cat(tokens, dim=2).reshape(batch_size * obs_steps, -1, self.n_emb)
         if selected_observation_indices is not None:
             tokens_per_observation = context.shape[1]
@@ -621,21 +761,26 @@ class ForceAwareObsEncoder(nn.Module):
             batch_size * obs_steps, image_token_count, self.n_emb
         )
         if self.pre_cross_self_attn_layers:
-            # Per observation: [all camera patches, all temporal wrench outputs].
-            # Self-attention changes features, preserving token order/length.
-            mixed = self.pre_cross_self_attention(
-                torch.cat([flat_images, flat_force], dim=1)
-            )
-            flat_images = mixed[:, :image_token_count]
-            flat_force = mixed[:, image_token_count:]
+            if self.fusion_downsample_factor > 1:
+                flat_images, flat_force = self._coarse_residual_self_attention(
+                    flat_images, flat_force, image_keys, camera_patch_counts,
+                )
+            else:
+                # Dense baseline: [all camera patches, all temporal wrench outputs].
+                mixed = self.pre_cross_self_attention(
+                    torch.cat([flat_images, flat_force], dim=1)
+                )
+                flat_images = mixed[:, :image_token_count]
+                flat_force = mixed[:, image_token_count:]
 
         self.last_cross_attention_weights = None
         self.last_cross_attention_weights_by_camera = None
         self.last_cross_attention_weights_by_layer = []
         if not self.cross_attn_layers:
-            # No cross-attention: retain both streams, including any preceding
-            # joint self-attention updates, rather than discarding the images.
-            context = torch.cat([flat_images, flat_force], dim=1)
+            # Force tokens participate in every joint self-attention layer.
+            # Select the action-head context only after both streams are fused.
+            context = (flat_images if self.fusion_output_mode == "visual"
+                       else torch.cat([flat_images, flat_force], dim=1))
         else:
             if self.cross_attn_query == "wrench":
                 context, memory = flat_force, flat_images

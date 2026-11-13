@@ -14,6 +14,7 @@ _bmad/
 data/
 data_converter/dataset/
 outputs/
+model_output/
 wandb/
 logs/
 checkpoints/

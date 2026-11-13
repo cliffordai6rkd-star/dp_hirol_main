@@ -41,6 +41,10 @@ def resolve_student_teacher(cfg):
     from omegaconf import OmegaConf, open_dict
     from diffusion_policy.common.config_cli import configured_output_dir, load_config_reference
 
+    if OmegaConf.is_missing(cfg, "teacher_checkpoint"):
+        # New-teacher presets require an explicit checkpoint. Preserve null
+        # as the historical opt-in to automatic action-MSE selection.
+        raise ValueError("Set teacher_checkpoint=/path/to/new_teacher/checkpoints/best.ckpt")
     source = None
     if cfg.get("teacher_config"):
         source = load_config_reference(

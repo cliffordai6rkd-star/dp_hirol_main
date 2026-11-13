@@ -113,7 +113,8 @@ class MetricsReader:
 
 _REGION_COMPONENTS = {"context_patch_mse", "mask_mse", "intensity_smoothness", "intensity_loss"}
 _COMPONENTS = ("token_mse", "phase_ce", "alpha_mse", "context_patch_mse",
-               "mask_mse", "intensity_smoothness", "intensity_loss", "loss")
+               "mask_mse", "intensity_smoothness", "intensity_loss", "loss",
+               "force_delta_mse", "force_delta_loss", "context_region_loss")
 _PREFIXES = ("train_", "val_", "epoch_train_", "epoch_val_", "initial_train_", "initial_val_")
 _METRIC_KEYS = {prefix + component for prefix in _PREFIXES
                 for component in (*_COMPONENTS, "mse", "open_token_mse", "closed_token_mse",
@@ -128,6 +129,7 @@ class LossHistory:
         self.step = self.epoch = 0
         self.objective = "token_mse"
         self.metric_scope = "all"
+        self.selection_metric = None
 
     def _put(self, key, step, value):
         if isinstance(value, numbers.Real) and math.isfinite(value):
@@ -146,6 +148,8 @@ class LossHistory:
             warmup = record.get("objective") == "condition_warmup"
             if "objective" in record and not warmup:
                 self.objective = record["objective"]
+            if "selection_metric" in record:
+                self.selection_metric = record["selection_metric"]
             step = record.get("global_step", record.get("step", self.step))
             if not isinstance(step, numbers.Real) or not math.isfinite(step):
                 continue
@@ -158,7 +162,9 @@ class LossHistory:
                                     if prefix in {"train_", "initial_train_"}
                                     else "val_token_mse_measured")
                     if prefix + "mse" in values and record.get(measured_key, not warmup):
-                        values.setdefault(prefix + "token_mse", values[prefix + "mse"])
+                        component = ("loss" if self.selection_metric == "force context loss"
+                                     else "token_mse")
+                        values.setdefault(prefix + component, values[prefix + "mse"])
             if warmup and "train_mse" in values:
                 values.setdefault("train_loss", values["train_mse"])
             if warmup:
@@ -222,16 +228,30 @@ def _rolling_mean(values, window):
 
 
 def save_loss_plot(history, output, smooth_window=100, max_points=4000):
-    """Atomically replace eight loss panels; all horizontal axes use global steps."""
+    """Atomically replace loss panels; all horizontal axes use global steps."""
     if smooth_window < 1 or max_points < 1:
         raise ValueError("smooth_window and max_points must be positive")
     output = Path(output)
-    figure = Figure(figsize=(16, 16), constrained_layout=True)
+    force_panels = [
+        ("force_delta_mse", "Force difference MSE (raw)"),
+        ("force_delta_loss", "Force difference loss (normalized)"),
+        ("context_region_loss", "Context region RGB loss"),
+    ]
+    if history.selection_metric == "force context loss":
+        panels = [("loss", "Combined force-context loss"),
+                  ("token_mse", "Context token MSE"), *force_panels]
+    else:
+        panels = list(zip(_COMPONENTS[:8], (
+            "Context token MSE", "Contact phase CE", "Alpha MSE", "Region patch SmoothL1",
+            "Region pixel MSE (diagnostic)", "Region smoothness",
+            "Weighted region loss", "Total training loss",
+        )))
+        panels.extend(panel for panel in force_panels if any(
+            prefix + panel[0] in history.series for prefix in _PREFIXES))
+    rows = math.ceil(len(panels) / 2)
+    figure = Figure(figsize=(16, 4 * rows), constrained_layout=True)
     FigureCanvasAgg(figure)
-    axes = figure.subplots(4, 2).ravel()
-    titles = ("Context token MSE", "Contact phase CE", "Alpha MSE", "Region patch SmoothL1",
-              "Region pixel MSE (diagnostic)", "Region smoothness",
-              "Weighted region loss", "Total training loss")
+    axes = figure.subplots(rows, 2, squeeze=False).ravel()
 
     def curve(axis, key, label, **options):
         x, y = history.points(key)
@@ -239,7 +259,7 @@ def save_loss_plot(history, output, smooth_window=100, max_points=4000):
             x, y = _thin(x, y, max_points)
             axis.plot(x, y, label=label, **options)
 
-    for axis, component, title in zip(axes, _COMPONENTS, titles):
+    for axis, (component, title) in zip(axes, panels):
         if component == "token_mse" and history.metric_scope == "phases_1_2":
             title += "\npre-contact + contact (combined)"
         x, y = history.points("train_" + component)
@@ -281,6 +301,8 @@ def save_loss_plot(history, output, smooth_window=100, max_points=4000):
         else:
             axis.text(.5, .5, "Waiting for measured losses", ha="center", va="center",
                       transform=axis.transAxes, color="gray")
+    for axis in axes[len(panels):]:
+        axis.set_visible(False)
     figure.suptitle(f"RenderNet losses | epoch {history.epoch:g} | step {history.step:g}", fontsize=15)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp.png")

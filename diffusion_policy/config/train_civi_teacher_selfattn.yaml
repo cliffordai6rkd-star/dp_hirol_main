@@ -1,0 +1,72 @@
+# Keep DINO/LSTM inputs and fuse both streams with joint self-attention.
+# The action head reads only coarse visual output positions: no separate
+# torque output slots, high-resolution skip, or spatial upsampling.
+defaults:
+  - train_civi_teacher
+  - _self_
+
+name: train_civi_teacher_selfattn
+action_head_backbone: act
+val_epoch_every: 5
+exp_name: ${name}_${action_head_backbone}
+output_dir: model_output/${now:%Y.%m.%d}/${now:%H.%M.%S}_civi_selfattn_${action_head_backbone}/teacher
+
+policy:
+  pre_cross_self_attn_layers: 2
+  # Per camera: 14x14 -> 7x7. Two cameras and two observations give 196
+  # visual context tokens, each 256-dimensional; fusion still includes tau.
+  fusion_downsample_factor: 2
+  fusion_upsample: false
+  fusion_highres_skip: false
+  fusion_output_mode: visual
+  cross_attn_layers: 0
+  # Kept for the legacy encoder constructor; unused without cross-attention.
+  cross_attn_query: image
+  action_head_backbone: ${action_head_backbone}
+  act_loss_type: l1
+  # The observation encoder already performs the joint self-attention.
+  n_cond_layers: 0
+  n_layer: 6
+  n_emb: 256
+  n_head: 4
+  # Inherit FACTR's global blur: first 2/3 at sigma=5, last 1/3 decays to 0.
+  # No contact alpha is applied to the joint self-attention token sequence.
+
+training:
+  resume: false
+  num_epochs: 1000
+  num_optimizer_steps: null
+  val_epoch_every: ${val_epoch_every}
+  val_every: ${val_epoch_every}
+  validation_start_optimizer_step: 0
+  checkpoint_every: ${val_epoch_every}
+  checkpoint_every_optimizer_steps: null
+  log_every_optimizer_steps: 50
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    # Epochs since the best validation loss, not number of validations.
+    patience: 100
+    min_delta: 0.0
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.8f}.ckpt
+  action_mse:
+    # Select on held-out validation loss instead of full-training-set MSE.
+    enabled: false
+
+task:
+  dataset:
+    # Split whole episodes; the normalizer is fit on training windows only.
+    val_ratio: 0.1
+
+logging:
+  enable_plots: true
+  plot_interval_sec: 10.0
+  name: ${exp_name}
+  tags: [xarm, 25hz, clean, tau-ext, joint-position, dual-camera, joint-self-attention, lstm2, "${action_head_backbone}"]
+

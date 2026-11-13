@@ -65,8 +65,6 @@ render_net:
   rendering_mode: residual
   shared_condition_backbone: false
   separate_gate_path: true # 两条视觉路径独立；冻结条件不会限制 render encoder 的训练。
-  spatial_modulation:
-    enabled: true # 在 RGB decoder 前两层后启用 FiLM，使用融合特征与条件 region 调制。
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
   wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
@@ -182,7 +180,7 @@ training:
     allow_tf32: true
   compile:
     enabled: true
-    render_backbone: true # 第二阶段编译独立 render encoder 和含 FiLM 的 decoder。
+    render_backbone: true # 第二阶段编译独立 render encoder 和 decoder。
     student_dino: true
     backend: inductor
     mode: default

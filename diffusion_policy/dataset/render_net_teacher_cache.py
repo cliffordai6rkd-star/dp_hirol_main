@@ -105,9 +105,14 @@ class TeacherTargetCache:
         self._pid = None
         self.in_ram = False
 
-    def append(self, tokens, patch_attention):
+    def append(self, tokens, patch_attention, *, zero_tokens=None):
+        """Commit a batch, optionally paired with physical-zero-wrench targets."""
+        if zero_tokens is not None and zero_tokens.shape != tokens.shape:
+            raise ValueError("Teacher cache zero_tokens must have the same shape as tokens")
         dtype = torch.float16 if self.token_dtype == np.float16 else torch.float32
         values = {"tokens": tokens.detach().to(device="cpu", dtype=dtype).numpy()}
+        if zero_tokens is not None:
+            values["zero_tokens"] = zero_tokens.detach().to(device="cpu", dtype=dtype).numpy()
         values.update({f"attention:{key}": value.detach().float().cpu().numpy()
                        for key, value in patch_attention.items()})
         size = len(values["tokens"])
@@ -132,10 +137,11 @@ class TeacherTargetCache:
         else:
             self._open_arrays("r+")
         if set(values) != set(self._arrays):
-            raise ValueError("Teacher cache attention camera keys changed")
+            raise ValueError("Teacher cache target keys changed: paired tokens or attention cameras")
         for key, value in values.items():
             if list(value.shape[1:]) != self.metadata["arrays"][key]["shape"]:
                 raise ValueError(f"Teacher cache target shape changed: {key}")
+        for key, value in values.items():
             self._arrays[key][start:end] = value
             self._arrays[key].flush()
         self.metadata["completed_samples"] = end
@@ -151,7 +157,37 @@ class TeacherTargetCache:
         tokens = torch.from_numpy(np.array(self._arrays["tokens"][index], copy=True))
         attention = {key.removeprefix("attention:"): torch.from_numpy(np.array(value[index], copy=True))
                      for key, value in self._arrays.items() if key.startswith("attention:")}
-        return {"tokens": tokens, "patch_attention": attention}
+        targets = {"tokens": tokens, "patch_attention": attention}
+        if "zero_tokens" in self._arrays:
+            targets["zero_tokens"] = torch.from_numpy(
+                np.array(self._arrays["zero_tokens"][index], copy=True)
+            )
+        return targets
+
+    def force_difference_statistics(self, *, chunk_size=64):
+        """Measure the paired token difference over every element without loading all rows."""
+        if not self.complete:
+            raise RuntimeError("Force difference statistics require a complete teacher cache")
+        if "zero_tokens" not in self.metadata["arrays"]:
+            raise ValueError("Force difference statistics require paired zero_tokens")
+        if int(chunk_size) != chunk_size or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
+        if self._arrays is None or (not self.in_ram and self._pid != os.getpid()):
+            self._open_arrays("r")
+        real, zero = self._arrays["tokens"], self._arrays["zero_tokens"]
+        if real.shape != zero.shape:
+            raise ValueError("Teacher cache zero_tokens must have the same shape as tokens")
+        sum_square, elements = 0.0, 0
+        for start in range(0, self.length, int(chunk_size)):
+            end = min(start + int(chunk_size), self.length)
+            difference = np.subtract(real[start:end], zero[start:end], dtype=np.float64)
+            np.square(difference, out=difference)
+            sum_square += float(difference.sum(dtype=np.float64))
+            elements += int(difference.size)
+        if not elements or not np.isfinite(sum_square):
+            raise FloatingPointError("Force difference statistics require finite, nonempty paired targets")
+        return {"mean_square": sum_square / elements, "sum_square": sum_square,
+                "elements": elements, "samples": self.length}
 
     def __getstate__(self):
         state = dict(self.__dict__)

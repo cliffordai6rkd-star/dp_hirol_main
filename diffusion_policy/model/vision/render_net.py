@@ -84,34 +84,6 @@ class BottleneckDecoderBlock(nn.Module):
         return F.silu(self.body(torch.cat([features, skip], dim=1)) + skip)
 
 
-class SpatialModulation(nn.Module):
-    """Condition one decoder feature map with the fused spatial context.
-
-    The last affine layer is zero initialized, so enabling this module starts
-    as an identity transform.  ``gate`` is supplied by the student region
-    head at the same input, rather than by a broadcast wrench vector.
-    """
-
-    def __init__(self, feature_channels, conditioning_channels):
-        super().__init__()
-        hidden = max(8, min(feature_channels, conditioning_channels))
-        self.affine = nn.Sequential(
-            nn.Conv2d(feature_channels + conditioning_channels, hidden, 1),
-            nn.SiLU(),
-            nn.Conv2d(hidden, 2 * feature_channels, 1),
-        )
-        nn.init.zeros_(self.affine[-1].weight)
-        nn.init.zeros_(self.affine[-1].bias)
-
-    def forward(self, feature, fused_feature, gate):
-        condition = F.interpolate(
-            fused_feature, size=feature.shape[-2:], mode="bilinear", align_corners=False,
-        )
-        gamma, beta = self.affine(torch.cat([feature, condition], dim=1)).chunk(2, dim=1)
-        gate = F.interpolate(gate, size=feature.shape[-2:], mode="bilinear", align_corners=False)
-        return feature + gate * (gamma * feature + beta)
-
-
 class ImageSelfAttentionBlock(nn.Module):
     """One image-token self-attention block."""
 
@@ -287,33 +259,14 @@ class ConvAttentionBackbone(nn.Module):
         features = self.norm(tokens).transpose(1, 2).reshape(image.shape[0], self.embed_dim, gh, gw)
         return features, skips, height, width
 
-    def forward(self, image, wrench_tokens, camera_embedding, *, return_decoder_features=False,
-                spatial_modulations=None, modulation_gate=None):
-        """Encode, fuse and decode one camera image.
-
-        ``spatial_modulations`` are applied immediately after the selected
-        decoder blocks.  Keeping the modulation inside this loop is important:
-        the modified feature is then consumed by every later decoder instead
-        of being projected back into the final feature map as a side branch.
-        """
+    def forward(self, image, wrench_tokens, camera_embedding):
+        """Encode, fuse and decode one camera image."""
         features, skips, height, width = self.encode(image, wrench_tokens, camera_embedding)
-        return self.decode_features(
-            features, skips, height, width, return_decoder_features=return_decoder_features,
-            spatial_modulations=spatial_modulations, modulation_gate=modulation_gate,
-        )
+        return self.decode_features(features, skips, height, width)
 
-    def decode_features(self, features, skips, height, width, *, return_decoder_features=False,
-                        spatial_modulations=None, modulation_gate=None):
+    def decode_features(self, features, skips, height, width):
         """Decode an existing fused representation without repeating its encoder."""
-        if spatial_modulations is not None:
-            if modulation_gate is None:
-                raise ValueError("spatial modulation requires modulation_gate")
-            if len(spatial_modulations) > len(self.decoders):
-                raise ValueError("spatial_modulations cannot exceed decoder count")
-        fused_features = features
-        decoder_features = []
-        for decoder_index, (decoder, skip) in enumerate(
-                zip(self.decoders, reversed(skips[-self.decoder_layers:]))):
+        for decoder, skip in zip(self.decoders, reversed(skips[-self.decoder_layers:])):
             if self.conv_block == "bottleneck":
                 features = decoder(features, skip)
             else:
@@ -321,19 +274,10 @@ class ConvAttentionBackbone(nn.Module):
                     F.interpolate(features, size=skip.shape[-2:], mode="bilinear", align_corners=False),
                     skip,
                 ], dim=1))
-            if spatial_modulations is not None and decoder_index < len(spatial_modulations):
-                features = spatial_modulations[decoder_index](
-                    features, fused_features, modulation_gate,
-                )
-            if return_decoder_features:
-                decoder_features.append(features)
         if features.shape[-2:] != (height, width):
             features = F.interpolate(features, size=(height, width), mode="bilinear", align_corners=False)
         features = features[:, :, :height, :width]
-        result = (self.output(features), features)
-        if return_decoder_features:
-            return (*result, decoder_features, fused_features)
-        return result
+        return self.output(features), features
 
 
 class DINOAttentionBackbone(ConvAttentionBackbone):
@@ -543,7 +487,9 @@ class RenderNet(nn.Module):
     The condition path predicts region maps, phase logits, and alpha. With
     ``separate_gate_path`` and ``condition_backbone``, it has its own compact
     visual encoder; freezing conditions leaves the entire RGB path trainable.
-    Shared-backbone and legacy joint/intensity modes remain checkpoint compatible.
+    Shared-backbone and legacy joint/intensity modes remain available.
+    ``cross_camera_attn_layers > 0`` selects plain RGB residual rendering:
+    camera bottlenecks exchange information without region or phase heads.
     """
 
     def __init__(self, wrench_dim, base_channels=16, conditioning_dim=256, residual_scale=0.1,
@@ -554,9 +500,10 @@ class RenderNet(nn.Module):
                  wrench_dropout=0.0, image_keys=("side", "wrist"),
                  initialize_wrench_from_teacher=True, conv_block="standard",
                  rendering_mode="residual", glow=None, patch_residual_refine=True,
-                 spatial_modulation=None, backbone=None, architecture_version=None,
+                 backbone=None, architecture_version=None,
                  separate_gate_path=False, transformer=None, phase_prediction=None,
-                 shared_condition_backbone=False, dino=None, condition_backbone=None):
+                 shared_condition_backbone=False, dino=None, condition_backbone=None,
+                 use_contact_alpha=True, use_region_gate=True, cross_camera_attn_layers=0):
         super().__init__()
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints. Accepting those fields keeps old CNN
@@ -594,22 +541,17 @@ class RenderNet(nn.Module):
             raise ValueError("backbone must be unet, transformer, cnn or omitted")
         if rendering_mode not in {"residual", "patch_residual", "gaussian_glow"}:
             raise ValueError("rendering_mode must be residual, patch_residual or gaussian_glow")
-        spatial_config = dict(spatial_modulation or {})
-        unknown_spatial = set(spatial_config) - {"enabled"}
-        if unknown_spatial:
-            raise ValueError(f"Unknown spatial_modulation options: {sorted(unknown_spatial)}")
-        self.spatial_modulation_enabled = bool(spatial_config.get("enabled", False))
-        if self.spatial_modulation_enabled and rendering_mode != "residual":
-            raise ValueError("spatial_modulation is currently supported only for rendering_mode=residual")
         effective_decoder_layers = ((3 if image_encoder == "dino_lora" else int(math.log2(patch_size)))
                                     if decoder_layers is None else int(decoder_layers))
-        if self.spatial_modulation_enabled and effective_decoder_layers < 2:
-            raise ValueError("spatial_modulation requires at least two decoder layers (/8 and /4)")
         self.rendering_mode = rendering_mode
         self.image_keys = tuple(sorted(str(key) for key in image_keys))
         if not self.image_keys or len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must be nonempty and unique")
         self.residual_scale = float(residual_scale)
+        # These switches affect rendering only. Keep the condition network and
+        # checkpoint tensors intact for paired rendering-gate ablations.
+        self.use_contact_alpha = bool(use_contact_alpha)
+        self.use_region_gate = bool(use_region_gate)
         self.image_encoder_name = str(image_encoder)
         self.wrench_encoder_name = str(wrench_encoder)
         self.conv_block = conv_block
@@ -622,6 +564,19 @@ class RenderNet(nn.Module):
             raise ValueError(f"Unknown phase_prediction options: {sorted(unknown_phase)}")
         self.phase_prediction_enabled = bool(phase_config.get("enabled", False))
         self.shared_condition_backbone = bool(shared_condition_backbone)
+        if int(cross_camera_attn_layers) != cross_camera_attn_layers or cross_camera_attn_layers < 0:
+            raise ValueError("cross_camera_attn_layers must be a non-negative integer")
+        self.cross_camera_attn_layers = int(cross_camera_attn_layers)
+        if self.cross_camera_attn_layers and (
+            image_encoder != "cnn" or rendering_mode != "residual" or len(self.image_keys) < 2
+            or self.use_contact_alpha or self.use_region_gate or self.phase_prediction_enabled
+            or bool((high_attention_render or {}).get("enabled", False))
+            or self.shared_condition_backbone or separate_gate_path or condition_backbone is not None
+        ):
+            raise ValueError(
+                "cross_camera_attn_layers requires CNN residual rendering with at least two cameras "
+                "and disabled region/contact-alpha/phase conditions and condition backbones"
+            )
         if self.shared_condition_backbone and (
             separate_gate_path or not self.phase_prediction_enabled or rendering_mode != "residual"
         ):
@@ -770,19 +725,12 @@ class RenderNet(nn.Module):
                 self.mask_head.bias.data[0] = 0.1
                 if self.phase_prediction_enabled:
                     nn.init.normal_(self.mask_head.weight.data[1:], std=0.01)
-        self.spatial_modulations = nn.ModuleList()
-        if self.spatial_modulation_enabled:
-            decoder_channels = [module.body[-2].out_channels
-                                if isinstance(module, ResidualBlock)
-                                else module.body[-1].num_channels
-                                for module in self.backbone.decoders[:2]]
-            # The first two decoder outputs are /8 and /4 for patch_size=16.
-            # They are modified in-place in ConvAttentionBackbone.forward;
-            # subsequent decoder blocks consume the conditioned features.
-            for channels in decoder_channels:
-                self.spatial_modulations.append(
-                    SpatialModulation(channels, self.backbone.embed_dim)
-                )
+        # Each batch item is one observation time. These blocks exchange only
+        # camera tokens from that time, after their image/wrench encoding.
+        self.cross_camera_attention = nn.ModuleList([
+            ImageSelfAttentionBlock(embed_dim, num_heads, mlp_ratio, dropout)
+            for _ in range(self.cross_camera_attn_layers)
+        ])
         self._compiled_backbone_forward = None
         self._compiled_shared_encode = None
         self._compiled_shared_decode = None
@@ -791,27 +739,26 @@ class RenderNet(nn.Module):
     def compile_backbone(self, **kwargs):
         # Compile only the image path. LSTM stays in cuDNN; state_dict keys stay
         # unchanged, and evaluation does not compile a second forward-only graph.
-        if self.shared_condition_backbone:
+        if self.shared_condition_backbone or self.cross_camera_attn_layers:
             self._compiled_shared_encode = torch.compile(self.backbone.encode, **kwargs)
-            # The selected observation count changes between batches. Encode
-            # keeps its fixed full batch; decode accepts the variable subset.
+            # The condition path encodes every observation and decodes a
+            # subset. The plain RGB path applies selection before both calls;
+            # its caller supplies dynamic=True when sparse rendering is used.
             decode_options = {**kwargs, "dynamic": True}
             self._compiled_shared_decode = torch.compile(self._shared_decode, **decode_options)
         else:
             self._compiled_backbone_forward = torch.compile(self.backbone.forward, **kwargs)
 
-    def _shared_decode(self, features, skips, height, width, gate):
-        return self.backbone.decode_features(
-            features, skips, height, width,
-            spatial_modulations=self.spatial_modulations if self.spatial_modulation_enabled else None,
-            modulation_gate=gate,
-        )[0]
+    def _shared_decode(self, features, skips, height, width):
+        return self.backbone.decode_features(features, skips, height, width)[0]
 
     def _set_requires_grad(self, module, enabled):
         if module is not None:
             module.requires_grad_(bool(enabled))
 
     def _gate_modules(self):
+        if self.cross_camera_attn_layers:
+            return ()
         if self.shared_condition_backbone:
             modules = [
                 *self.backbone.encoder_modules(), self.camera_embedding,
@@ -849,19 +796,27 @@ class RenderNet(nn.Module):
         return tuple(modules)
 
     def _rgb_modules(self):
+        if self.cross_camera_attn_layers:
+            modules = [self.backbone, self.camera_embedding, self.cross_camera_attention]
+            if not self._wrench_encoder_frozen:
+                modules.extend([
+                    self.wrench_projection, self.wrench_encoder,
+                    self.wrench_position, self.obs_position, self.force_modality,
+                ])
+            return tuple(modules)
         if self.shared_condition_backbone:
-            return (*self.backbone.rgb_modules(), self.spatial_modulations)
+            return self.backbone.rgb_modules()
         if not self.separate_gate_path:
             # The shared encoder stays frozen in the legacy RGB-only stage;
             # renderer-specific heads (patch refinement or Gaussian blobs)
             # remain trainable alongside the final output projection.
-            rgb_only = [self.backbone.output, self.spatial_modulations]
+            rgb_only = [self.backbone.output]
             for name in ("refine", "blob_queries", "blob_attention", "blob_norm"):
                 module = getattr(self.backbone, name, None)
                 if module is not None:
                     rgb_only.append(module)
             return tuple(rgb_only)
-        modules = [self.backbone, self.camera_embedding, self.spatial_modulations]
+        modules = [self.backbone, self.camera_embedding]
         if not self._wrench_encoder_frozen:
             modules.extend([
                 self.wrench_projection, self.wrench_encoder,
@@ -900,7 +855,7 @@ class RenderNet(nn.Module):
     def set_training_stage(self, stage):
         """Select the condition/RGB paths that receive gradients.
 
-        ``condition_warmup`` trains the condition branch while RGB and FiLM
+        ``condition_warmup`` trains the condition branch while RGB decoders
         stay frozen. ``joint`` trains both paths, except explicitly frozen
         force encoders. Legacy ``intensity`` aliases condition warm-up and
         legacy ``rgb`` trains RGB while freezing the condition branch.
@@ -908,11 +863,13 @@ class RenderNet(nn.Module):
         stage = str(stage)
         if stage not in {"intensity", "rgb", "condition_warmup", "joint"}:
             raise ValueError("RenderNet stage must be intensity, rgb, condition_warmup or joint")
+        if self.cross_camera_attn_layers and stage not in {"rgb", "joint"}:
+            raise ValueError("Cross-camera RGB rendering has no condition warm-up stage")
         self.training_stage = stage
         self.requires_grad_(False)
         if stage in {"intensity", "condition_warmup", "joint"}:
             # The conditioning phase keeps its visual/wrench-conditioned gate
-            # branch trainable; RGB decoder and FiLM stay frozen.
+            # branch trainable; RGB decoders stay frozen.
             for module in self._gate_modules():
                 self._set_requires_grad(module, True)
         if stage in {"rgb", "joint"}:
@@ -1195,9 +1152,12 @@ class RenderNet(nn.Module):
         }
         if condition_only:
             return None, masks, self._condition_only_predictions(phase_predictions)
-        alpha = phase_predictions["contact_alpha"] if contact_alpha is None else contact_alpha
-        if alpha.shape != (batch, steps):
-            raise ValueError("contact_alpha must have shape [B, To]")
+        if self.use_contact_alpha:
+            alpha = phase_predictions["contact_alpha"] if contact_alpha is None else contact_alpha
+            if alpha.shape != (batch, steps):
+                raise ValueError("contact_alpha must have shape [B, To]")
+        else:
+            alpha = wrench_history.new_ones((batch, steps))
         decode = (self._compiled_shared_decode
                   if use_compiled and self._compiled_shared_decode is not None else self._shared_decode)
         rendered = {}
@@ -1219,7 +1179,7 @@ class RenderNet(nn.Module):
                 flat_image = flat_image.index_select(0, indices)
                 gate = gate.index_select(0, indices)
                 image_alpha = image_alpha.index_select(0, indices)
-            residual = decode(features, skips, height, width, gate).tanh()
+            residual = decode(features, skips, height, width).tanh()
             selected_image = (
                 flat_image + self.residual_scale * image_alpha * gate * residual
             ).clamp(0, 1)
@@ -1231,6 +1191,60 @@ class RenderNet(nn.Module):
             return rendered, masks if use_mask else {}, phase_predictions
         return (rendered, masks if use_mask else {}) if return_aux else rendered
 
+    def _forward_multicamera(self, images, wrench_history, *, return_aux,
+                             return_phase, render_observation_mask):
+        """Exchange camera features at each time, then decode their RGB separately."""
+        if set(images) != set(self.image_keys):
+            raise ValueError("Cross-camera rendering requires all configured image_keys")
+        batch, steps = wrench_history.shape[:2]
+        for image in images.values():
+            if image.ndim != 5 or image.shape[:3] != (batch, steps, 3):
+                raise ValueError("RenderNet requires matching [B, To, 3, H, W] images")
+        indices = self._render_observation_indices(
+            render_observation_mask, batch, steps, wrench_history.device,
+        )
+        wrench_tokens = self.encode_wrench_history(wrench_history)
+        if indices is not None:
+            wrench_tokens = wrench_tokens.index_select(0, indices)
+        rendered = {}
+        if indices is not None and indices.numel() == 0:
+            rendered = dict(images)
+        else:
+            use_compiled = self.training and torch.is_grad_enabled()
+            encode = (self._compiled_shared_encode
+                      if use_compiled and self._compiled_shared_encode is not None
+                      else self.backbone.encode)
+            decode = (self._compiled_shared_decode
+                      if use_compiled and self._compiled_shared_decode is not None
+                      else self._shared_decode)
+            encoded, token_groups = {}, []
+            for camera_index, key in enumerate(self.image_keys):
+                image = images[key].flatten(0, 1)
+                if indices is not None:
+                    image = image.index_select(0, indices)
+                camera = self.camera_embedding.weight[camera_index].reshape(1, 1, -1)
+                encoded[key] = encode(image, wrench_tokens, camera)
+                token_groups.append(encoded[key][0].flatten(2).transpose(1, 2))
+            tokens = torch.cat(token_groups, dim=1)
+            for block in self.cross_camera_attention:
+                tokens = block(tokens)
+            camera_tokens = tokens.split([group.shape[1] for group in token_groups], dim=1)
+            for key, tokens in zip(self.image_keys, camera_tokens):
+                features, skips, height, width = encoded[key]
+                features = tokens.transpose(1, 2).reshape_as(features)
+                raw_residual = decode(features, skips, height, width)
+                image = images[key]
+                flat_image = image.flatten(0, 1)
+                if indices is not None:
+                    flat_image = flat_image.index_select(0, indices)
+                rgb = (flat_image + self.residual_scale * raw_residual.tanh()).clamp(0, 1)
+                if indices is not None:
+                    rgb = image.flatten(0, 1).index_copy(0, indices, rgb)
+                rendered[key] = rgb.reshape_as(image)
+        if return_phase:
+            return rendered, {}, None
+        return (rendered, {}) if return_aux else rendered
+
     def _activate_region(self, logits):
         if self.region_activation == "relu":
             return F.relu(logits).clamp(max=1.0)
@@ -1238,6 +1252,8 @@ class RenderNet(nn.Module):
 
     def _mask_gate(self, mask, image):
         """Convert a predicted field into the spatial support used by RGB."""
+        if not self.use_region_gate:
+            return torch.ones_like(mask)
         if self.region_selection == "binary_top_percentile":
             height, width = image.shape[-2:]
             patch = self.backbone.patch_size
@@ -1267,6 +1283,11 @@ class RenderNet(nn.Module):
         if condition_only and not (self.phase_prediction_enabled and return_aux and return_phase):
             raise ValueError(
                 "condition_only requires phase prediction, return_aux=True, and return_phase=True"
+            )
+        if self.cross_camera_attn_layers:
+            return self._forward_multicamera(
+                images, wrench_history, return_aux=return_aux, return_phase=return_phase,
+                render_observation_mask=render_observation_mask,
             )
         if self.shared_condition_backbone:
             return self._forward_shared(
@@ -1300,15 +1321,17 @@ class RenderNet(nn.Module):
                 masks[key] = mask.reshape(batch, steps, 1, height, width)
             return None, masks, self._condition_only_predictions(phase_predictions)
         wrench_tokens = self.encode_wrench_history(wrench_history)
-        alpha = contact_alpha
-        if alpha is None and phase_predictions is not None:
-            alpha = phase_predictions["contact_alpha"]
-        if alpha is None and future_contact is not None:
-            if future_contact.ndim == 2:
-                future_contact = future_contact.unsqueeze(-1)
-            alpha = compute_contact_alpha(future_contact)
-        if alpha is not None and alpha.shape != (batch, steps):
-            raise ValueError("contact_alpha must have shape [B, To]")
+        alpha = None
+        if self.use_contact_alpha:
+            alpha = contact_alpha
+            if alpha is None and phase_predictions is not None:
+                alpha = phase_predictions["contact_alpha"]
+            if alpha is None and future_contact is not None:
+                if future_contact.ndim == 2:
+                    future_contact = future_contact.unsqueeze(-1)
+                alpha = compute_contact_alpha(future_contact)
+            if alpha is not None and alpha.shape != (batch, steps):
+                raise ValueError("contact_alpha must have shape [B, To]")
         rendered, masks = {}, {}
         for key, image in images.items():
             if key not in self.image_keys:
@@ -1333,27 +1356,18 @@ class RenderNet(nn.Module):
             flat_gate = self._mask_gate(mask, image) if use_mask else mask
             rgb_image = flat_image
             rgb_wrench = wrench_tokens
-            rgb_gate = flat_gate
             if render_indices is not None:
                 rgb_image = rgb_image.index_select(0, render_indices)
                 rgb_wrench = rgb_wrench.index_select(0, render_indices)
-                rgb_gate = rgb_gate.index_select(0, render_indices)
             rgb_camera = self.camera_embedding.weight[self.image_keys.index(key)].reshape(1, 1, -1)
             backbone_forward = (self._compiled_backbone_forward
                                 if self._compiled_backbone_forward is not None
                                 and self.training and torch.is_grad_enabled() else self.backbone)
-            backbone_kwargs = {}
-            if self.spatial_modulation_enabled and self.rendering_mode == "residual":
-                backbone_kwargs.update(
-                    spatial_modulations=self.spatial_modulations,
-                    modulation_gate=(rgb_gate.detach()
-                                     if self.detach_intensity_for_rgb else rgb_gate),
-                )
             if render_indices is not None and render_indices.numel() == 0:
                 raw_residual = torch.zeros_like(flat_image)
             else:
                 raw_residual, _ = backbone_forward(
-                    rgb_image, rgb_wrench, rgb_camera, **backbone_kwargs,
+                    rgb_image, rgb_wrench, rgb_camera,
                 )
                 if render_indices is not None:
                     raw_residual = raw_residual.new_zeros(flat_image.shape).index_copy(
@@ -1391,6 +1405,13 @@ class RenderNet(nn.Module):
 
 def build_render_net(wrench_dim, config):
     options = dict(config)
+    legacy_spatial = dict(options.pop("spatial_modulation", None) or {})
+    if legacy_spatial.get("enabled", False):
+        raise ValueError(
+            "Decoder FiLM has been removed. Start a new no-FiLM training run "
+            "without spatial_modulation in the config, or use the legacy code "
+            "to reproduce a FiLM-enabled checkpoint."
+        )
     # v1 serialized configs omitted the history length; that entry point used
     # seven samples.  Keep direct constructor defaults unchanged for new code.
     if ("wrench_history_steps" not in options and options.get("architecture_version", 1) == 1

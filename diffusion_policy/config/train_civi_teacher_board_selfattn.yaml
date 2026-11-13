@@ -1,0 +1,19 @@
+defaults:
+  - train_civi_teacher_selfattn
+  - _self_
+
+name: train_civi_teacher_board_selfattn
+dataset_path: data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+output_dir: model_output/${now:%Y.%m.%d}/${now:%H.%M.%S}_board_selfattn_${action_head_backbone}/teacher
+
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64
+
+training:
+  distributed:
+    enabled: false
+
+task:
+  name: board_clean_25hz_tau_ext

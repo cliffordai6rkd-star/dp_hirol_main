@@ -38,7 +38,6 @@ def _workspace():
         embed_dim=16, image_self_attn_layers=1, cross_attn_layers=1,
         patch_size=8, decoder_layers=3, num_heads=4, separate_gate_path=True,
         high_attention_render={"enabled": True, "threshold": 0., "detach_for_rgb": False},
-        spatial_modulation={"enabled": True},
         phase_prediction={"enabled": True, "hidden_dim": 8},
     )
     workspace.model.freeze_wrench_encoder()

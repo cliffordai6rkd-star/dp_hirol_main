@@ -49,7 +49,7 @@ def _renderer(pretrained_dino):
                           "freeze_wrench_encoder": True},
         high_attention_render={"enabled": True, "initial_strength": .4,
                                "threshold": .1, "detach_for_rgb": False},
-        spatial_modulation={"enabled": True}, residual_scale=.5,
+        residual_scale=.5,
     )
     model.freeze_wrench_encoder()
     model.set_training_stage("joint")
@@ -216,13 +216,11 @@ def test_dino_renderer_checkpoint_roundtrip_loads_strictly(pretrained_dino, tmp_
     _assert_base_frozen(restored)
 
 
-def test_compiled_dino_and_film_fullgraph_match_eager_outputs_and_gradients(pretrained_dino, monkeypatch):
+def test_compiled_dino_decoder_fullgraph_match_eager_outputs_and_gradients(pretrained_dino, monkeypatch):
     torch.manual_seed(1603)
     eager = _renderer(pretrained_dino)
     with torch.no_grad():
         eager.output.weight.normal_(std=.03)
-        for modulation in eager.spatial_modulations:
-            modulation.affine[-1].weight.normal_(std=.02)
         for parameter in eager.backbone.dino_encoder.lora_parameters():
             parameter.add_(.01)
     compiled = copy.deepcopy(eager)

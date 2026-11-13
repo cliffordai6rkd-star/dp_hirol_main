@@ -29,7 +29,7 @@ def _renderer(*, shared=True):
                           "freeze_wrench_encoder": True},
         high_attention_render={"enabled": True, "initial_strength": .4,
                                "threshold": 0., "detach_for_rgb": False},
-        spatial_modulation={"enabled": True}, residual_scale=.5,
+        residual_scale=.5,
     )
     model.freeze_wrench_encoder()
     return model
@@ -91,7 +91,6 @@ def test_shared_encoder_runs_once_per_camera_and_warmup_bypasses_decoder(monkeyp
         assert _has_gradient(model.mask_head)
         assert _has_gradient(model.phase_temporal_encoder)
         assert all(not parameter.requires_grad for parameter in model.backbone.decoders.parameters())
-        assert all(not parameter.requires_grad for parameter in model.spatial_modulations.parameters())
         assert all(parameter.grad is None for parameter in model.wrench_encoder.parameters())
 
         calls.clear()
@@ -104,7 +103,7 @@ def test_shared_encoder_runs_once_per_camera_and_warmup_bypasses_decoder(monkeyp
         hook.remove()
 
 
-def test_joint_loss_reaches_encoder_condition_rgb_and_film_after_zero_output_update():
+def test_joint_loss_reaches_encoder_condition_and_rgb_after_zero_output_update():
     torch.manual_seed(1202)
     model = _renderer()
     images, wrench = _observations()
@@ -121,8 +120,6 @@ def test_joint_loss_reaches_encoder_condition_rgb_and_film_after_zero_output_upd
         assert _has_gradient(model.output)
         if update:
             assert _has_gradient(model.backbone.decoders)
-            assert all(_has_gradient(modulation.affine[-1])
-                       for modulation in model.spatial_modulations)
         optimizer.step()
 
 
@@ -168,14 +165,12 @@ def test_render_selection_keeps_all_condition_predictions_and_free_images(monkey
         torch.testing.assert_close(free_prediction[key], full_prediction[key], rtol=0, atol=0)
 
 
-def test_compiled_shared_encode_and_film_decode_match_eager_outputs_and_gradients(monkeypatch):
+def test_compiled_shared_encode_and_decode_match_eager_outputs_and_gradients(monkeypatch):
     torch.manual_seed(1204)
     eager = _renderer().train()
-    # Exercise non-identity FiLM, including the gradient through its input.
+    # A nonzero RGB output exposes gradients through the full decoder.
     with torch.no_grad():
         eager.output.weight.normal_(std=.03)
-        for modulation in eager.spatial_modulations:
-            modulation.affine[-1].weight.normal_(std=.02)
     compiled = copy.deepcopy(eager)
     compiled.compile_backbone(backend="eager")
     calls = {"encode": 0, "decode": 0}
@@ -198,8 +193,8 @@ def test_compiled_shared_encode_and_film_decode_match_eager_outputs_and_gradient
         )
         (_rgb_loss(rendered, images) + _condition_loss(masks, prediction)).backward()
         outputs.append((rendered, masks, prediction))
-        assert all(_has_gradient(modulation.affine[-1])
-                   for modulation in model.spatial_modulations)
+        assert _has_gradient(model.backbone.decoders)
+        assert _has_gradient(model.backbone.stem)
     assert calls == {"encode": 2, "decode": 2}
     for expected, actual in zip(outputs[0], outputs[1]):
         for key in expected:
@@ -213,20 +208,18 @@ def test_compiled_shared_encode_and_film_decode_match_eager_outputs_and_gradient
             torch.testing.assert_close(actual.grad, expected.grad, msg=lambda message: name + ": " + message)
 
 
-def test_legacy_separate_gate_film_uses_compiled_backbone_and_matches_eager(monkeypatch):
+def test_separate_gate_path_uses_compiled_backbone_and_matches_eager(monkeypatch):
     torch.manual_seed(1205)
     eager = _renderer(shared=False).train()
     with torch.no_grad():
         eager.output.weight.normal_(std=.03)
-        for modulation in eager.spatial_modulations:
-            modulation.affine[-1].weight.normal_(std=.02)
     compiled = copy.deepcopy(eager)
     compiled.compile_backbone(backend="eager")
     implementation = compiled._compiled_backbone_forward
     calls = []
 
     def counted(*args, **kwargs):
-        calls.append(kwargs.get("spatial_modulations"))
+        calls.append(tuple(args[0].shape))
         return implementation(*args, **kwargs)
 
     monkeypatch.setattr(compiled, "_compiled_backbone_forward", counted)
@@ -236,10 +229,10 @@ def test_legacy_separate_gate_film_uses_compiled_backbone_and_matches_eager(monk
         rendered, masks, prediction = model(images, wrench, return_aux=True, return_phase=True)
         (_rgb_loss(rendered, images) + _condition_loss(masks, prediction)).backward()
         outputs.append((rendered, masks, prediction))
-        assert all(_has_gradient(modulation.affine[-1])
-                   for modulation in model.spatial_modulations)
+        assert _has_gradient(model.backbone.decoders)
+        assert _has_gradient(model.backbone.stem)
     assert len(calls) == len(images)
-    assert all(modulations is compiled.spatial_modulations for modulations in calls)
+    assert calls == [(4, 3, 16, 24)] * len(images)
     for expected, actual in zip(outputs[0], outputs[1]):
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key])

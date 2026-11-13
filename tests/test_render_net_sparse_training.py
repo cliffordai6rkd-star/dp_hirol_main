@@ -34,15 +34,12 @@ def _shared_workspace(*, joint=True):
         patch_size=8, decoder_layers=3, num_heads=4, conv_block="bottleneck",
         shared_condition_backbone=True, separate_gate_path=False,
         high_attention_render={"enabled": True, "threshold": 0., "detach_for_rgb": False},
-        spatial_modulation={"enabled": True},
         phase_prediction={"enabled": True, "hidden_dim": 8},
     )
     workspace.model.freeze_wrench_encoder()
-    # Exercise the entire RGB graph immediately, including non-identity FiLM.
+    # Exercise the entire RGB graph immediately with a nonzero output layer.
     with torch.no_grad():
         workspace.model.output.weight.normal_(std=.03)
-        for modulation in workspace.model.spatial_modulations:
-            modulation.affine[-1].weight.normal_(std=.02)
     if joint:
         workspace.epoch = 1
         workspace._maybe_transition_stage()

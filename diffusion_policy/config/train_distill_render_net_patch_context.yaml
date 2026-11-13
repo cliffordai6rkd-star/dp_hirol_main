@@ -15,8 +15,6 @@ render_net:
   rendering_mode: residual
   separate_gate_path: true
   residual_scale: 1.0 # Selected: RGB-channel change is bounded by predicted strength.
-  spatial_modulation:
-    enabled: true
   high_attention_render:
     enabled: true
     source: context

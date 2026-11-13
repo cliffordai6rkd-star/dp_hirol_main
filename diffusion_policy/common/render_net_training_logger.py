@@ -22,18 +22,28 @@ class MetricHistory:
     """Keep only plotted numbers; full records remain in the JSON log."""
 
     step_keys = ("train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+                 "train_force_delta_mse", "train_force_delta_loss", "train_context_region_loss",
                  "train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                 "train_intensity_smoothness",
                  "train_phase_ce", "train_alpha_mse",
                  "train_contact_open_ratio", "train_open_token_mse", "train_closed_token_mse",
                  "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
                  "initial_train_mse")
-    region_keys = {"train_mask_mse", "train_context_patch_mse", "train_intensity_loss"}
+    region_keys = {"train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
+                   "train_intensity_smoothness"}
+    component_keys = ("token_mse", "denoiser_mse", "demo_mse", "mask_mse",
+                      "force_delta_mse", "force_delta_loss", "context_region_loss",
+                      "context_patch_mse", "intensity_smoothness", "intensity_loss",
+                      "phase_ce", "alpha_mse", "contact_open_ratio", "open_token_mse",
+                      "closed_token_mse", "loss")
     scope_dependent_keys = {
         "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+        "train_force_delta_mse", "train_force_delta_loss", "train_context_region_loss",
         "train_open_token_mse", "train_closed_token_mse", "train_loss",
         "train_condition_loss", "val_condition_loss", "initial_train_mse", "epoch_train_mse",
-        "val_mse", "epoch_val_mse", "epoch_best_val_mse",
+        "val_mse", "epoch_val_mse", "epoch_best_val_mse", "epoch_train_mse_step",
+        "epoch_train_condition_loss",
     } | region_keys
 
     def __init__(self):
@@ -41,6 +51,7 @@ class MetricHistory:
         self.step = self.epoch = 0
         self.objective = "token_mse"
         self.metric_scope = "all"
+        self.selection_metric = None
 
     def _append(self, name, x, y):
         if not math.isfinite(float(y)):
@@ -60,10 +71,16 @@ class MetricHistory:
             # histories remain comparable across this change.
             for key in self.scope_dependent_keys:
                 self.series.pop(key, None)
+            for key in list(self.series):
+                if (key.startswith(("val_", "epoch_train_"))
+                        and not key.endswith(("phase_ce", "alpha_mse", "contact_open_ratio"))):
+                    self.series.pop(key)
             self.metric_scope = scope
         warmup = metrics.get("objective") == "condition_warmup"
         if "objective" in metrics and not warmup:
             self.objective = metrics["objective"]
+        if "selection_metric" in metrics:
+            self.selection_metric = metrics["selection_metric"]
         step, epoch = metrics.get("global_step", self.step), metrics.get("epoch", self.epoch)
         self.step, self.epoch = step, epoch
         token_measured = metrics.get("train_token_mse_measured", not warmup)
@@ -73,6 +90,8 @@ class MetricHistory:
             self._append("train_condition_loss", step, metrics["train_mse"])
         elif warmup and "initial_train_mse" in metrics and not token_measured:
             self._append("train_condition_loss", step, metrics["initial_train_mse"])
+        if warmup and "epoch_train_mse" in metrics:
+            self._append("epoch_train_condition_loss", step, metrics["epoch_train_mse"])
         for key in self.step_keys:
             if (not token_measured and key in {
                     "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
@@ -85,9 +104,28 @@ class MetricHistory:
                 continue
             if key in metrics:
                 self._append(key, step, metrics[key])
+        for prefix in ("epoch_train_", "val_"):
+            measured = metrics.get("epoch_train_token_mse_measured" if prefix == "epoch_train_"
+                                   else "val_token_mse_measured", not warmup)
+            count_prefix = "epoch_" if prefix == "epoch_train_" else prefix
+            count = metrics.get(count_prefix + "token_region_observation_count")
+            for component in self.component_keys:
+                key = prefix + component
+                if key not in metrics:
+                    continue
+                if not measured and component in {
+                        "token_mse", "denoiser_mse", "demo_mse", "open_token_mse", "closed_token_mse"}:
+                    continue
+                if count == 0 and "train_" + component in self.region_keys:
+                    continue
+                if (component in {"open_token_mse", "closed_token_mse"}
+                        and metrics.get(count_prefix + component.replace("mse", "count")) == 0):
+                    continue
+                self._append(key, step, metrics[key])
         if ("epoch_train_mse" in metrics
                 and metrics.get("epoch_train_token_mse_measured", not warmup)):
             self._append("epoch_train_mse", epoch, metrics["epoch_train_mse"])
+            self._append("epoch_train_mse_step", step, metrics["epoch_train_mse"])
         val = metrics.get("val_mse", metrics.get("initial_val_mse"))
         val_token_measured = metrics.get("val_token_mse_measured", not warmup)
         if val is not None and warmup and not val_token_measured:
@@ -102,7 +140,7 @@ class MetricHistory:
     def points(self, key, max_points=4000):
         xs, ys = self.series.get(key, (array("d"), array("d")))
         x, y = np.frombuffer(xs, dtype=np.float64), np.frombuffer(ys, dtype=np.float64)
-        if len(x) > max_points:
+        if max_points is not None and len(x) > max_points:
             selected = np.linspace(0, len(x) - 1, max_points, dtype=int)
             x, y = x[selected], y[selected]
         return x, y
@@ -121,72 +159,114 @@ class MetricHistory:
 
 
 def save_training_plot(history, destination):
-    """Render without a display server; atomically replace the current PNG."""
+    """Plot each metric on its own scale, outside the training process."""
     destination = Path(destination)
-    figure = Figure(figsize=(16, 9), constrained_layout=True)
-    FigureCanvasAgg(figure)
-    axes = figure.subplots(2, 3).ravel()
-
-    def curve(axis, key, label, *, factor=1, **kwargs):
-        x, y = history.points(key)
-        if len(x):
-            axis.plot(x, y * factor, label=label, **kwargs)
-
-    curve(axes[0], "train_mse", "Train batch", alpha=0.65, linewidth=0.8)
-    curve(axes[0], "val_mse", "Validation", marker="o", color="tab:orange")
-    curve(axes[0], "initial_train_mse", "Initial train batch", marker="x", linestyle="none", color="black")
-    curve(axes[1], "epoch_train_mse", "Train epoch mean", marker=".")
-    curve(axes[1], "epoch_val_mse", "Validation", marker=".")
-    curve(axes[1], "epoch_best_val_mse", "Best validation", linestyle="--", color="tab:green")
-    x, y = history.points("epoch_val_mse")
-    if len(x):
-        best = int(np.argmin(y))
-        axes[1].plot(x[best], y[best], "*", color="tab:red", markersize=13,
-                     label=f"Best {y[best]:.6g} @ epoch {x[best]:g}")
-    metric_label = "Denoiser output MSE" if history.objective == "denoiser_mse" else "Context token MSE"
+    force_context = history.selection_metric == "force context loss"
+    metric_label = ("Combined force-context loss" if force_context else
+                    "Denoiser output MSE" if history.objective == "denoiser_mse" else "Context token MSE")
     if history.metric_scope == "phases_1_2":
         metric_label += "\npre-contact / contact"
-    curve(axes[2], "train_mse", metric_label, linewidth=0.9)
-    if history.objective == "denoiser_mse":
-        curve(axes[2], "train_token_mse", "Token MSE (diagnostic)", linewidth=0.8, alpha=0.65)
-        curve(axes[2], "train_demo_mse", "Demonstration loss", linewidth=0.8, alpha=0.65)
-    curve(axes[2], "train_mask_mse", "Region MSE", linewidth=0.9)
-    curve(axes[2], "train_condition_loss", "Condition warmup loss", linewidth=0.9)
-    curve(axes[2], "val_condition_loss", "Condition validation loss", linewidth=0.9,
-          marker="o", color="tab:orange")
-    curve(axes[2], "train_phase_ce", "Contact phase CE", linewidth=0.8, alpha=0.8)
-    curve(axes[2], "train_alpha_mse", "Alpha MSE", linewidth=0.8, alpha=0.8)
-    curve(axes[2], "train_loss", "Total loss", linewidth=0.9)
-    curve(axes[2], "train_contact_open_ratio", "Contact open ratio", linewidth=0.8,
-          color="tab:orange", alpha=0.8)
-    curve(axes[2], "train_open_token_mse", "Open-window token MSE", linewidth=0.8,
-          color="tab:green", alpha=0.8)
-    curve(axes[2], "train_closed_token_mse", "Closed-window token MSE", linewidth=0.8,
-          color="tab:red", alpha=0.8)
-    curve(axes[3], "grad_norm", "Gradient norm before clipping", color="tab:purple", linewidth=0.8)
-    curve(axes[4], "lr", "Learning rate", color="tab:green")
-    curve(axes[5], "gpu_allocated_mib", "GPU allocated", factor=1 / 1024, color="tab:blue")
-    curve(axes[5], "gpu_reserved_mib", "GPU reserved", factor=1 / 1024, color="tab:cyan")
-    curve(axes[5], "gpu_peak_allocated_mib", "Peak allocated (run)", factor=1 / 1024,
-          color="tab:blue", linestyle="--")
-    speed_axis = axes[5].twinx()
-    curve(speed_axis, "samples_per_second", "Throughput", color="tab:orange", alpha=0.65)
-    speed_axis.set_ylabel("Samples / second")
-    if speed_axis.lines:
-        speed_axis.legend(loc="upper right", fontsize=8)
 
-    titles = (metric_label, "Train / validation by epoch", "Training loss components",
-              "Gradient norm", "Learning rate", "GPU memory and training throughput")
-    labels = ("MSE", "MSE", "Loss", "L2 norm", "Learning rate", "GiB")
-    for index, axis in enumerate(axes):
-        axis.set(title=titles[index], xlabel="Epoch" if index == 1 else "Optimizer step",
-                 ylabel=labels[index])
-        axis.grid(alpha=0.25)
+    # A panel contains only one metric. Batch/epoch/validation curves share its
+    # scale; unrelated losses, proportions and runtime measurements never do.
+    panels = [(metric_label, "Loss" if force_context else "MSE",
+               "train_mse", "epoch_train_mse_step", "val_mse", 1.)]
+    if force_context:
+        panels.append(("Context token MSE", "MSE", "train_token_mse",
+                       "epoch_train_token_mse", "val_token_mse", 1.))
+    if history.objective == "denoiser_mse":
+        panels.extend([
+            ("Token MSE (diagnostic)", "MSE", "train_token_mse", "epoch_train_token_mse", "val_token_mse", 1.),
+            ("Demonstration loss", "Loss", "train_demo_mse", "epoch_train_demo_mse", "val_demo_mse", 1.),
+        ])
+    for title, component, ylabel in (
+        ("Force difference MSE (raw)", "force_delta_mse", "MSE"),
+        ("Force difference loss (normalized)", "force_delta_loss", "Loss"),
+        ("Context region RGB loss", "context_region_loss", "Weighted L1"),
+        ("Condition warmup loss", "condition_loss", "Loss"),
+        ("Contact phase CE", "phase_ce", "Cross entropy"),
+        ("Alpha MSE", "alpha_mse", "MSE"),
+        ("Region patch SmoothL1", "context_patch_mse", "Loss"),
+        ("Region pixel MSE (diagnostic)", "mask_mse", "MSE"),
+        ("Region smoothness", "intensity_smoothness", "Loss"),
+        ("Weighted region loss", "intensity_loss", "Loss"),
+        ("Total training loss", "loss", "Loss"),
+        ("Contact open ratio", "contact_open_ratio", "Fraction"),
+        ("Open-window token MSE", "open_token_mse", "MSE"),
+        ("Closed-window token MSE", "closed_token_mse", "MSE"),
+    ):
+        if force_context and component == "loss":
+            continue
+        panels.append((title, ylabel, "train_" + component,
+                       "epoch_train_" + component, "val_" + component, 1.))
+    for title, key, ylabel, factor in (
+        ("Gradient norm before clipping", "grad_norm", "L2 norm", 1.),
+        ("Learning rate", "lr", "Learning rate", 1.),
+        ("Training throughput", "samples_per_second", "Samples / second", 1.),
+        ("GPU allocated memory", "gpu_allocated_mib", "GiB", 1. / 1024),
+        ("GPU reserved memory", "gpu_reserved_mib", "GiB", 1. / 1024),
+        ("Peak GPU allocated memory", "gpu_peak_allocated_mib", "GiB", 1. / 1024),
+    ):
+        panels.append((title, ylabel, key, None, None, factor))
+    panels = [panel for index, panel in enumerate(panels)
+              if index == 0 or any(key in history.series for key in panel[2:5] if key)]
+    rows = math.ceil(len(panels) / 3)
+    figure = Figure(figsize=(16, 3.45 * rows), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(rows, 3, squeeze=False).ravel()
+
+    def sparse_line(axis, key, label, color, factor, marker):
+        if key is None:
+            return
+        x, y = history.points(key)
+        if len(x):
+            axis.plot(x, y * factor, label=label, color=color, marker=marker,
+                      markersize=3.8, linewidth=1.25, zorder=4)
+
+    for index, (title, ylabel, train_key, epoch_key, val_key, factor) in enumerate(panels):
+        axis = axes[index]
+        x, y = history.points(train_key, max_points=None)
+        if len(x):
+            selected = np.linspace(0, len(x) - 1, min(len(x), 4000), dtype=int)
+            smooth = len(x) >= 20 and train_key != "lr" and not train_key.startswith("gpu_")
+            axis.plot(x[selected], y[selected] * factor, color="tab:blue",
+                      alpha=.18 if smooth else .85, linewidth=.6 if smooth else 1.1,
+                      label="Train batch" if train_key.startswith("train_") else "Measured")
+            if smooth:
+                window = min(100, len(y))
+                cumulative = np.concatenate(([0.], np.cumsum(y)))
+                means = (cumulative[window:] - cumulative[:-window]) / window
+                mean_x = x[window - 1:]
+                selected = np.linspace(0, len(means) - 1, min(len(means), 4000), dtype=int)
+                axis.plot(mean_x[selected], means[selected] * factor, color="tab:blue",
+                          linewidth=1.45, label=f"Mean ({window} batches)", zorder=3)
+        sparse_line(axis, epoch_key, "Train epoch mean", "tab:red", factor, "^")
+        sparse_line(axis, val_key, "Validation", "tab:orange", factor, "o")
+        if index == 0:
+            initial_x, initial_y = history.points("initial_train_mse")
+            if len(initial_x):
+                axis.plot(initial_x, initial_y, "x", color="black", label="Initial train", markersize=5)
+        axis.set(title=title, xlabel="Optimizer step", ylabel=ylabel)
+        axis.title.set_fontsize(11)
+        axis.tick_params(labelsize=8)
+        axis.grid(alpha=.2)
+        axis.margins(x=.015, y=.08)
+        if train_key == "lr":
+            axis.ticklabel_format(axis="y", style="plain", useOffset=False)
+            if len(y) and np.ptp(y) <= np.max(np.abs(y)) * 1e-6:
+                center = float(np.mean(y))
+                margin = max(abs(center) * .05, 1e-9)
+                axis.set_ylim(center - margin, center + margin)
         if axis.lines:
-            axis.legend(loc="upper left", fontsize=8)
+            # A shared color convention makes panels easy to compare; compact
+            # legends explain only the curves actually present in this panel.
+            if len(axis.lines) > 1:
+                axis.legend(loc="best", fontsize=7.5, framealpha=.8)
         else:
-            axis.text(0.5, 0.5, "Waiting for training metrics", ha="center", va="center",
-                      transform=axis.transAxes, color="gray")
+            axis.text(.5, .5, "Waiting for measured metrics", ha="center", va="center",
+                      transform=axis.transAxes, color="gray", fontsize=9)
+    for axis in axes[len(panels):]:
+        axis.set_visible(False)
     figure.suptitle(f"RenderNet distillation | epoch {history.epoch:g} | step {history.step:g}", fontsize=15)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp.png")
@@ -225,7 +305,8 @@ class RenderNetTrainingLogger(JsonLogger):
                  async_plots=True, plot_interval_sec=20.0):
         self.directory = Path(directory)
         super().__init__(str(self.directory / "logs.json.txt"), filter_fn=lambda key, value:
-                         isinstance(value, numbers.Number) or key in {"objective", "metric_name", "metric_scope"})
+                         isinstance(value, numbers.Number) or key in {
+                             "objective", "metric_name", "metric_scope", "selection_metric"})
         self.history = MetricHistory()
         self.enable_plots = bool(enable_plots)
         self.async_plots = bool(async_plots)

@@ -65,6 +65,8 @@ def _worker(rank, root):
         workspace.attention_enabled, workspace.attention_config, workspace.region_source = True, cfg, "context"
         workspace.intensity_loss_weight, workspace.context_patch_loss_weight, workspace.smoothness_loss_weight = 1., 1., 0.
         workspace.amp_enabled, workspace.shape_info, workspace.intensity_warmup_epochs = False, {}, 2
+        # This fixture bypasses __init__; mirror its initial joint stage.
+        workspace.training_stage = "joint"
         workspace._setup_distributed_model()
         optimizer = torch.optim.AdamW(workspace.model.parameters(), lr=1e-3)
         torch.manual_seed(201 + rank)

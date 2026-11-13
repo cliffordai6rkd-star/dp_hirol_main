@@ -73,6 +73,8 @@ def parse_args(argv=None, *, checkpoint_required=True, episode_required=True):
 def output_paths(checkpoint, args):
     directory = checkpoint.parent.parent / "attention_visualize"
     stem = f"render_net_episode_{args.episode}_{args.camera}"
+    if args.disable_high_attention_render:
+        stem += "_no_region_gate"
     if args.threshold is not None:
         stem += f"_threshold_{args.threshold:g}"
     return {
@@ -206,7 +208,8 @@ def run(args):
         model.region_threshold = args.threshold
         with open_dict(cfg):
             cfg.render_net.high_attention_render.threshold = args.threshold
-    attention_enabled = model.high_attention_enabled and not args.disable_high_attention_render
+    attention_enabled = (model.high_attention_enabled and getattr(model, "use_region_gate", True)
+                         and not args.disable_high_attention_render)
     image_keys = sorted(key for key, spec in teacher_cfg.policy.shape_meta.obs.items() if spec.get("type") == "rgb")
     camera_keys = [key for key in ("wrist", "side") if key in image_keys]
     camera_keys.extend(key for key in image_keys if key not in camera_keys)
@@ -249,7 +252,8 @@ def run(args):
                 stats[key]["mae"].append(float(delta.mean()))
                 stats[key]["max_abs_delta"].append(float(delta.max()))
             seconds = (anchor - selected[0][0]) / dataset_fps
-            title = f"RenderNet RGB | ep {args.episode} | {index + 1}/{len(selected)} | {seconds:.2f}s | step {checkpoint_info.get('global_step', '?')}"
+            label = "RGB (region gate off)" if not attention_enabled else "RenderNet RGB"
+            title = f"{label} | ep {args.episode} | {index + 1}/{len(selected)} | {seconds:.2f}s | step {checkpoint_info.get('global_step', '?')}"
             frames = video_frames(images, rendered, camera_keys, title=title, difference_gain=args.difference_gain)
             for key, frame in frames.items():
                 if key not in writers:
@@ -287,14 +291,18 @@ def run(args):
             "cross_attn_layers": len(model.backbone.cross_attention),
             "decoder_layers": model.backbone.decoder_layers,
             "high_attention_render_enabled": attention_enabled,
+            "use_region_gate": getattr(model, "use_region_gate", True),
+            "use_contact_alpha": getattr(model, "use_contact_alpha", True),
             "region_source": "student-predicted teacher region" if attention_enabled else "full image",
             "high_attention_render_config": OmegaConf.to_container(cfg.render_net.high_attention_render, resolve=True)
             if "high_attention_render" in cfg.render_net else None,
             "rendering_mode": getattr(model, "rendering_mode", "residual"),
             "rendered_rgb": (
-                "original + contact_alpha * (1 - original) * (1 - exp(-residual_scale * region_weight * Gaussian glow)); no display amplification"
+                "original + " + ("contact_alpha * " if getattr(model, "use_contact_alpha", True) else "")
+                + "(1 - original) * (1 - exp(-residual_scale * region_weight * Gaussian glow)); no display amplification"
                 if getattr(model, "rendering_mode", "residual") == "gaussian_glow" else
-                "clamp(original + contact_alpha * residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
+                "clamp(original + " + ("contact_alpha * " if getattr(model, "use_contact_alpha", True) else "")
+                + "residual_scale * region_weight * tanh(RenderNet RGB residual), 0, 1); region_weight=1 when disabled; no display amplification"
             ),
             "difference_rgb": "clip(0.5 + difference_gain * (rendered - original), 0, 1); signed RGB delta centered at gray, not attention",
             "stats_scope": "displayed cameras and latest observation; RGB units in [0,1], before video encoding",

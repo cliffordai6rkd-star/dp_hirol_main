@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from diffusion_policy.scripts import compare_render_net_film_episode as comparison
 from diffusion_policy.scripts import visualize_render_net_episode as visual
 
 
@@ -22,8 +21,6 @@ class CausalPreprocessor:
 
 class PredictedAlphaRenderer:
     phase_prediction_enabled = True
-    spatial_modulation_enabled = True
-    spatial_modulations = [object()]
     high_attention_enabled = False
 
     def __init__(self):
@@ -45,8 +42,7 @@ class PredictedAlphaRenderer:
         self.alphas.append(None if contact_alpha is None else contact_alpha.clone())
         alpha = (self.predict_contact_phase(images, wrench)["contact_alpha"]
                  if contact_alpha is None else contact_alpha)
-        strength = 0.1 if self.spatial_modulation_enabled else 0.05
-        rendered = {key: image + strength * alpha[..., None, None, None]
+        rendered = {key: image + 0.1 * alpha[..., None, None, None]
                     for key, image in images.items()}
         masks = {key: torch.ones_like(image[:, :, :1]) for key, image in images.items()}
         return (rendered, masks) if return_aux else rendered
@@ -73,23 +69,6 @@ def test_visualization_uses_predicted_alpha_without_offline_labels(with_labels):
     assert "contact_phase" not in preprocessor.received_keys[0]
     torch.testing.assert_close(model.wrenches[0], obs["tau_ext"])
     assert (rendered["side"] > images["side"]).all()
-
-
-def test_film_comparison_shares_predicted_alpha_and_reports_its_gate():
-    model, preprocessor = PredictedAlphaRenderer(), CausalPreprocessor()
-    obs = observations()
-    images, branches = comparison.compare_observations(model, preprocessor, obs, ["side"])
-    assert model.prediction_calls == 1
-    assert "contact_alpha" not in preprocessor.received_keys[0]
-    assert "contact_phase" not in preprocessor.received_keys[0]
-    assert len(model.alphas) == 2
-    torch.testing.assert_close(model.alphas[0], model.alphas[1])
-    assert (model.alphas[0] > 0).all()
-    for branch in branches.values():
-        expected_gate = model.alphas[0][..., None, None, None].expand_as(branch["gate"]["side"])
-        torch.testing.assert_close(branch["gate"]["side"], expected_gate)
-        assert (branch["rendered"]["side"] > images["side"]).all()
-    assert model.spatial_modulation_enabled
 
 
 def test_legacy_visualization_preserves_explicit_alpha_override():

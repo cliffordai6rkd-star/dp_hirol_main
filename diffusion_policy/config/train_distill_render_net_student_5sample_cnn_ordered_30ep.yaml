@@ -35,8 +35,6 @@ render_net:
   rendering_mode: residual
   shared_condition_backbone: true
   separate_gate_path: false
-  spatial_modulation:
-    enabled: true
   initialize_wrench_from_teacher: true
   conditioning_dim: 256
   wrench_history_steps: 8

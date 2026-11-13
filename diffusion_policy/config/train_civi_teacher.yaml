@@ -89,14 +89,18 @@ policy:
   contact_history_reducer: max
   contact_norm: ${contact_norm}
   input_gate_enabled: false
-  image_blur_scope: full_context
+  # Blur every training image, including free and pre-contact observations.
+  image_blur_scope: all
   image_blur_schedule:
     schedule_type: linear
-    total_steps: 200000
+    # Resolved from the training optimizer-update budget after loader creation.
+    total_steps: null
     start_sigma: 5.0
     end_sigma: 0.0
-    start_fraction: 0.25
-    end_fraction: 0.75
+    # FACTR default: hold maximum blur for 2/3 of the planned updates,
+    # then linearly restore clarity until the budget endpoint; no clear tail.
+    start_fraction: 0.6666666666666666
+    end_fraction: 1.0
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

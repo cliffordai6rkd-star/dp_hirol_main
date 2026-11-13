@@ -5,6 +5,8 @@ export CIVI_DATASET_PATH=data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
 python train.py  # Train the configured teacher, then its RenderNet student.
 python train.py --config-name=train_diffusion_lowdim_workspace
 python train.py -c diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml
+# Reset one selected output directory and train from scratch.
+python train.py --config-name=train_civi_teacher_board_selfattn --overwrite output_dir=model_output/board_current/teacher
 
 GPU Selection:
 # Single GPU training - specify device
@@ -60,7 +62,8 @@ import pathlib
 import os
 import tempfile
 from hydra.core.hydra_config import HydraConfig
-from diffusion_policy.common.config_cli import rewrite_config_reference_argv
+from diffusion_policy.common.config_cli import parse_overwrite_argv, rewrite_config_reference_argv
+from diffusion_policy.common.training_output import reset_training_output
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import (
     initialize_distributed,
@@ -75,6 +78,7 @@ REPO_ROOT = pathlib.Path(__file__).parent.resolve()
 BCPOLICY_PACKAGE_ROOT = REPO_ROOT.joinpath("BCpolicy")
 DEFAULT_CONFIG_DIR = REPO_ROOT.joinpath("diffusion_policy", "config")
 _TEMP_CONFIG_DIR = None
+_OVERWRITE_REQUESTED = False
 
 if BCPOLICY_PACKAGE_ROOT.is_dir():
     bcpolicy_path = str(BCPOLICY_PACKAGE_ROOT)
@@ -272,6 +276,28 @@ def main(cfg: OmegaConf):
                 f"{cls.__name__} does not implement the repository DDP protocol. "
                 "Use a DDP-enabled workspace or launch this config with one process."
             )
+        if _OVERWRITE_REQUESTED:
+            reset_error = None
+            if distributed.is_main:
+                try:
+                    reset_training_output(
+                        output_dir,
+                        hydra_output_subdir=HydraConfig.get().output_subdir,
+                        protected_paths=(REPO_ROOT,),
+                    )
+                    print(f"[overwrite] Reset output directory; starting fresh: {output_dir}", flush=True)
+                except Exception as exc:
+                    reset_error = str(exc)
+            if distributed.enabled:
+                # Only rank 0 removes files. All ranks wait for its result
+                # before any workspace can create checkpoints or metrics.
+                result = [reset_error]
+                dist.broadcast_object_list(
+                    result, src=0, device=torch.device("cuda", distributed.local_rank),
+                )
+                reset_error = result[0]
+            if reset_error is not None:
+                raise RuntimeError(f"Could not overwrite training output: {reset_error}")
         workspace_kwargs = {"output_dir": output_dir}
         if "distributed" in init_params:
             workspace_kwargs["distributed"] = distributed
@@ -283,6 +309,7 @@ def main(cfg: OmegaConf):
 
 if __name__ == "__main__":
     default_config_dir = DEFAULT_CONFIG_DIR
+    sys.argv, _OVERWRITE_REQUESTED = parse_overwrite_argv(sys.argv)
     sys.argv = rewrite_config_reference_argv(
         sys.argv,
         default_config_dir=str(default_config_dir),

@@ -36,6 +36,8 @@ class FusionVisualAttentionTrace:
     Its cross-camera relevance split cannot be recovered from attention alone;
     this utility rejects that case by default. Explicitly request
     ``camera_fusion_approximation='equal'`` to use equal camera weights.
+    Coarse residual fusion is unsupported because its pooling, upsampling and
+    residual routes are not represented by this full-resolution rollout.
     """
 
     def __init__(self, policy, *, camera_fusion_approximation="error", batched=False):
@@ -52,6 +54,17 @@ class FusionVisualAttentionTrace:
             raise ValueError(
                 "Fusion rollout supports ForceAwareObsEncoder and DinoTokenBaselineObsEncoder; "
                 f"got {type(self.encoder).__name__}"
+            )
+        if self._is_force and getattr(self.encoder, "fusion_downsample_factor", 1) > 1:
+            raise ValueError(
+                "Coarse residual fusion rollout is not supported: this utility "
+                "assumes full-resolution fusion self-attention and does not "
+                "model spatial pooling, upsampling or the residual paths."
+            )
+        if self._is_force and getattr(self.encoder, "fusion_output_mode", "all") != "all":
+            raise ValueError(
+                "Visual-only fusion output rollout is not supported: internal torque "
+                "positions must be included when tracing joint self-attention."
             )
         self.image_keys, self.patch_counts = self._camera_layout(policy)
         self.image_token_count = sum(self.patch_counts.values())

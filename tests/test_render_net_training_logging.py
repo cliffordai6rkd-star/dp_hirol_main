@@ -8,6 +8,60 @@ from diffusion_policy.common.render_net_training_logger import (
 )
 
 
+def test_force_context_components_and_selection_survive_json_and_plotting(tmp_path, monkeypatch):
+    from matplotlib.figure import Figure
+
+    records = [
+        {"global_step": 1, "epoch": 1, "objective": "token_mse",
+         "selection_metric": "force context loss", "train_mse": 1.2,
+         "train_loss": 1.2, "train_token_mse": .2, "train_force_delta_mse": .004,
+         "train_force_delta_loss": .4, "train_context_region_loss": .6},
+        {"global_step": 1, "epoch": 1, "epoch_train_mse": 1.3,
+         "epoch_train_loss": 1.3, "epoch_train_token_mse": .25,
+         "epoch_train_force_delta_mse": .0045, "epoch_train_force_delta_loss": .45,
+         "epoch_train_context_region_loss": .6},
+        {"global_step": 1, "epoch": 1, "val_mse": 1.4, "val_loss": 1.4,
+         "val_token_mse": .3, "val_force_delta_mse": .005,
+         "val_force_delta_loss": .5, "val_context_region_loss": .6},
+    ]
+    with RenderNetTrainingLogger(tmp_path, enable_plots=False) as logger:
+        for record in records:
+            logger.log(record)
+    saved = [json.loads(line) for line in (tmp_path / "logs.json.txt").read_text().splitlines()]
+    assert saved == records
+    history = MetricHistory.from_json(tmp_path / "logs.json.txt")
+    assert history.objective == "token_mse"
+    assert history.selection_metric == "force context loss"
+    for record in records:
+        for key, value in record.items():
+            if key.startswith(("train_", "epoch_train_", "val_")):
+                np.testing.assert_allclose(history.points(key)[1], [value])
+
+    panels = {}
+    savefig = Figure.savefig
+
+    def capture_figure(figure, *args, **kwargs):
+        panels.update({axis.get_title(): {
+            "ylabel": axis.get_ylabel(),
+            "curves": {line.get_label(): list(line.get_ydata()) for line in axis.lines},
+        } for axis in figure.axes if axis.get_visible()})
+        return savefig(figure, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    save_training_plot(history, tmp_path / "force_context.png")
+    combined = panels["Combined force-context loss"]
+    assert combined["ylabel"] == "Loss"
+    assert combined["curves"] == {
+        "Train batch": [1.2], "Train epoch mean": [1.3], "Validation": [1.4],
+    }
+    assert panels["Context token MSE"]["curves"]["Validation"] == [.3]
+    assert panels["Force difference MSE (raw)"]["curves"]["Validation"] == [.005]
+    assert panels["Force difference loss (normalized)"]["curves"]["Validation"] == [.5]
+    assert panels["Context region RGB loss"]["curves"]["Validation"] == [.6]
+    with Image.open(tmp_path / "force_context.png") as image:
+        assert image.format == "PNG" and np.asarray(image).std() > 10
+
+
 def test_condition_validation_and_initial_losses_never_enter_token_curves():
     history = MetricHistory()
     history.record({"global_step": 0, "epoch": 0, "objective": "condition_warmup",

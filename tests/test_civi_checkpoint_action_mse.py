@@ -300,6 +300,77 @@ def test_full_checkpoint_mse_is_element_mean_not_episode_mean(tmp_path):
     assert metrics[ACTION_MSE_KEY] != pytest.approx(episode_mean)
 
 
+@pytest.mark.parametrize("configured_seed", [None, 73])
+def test_act_checkpoint_scoring_uses_deterministic_head_without_protocol_seed(
+    tmp_path, monkeypatch, configured_seed,
+):
+    from test_civi_action_heads import _batch, _make_policy
+
+    batch = _batch()
+
+    class ActionEpisodes(torch.utils.data.Dataset):
+        episode_index = np.array([0, 1])
+        indices = np.column_stack([np.arange(2)] * 4)
+
+        def __len__(self):
+            return 2
+
+        @staticmethod
+        def _anchor_index_from_sampler_row(row):
+            return int(row[0])
+
+        def __getitem__(self, row):
+            return {
+                "obs": {key: value[row] for key, value in batch["obs"].items()},
+                "action": batch["action"][row],
+            }
+
+    workspace = _workspace(tmp_path)
+    workspace.cfg.policy = {"action_head_backbone": "act"}
+    workspace.cfg.checkpoint.action_mse.episode_selection = "all"
+    if configured_seed is not None:
+        workspace.cfg.checkpoint.action_mse.seed = configured_seed
+    workspace._checkpoint_eval_dataset = ActionEpisodes()
+    policy = workspace.ema_model = _make_policy("act")
+    assert "seed" not in _action_mse_protocol(workspace.cfg)
+    policy.eval()
+    with torch.no_grad():
+        prediction = policy.predict_action(batch["obs"])["model_action_pred"][:, 1:9].float()
+    target = batch["action"][:, 1:9].float()
+    expected_raw = (prediction.double() - target.double()).square().mean().item()
+    normalizer = policy.normalizer["action"]
+    expected_normalized = (
+        normalizer.normalize(prediction).double() - normalizer.normalize(target).double()
+    ).square().mean().item()
+    policy.train()
+    received_batch_sizes = []
+    predict_action = policy.predict_action
+
+    def capture_generator_list(obs, generator):
+        assert isinstance(generator, list)
+        assert len(generator) == len(obs["side"])
+        received_batch_sizes.append(len(generator))
+        return predict_action(obs, generator=generator)
+
+    monkeypatch.setattr(policy, "predict_action", capture_generator_list)
+    for step, batch_size in [(2, 1), (4, 2)]:
+        workspace.optimizer_step = step
+        workspace.cfg.checkpoint.action_mse.batch_size = batch_size
+        metrics = workspace._checkpoint_action_mse_and_log(
+            workspace.cfg, torch.device("cpu"), _Logger(), _Logger(),
+        )
+        assert metrics["action_mse_protocol"]["name"] == "deterministic_action_chunk_v1"
+        assert "seed" not in metrics["action_mse_protocol"]
+        assert metrics["inference_seed"] == (42 if configured_seed is None else configured_seed)
+        assert metrics["episode_ids"] == [0, 1]
+        assert metrics["num_windows"] == 2
+        assert metrics["num_action_values"] == 2 * 8 * 7
+        assert metrics[ACTION_MSE_KEY] == pytest.approx(expected_raw, rel=1e-6)
+        assert metrics["checkpoint_action_mse_normalized"] == pytest.approx(expected_normalized, rel=1e-6)
+        assert policy.training
+    assert received_batch_sizes == [1, 1, 2]
+
+
 def test_changing_action_mse_protocol_invalidates_same_step_cache_and_old_topk(tmp_path):
     workspace = _workspace(tmp_path)
     workspace.optimizer_step = 2

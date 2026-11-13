@@ -16,6 +16,8 @@ import math
 import os
 import pathlib
 import random
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
@@ -66,6 +68,12 @@ def _action_mse_protocol(cfg):
         raise ValueError("checkpoint.action_mse.episode_selection must be 'random' or 'all'")
     if selection == "random":
         return None
+    if OmegaConf.select(cfg, "policy.action_head_backbone", default="dit") == "act":
+        return {
+            "name": "deterministic_action_chunk_v1",
+            "episode_selection": "all",
+            "reduction": "action_element_mean",
+        }
     return {
         "name": "all_windows_fixed_noise_v1",
         "episode_selection": "all",
@@ -242,7 +250,7 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
     include_keys = (
         "global_step", "optimizer_step", "epoch", "freeze_config", "topk_state",
-        "action_mse_metrics",
+        "action_mse_metrics", "early_stopping_state",
     )
 
     def __init__(
@@ -284,6 +292,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         self.optimizer_step = 0
         self.epoch = 0
         self.topk_state = {}
+        self.early_stopping_state = {}
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
         """Restore freeze settings before loading optimizer state.
@@ -318,6 +327,72 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
     @property
     def is_main_process(self) -> bool:
         return getattr(self, "distributed", DistributedContext()).is_main
+
+    def _print_loss_record(self, phase: str, record: dict) -> None:
+        """Persist loss summaries in stdout, including redirected training logs."""
+        if not self.is_main_process:
+            return
+        fields = [f"[{phase}]", f"epoch={record.get('epoch', self.epoch)}",
+                  f"optimizer_step={record.get('optimizer_step', self.optimizer_step)}"]
+        if phase == "train":
+            distributed = getattr(self, "distributed", DistributedContext()).enabled
+            metrics = [("train_loss", "train_loss(rank0)" if distributed else "train_loss"),
+                       ("lr", "lr"), ("curriculum/blur_sigma", "blur_sigma")]
+        elif phase == "epoch":
+            metrics = [("epoch_train_loss", "epoch_train_loss(global)"),
+                       ("val_loss", "val_loss(clear)"),
+                       ("val_action_mse", "val_action_mse(normalized)")]
+        else:
+            metrics = [("val_loss", "val_loss(clear)"),
+                       ("val_action_mse", "val_action_mse(normalized)"),
+                       ("val_action_mse_raw", "val_action_mse(raw)"),
+                       ("early_stopping/best_value", "best_val"),
+                       ("early_stopping/stale_epochs", "stale_epochs")]
+        for key, label in metrics:
+            value = record.get(key)
+            if value is not None:
+                fields.append(f"{label}={float(value):.8g}")
+        print(" ".join(fields), flush=True)
+
+    @contextlib.contextmanager
+    def _training_plotter(self, cfg):
+        """Run one CPU-only log follower and always finish/close it on exit."""
+        if not self.is_main_process or not OmegaConf.select(cfg, "logging.enable_plots", default=False):
+            yield
+            return
+        interval = float(OmegaConf.select(cfg, "logging.plot_interval_sec", default=10.0))
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("logging.plot_interval_sec must be positive and finite")
+        command = [sys.executable, "-m", "diffusion_policy.scripts.plot_teacher_losses",
+                   str(pathlib.Path(self.output_dir).resolve()), "--quiet"]
+        environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+        directory = pathlib.Path(__file__).resolve().parents[2]
+        process = None
+        try:
+            try:
+                process = subprocess.Popen(
+                    command + ["--watch", "--interval", str(interval), "--pid", str(os.getpid())],
+                    cwd=directory, env=environment, stdout=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                log.warning("Could not start teacher loss plotter: %s", exc)
+            yield
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5.0)
+                # JsonLogger is still open and line-buffered here. Render its
+                # final complete record even if the watcher was mid-render.
+                try:
+                    subprocess.run(command, cwd=directory, env=environment,
+                                   stdout=subprocess.DEVNULL, check=True, timeout=30.0)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log.warning("Could not finish teacher loss plot: %s", exc)
 
     def _autocast(self, cfg, device):
         amp_cfg = cfg.training.get("amp", {})
@@ -361,6 +436,12 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
         distributed = self.distributed
         num_epochs, num_optimizer_steps = resolve_training_limits(cfg.training)
+        epoch_validation_interval = self._validation_epoch_interval(cfg)
+        early_stopping_enabled = bool(OmegaConf.select(
+            cfg, "training.early_stopping.enabled", default=False,
+        ))
+        if early_stopping_enabled:
+            self._early_stopping_options(cfg)
         if cfg.training.debug:
             cfg.training.max_train_steps = 3
             cfg.training.max_val_steps = 2
@@ -369,6 +450,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             if cfg.training.get("checkpoint_every_optimizer_steps") is not None:
                 cfg.training.checkpoint_every_optimizer_steps = 1
             cfg.training.val_every = 1
+            if epoch_validation_interval is not None:
+                with open_dict(cfg.training):
+                    cfg.training.val_epoch_every = 1
+                epoch_validation_interval = 1
             cfg.training.sample_every = 1
             if num_epochs is not None:
                 num_epochs = min(num_epochs, 2)
@@ -431,6 +516,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     "dataset and policy action_reference_key settings must match"
                 )
         validation_dataset = dataset.get_validation_dataset()
+        if early_stopping_enabled and len(validation_dataset) == 0:
+            raise ValueError("Early stopping requires a non-empty validation split")
         if OmegaConf.select(cfg, "checkpoint.action_mse.enabled", default=False):
             if (cfg.checkpoint.topk.monitor_key != ACTION_MSE_KEY
                     or cfg.checkpoint.topk.mode != "min" or cfg.checkpoint.topk.k < 1):
@@ -558,6 +645,15 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             if num_epochs is not None
             else num_optimizer_steps
         )
+        for policy in (self.model, self.ema_model):
+            if policy is None:
+                continue
+            blur_scheduler = getattr(policy, "blur_scheduler", None)
+            if blur_scheduler is not None and getattr(blur_scheduler, "auto_total_steps", False):
+                blur_scheduler.set_total_steps(total_optimizer_steps)
+            # Optimizer progress is checkpointed on the workspace, whereas
+            # the policy's scalar step is not part of its state_dict.
+            policy.set_optimizer_step(self.optimizer_step)
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -666,8 +762,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         logger_context = (
             JsonLogger(log_path) if self.is_main_process else _NullLogger()
         )
-        with logger_context as json_logger:
+        with logger_context as json_logger, self._training_plotter(cfg):
             def training_is_complete() -> bool:
+                if early_stopping_enabled and getattr(self, "early_stopping_state", {}).get("should_stop", False):
+                    return True
                 if num_epochs is not None:
                     return self.epoch >= num_epochs
                 return self.optimizer_step >= num_optimizer_steps
@@ -694,6 +792,17 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 policy = self.ema_model if self.ema_model is not None else self.model
                 policy.eval()
                 validation_enabled = self._validation_enabled(cfg)
+                completed_epoch = self.epoch + 1 if epoch_validation_interval is not None else self.epoch
+                final_epoch = (
+                    (num_epochs is not None and self.epoch + 1 >= num_epochs)
+                    or (num_optimizer_steps is not None and self.optimizer_step >= num_optimizer_steps)
+                )
+                validation_due = (
+                    self._epoch_validation_due(cfg, completed_epoch, final=final_epoch)
+                    if epoch_validation_interval is not None
+                    else self.epoch % int(cfg.training.val_every) == 0
+                )
+                validation_ran = False
                 if (
                     self.is_main_process
                     and validation_enabled
@@ -702,12 +811,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 ):
                     step_log.update(env_runner.run(policy))
 
-                if validation_enabled and self.epoch % int(cfg.training.val_every) == 0:
+                if validation_enabled and validation_due:
+                    validation_kwargs = (
+                        {"completed_epoch": completed_epoch} if epoch_validation_interval is not None else {}
+                    )
                     val_metrics = self._validate_and_log(
-                        cfg, val_dataloader, device, wandb_run, json_logger,
+                        cfg, val_dataloader, device, wandb_run, json_logger, **validation_kwargs,
                     )
                     if val_metrics is not None:
                         step_log.update(val_metrics)
+                        validation_ran = bool(val_metrics)
 
                 if (
                     self.is_main_process
@@ -744,15 +857,16 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             batch["action"],
                         ).item()
 
-                completed_epoch = self.epoch
                 step_log.update(
                     epoch=completed_epoch,
                     global_step=self.global_step,
                     optimizer_step=self.optimizer_step,
                 )
+                step_log.setdefault("epoch_train_loss", step_log["train_loss"])
                 if self.is_main_process:
                     json_logger.log(step_log)
                     self._log_wandb(wandb_run, step_log, step=self.global_step)
+                    self._print_loss_record("epoch", step_log)
                 self.epoch += 1
 
                 checkpoint_every_optimizer_steps = cfg.training.get(
@@ -772,9 +886,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                         should_save_final
                         and self.optimizer_step % checkpoint_interval != 0
                     )
-                should_checkpoint = should_checkpoint or should_save_final
+                should_checkpoint = (should_checkpoint or should_save_final
+                                     or (epoch_validation_interval is not None and validation_ran))
                 if should_checkpoint:
-                    if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
+                    if (epoch_validation_interval is None
+                            and self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg)):
                         step_log.update(
                             self._validate_and_log(
                                 cfg, val_dataloader, device, wandb_run, json_logger,
@@ -792,6 +908,11 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                             )
                         else:
                             self._save_checkpoints(cfg, step_log, topk_manager)
+                        # Every completed-epoch validation, including the
+                        # stopping point, leaves a resumable latest checkpoint.
+                        if (epoch_validation_interval is not None and validation_ran
+                                and not cfg.checkpoint.save_last_ckpt):
+                            self._save_latest_checkpoint()
 
                 policy.train()
                 # DDP's gradient collectives already synchronize at the next
@@ -926,7 +1047,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 loss_sum = group_loss_tensor if loss_sum is None else loss_sum + group_loss_tensor
                 loss_count += 1
                 should_log = (
-                    self.optimizer_step % log_interval == 0
+                    loss_count == 1
+                    or self.optimizer_step % log_interval == 0
                     or batch_idx >= maximum
                     or (
                         target_optimizer_steps is not None
@@ -943,7 +1065,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                     # training and was measurable with small per-rank batches.
                     "train_loss": loss_value,
                     "lr": lr_scheduler.get_last_lr()[0],
-                    "epoch": self.epoch,
+                    "epoch": self.epoch + int(self._validation_epoch_interval(cfg) is not None),
                     "global_step": self.global_step,
                     "optimizer_step": self.optimizer_step,
                     **self.model.last_curriculum_metrics,
@@ -951,6 +1073,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 if self.is_main_process and should_log:
                     json_logger.log(last_log)
                     self._log_wandb(wandb_run, last_log, step=self.global_step)
+                    self._print_loss_record("train", last_log)
                 periodic_checkpoint = (
                     checkpoint_interval is not None
                     and self.optimizer_step % checkpoint_interval == 0
@@ -962,7 +1085,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                 if periodic_checkpoint or action_mse_due:
                     if last_log["train_loss"] is None:
                         last_log["train_loss"] = float(group_loss_tensor.item())
-                    if self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg):
+                    if (self._validation_epoch_interval(cfg) is None
+                            and self._uses_validation_checkpoint(cfg) and self._validation_enabled(cfg)):
                         last_log.update(
                             self._validate_and_log(
                                 cfg, val_dataloader, device, wandb_run, json_logger,
@@ -983,6 +1107,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             float((loss_sum / loss_count).item()) if loss_sum is not None else float("nan")
         )
         last_log["train_loss"] = self._distributed_mean(epoch_loss, device)
+        last_log["epoch_train_loss"] = last_log["train_loss"]
         return last_log
 
     @staticmethod
@@ -999,6 +1124,86 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
     def _validation_enabled(self, cfg) -> bool:
         return self.optimizer_step >= self._validation_start_optimizer_step(cfg)
+
+    @staticmethod
+    def _validation_epoch_interval(cfg) -> Optional[int]:
+        interval = OmegaConf.select(cfg, "training.val_epoch_every")
+        if interval is None and OmegaConf.select(cfg, "training.early_stopping.enabled", default=False):
+            interval = OmegaConf.select(cfg, "training.val_every", default=1)
+        if interval is None:
+            return None
+        interval = int(interval)
+        if interval < 1:
+            raise ValueError("training.val_epoch_every must be positive")
+        return interval
+
+    @classmethod
+    def _epoch_validation_due(cls, cfg, completed_epoch: int, *, final: bool = False) -> bool:
+        interval = cls._validation_epoch_interval(cfg)
+        return interval is not None and completed_epoch > 0 and (completed_epoch % interval == 0 or final)
+
+    @staticmethod
+    def _early_stopping_options(cfg):
+        options = OmegaConf.select(cfg, "training.early_stopping")
+        if options is None or not options.get("enabled", False):
+            return None
+        monitor = str(options.get("monitor", "val_loss"))
+        patience = int(options.get("patience", 100))
+        min_delta = float(options.get("min_delta", 0.0))
+        if not monitor.startswith("val_"):
+            raise ValueError("Early stopping must monitor a validation metric")
+        if patience < 1 or not math.isfinite(min_delta) or min_delta < 0:
+            raise ValueError("Early stopping needs positive epoch patience and finite non-negative min_delta")
+        return monitor, patience, min_delta
+
+    def _update_early_stopping(self, cfg, metrics, completed_epoch: int) -> dict:
+        options = self._early_stopping_options(cfg)
+        if options is None:
+            return {}
+        monitor, patience, min_delta = options
+        if monitor not in metrics:
+            raise ValueError(f"Early stopping metric {monitor!r} is missing from validation")
+        completed_epoch = int(completed_epoch)
+        if completed_epoch < 1:
+            raise ValueError("Early stopping needs a positive completed epoch")
+        state = getattr(self, "early_stopping_state", {})
+        if state and state["monitor"] != monitor:
+            raise ValueError("Early stopping monitor differs from the resumed checkpoint")
+        if not state:
+            state = {
+                "monitor": monitor,
+                "best_value": None,
+                "best_epoch": 0,
+                "first_validation_epoch": completed_epoch,
+                "last_validation_epoch": 0,
+                "stale_epochs": 0,
+                "should_stop": False,
+            }
+            self.early_stopping_state = state
+        if completed_epoch > state["last_validation_epoch"]:
+            value = float(metrics[monitor])
+            improved = math.isfinite(value) and (
+                state["best_value"] is None or value < state["best_value"] - min_delta
+            )
+            if improved:
+                state["best_value"] = value
+                state["best_epoch"] = completed_epoch
+            state["last_validation_epoch"] = completed_epoch
+            reference_epoch = state["best_epoch"] if state["best_value"] is not None else state["first_validation_epoch"]
+            state["stale_epochs"] = completed_epoch - reference_epoch
+            state["should_stop"] = state["stale_epochs"] >= patience
+            if self.is_main_process:
+                log.info(
+                    "Early stopping: epoch=%d %s=%s best=%s at epoch=%d stale=%d/%d epochs stop=%s",
+                    completed_epoch, monitor, value, state["best_value"], state["best_epoch"],
+                    state["stale_epochs"], patience, state["should_stop"],
+                )
+        return {
+            "early_stopping/best_value": state["best_value"],
+            "early_stopping/best_epoch": state["best_epoch"],
+            "early_stopping/stale_epochs": state["stale_epochs"],
+            "early_stopping/should_stop": state["should_stop"],
+        }
 
     def _store_topk_state(self, manager, cfg) -> None:
         self.topk_state = {
@@ -1180,7 +1385,8 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         batch_size = int(options.get("batch_size", 16))
         if count < 1 or count > len(available) or batch_size < 1:
             raise ValueError("Checkpoint action MSE needs a positive batch size and enough valid episodes")
-        seed = protocol["seed"] if protocol is not None else int(cfg.training.seed) + int(self.optimizer_step)
+        seed = (int(protocol.get("seed", options.get("seed", 42))) if protocol is not None
+                else int(cfg.training.seed) + int(self.optimizer_step))
         selected = (available if protocol is not None else
                     np.random.default_rng(seed).choice(available, size=count, replace=False))
         rows = np.flatnonzero(np.isin(row_episodes, selected))
@@ -1266,7 +1472,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
                  mse, self.action_mse_metrics["checkpoint_action_mse_normalized"])
         return self.action_mse_metrics
 
-    def _validate_and_log(self, cfg, dataloader, device, wandb_run, json_logger):
+    def _validate_and_log(self, cfg, dataloader, device, wandb_run, json_logger, *, completed_epoch=None):
         if not self._validation_enabled(cfg):
             return {}
         if getattr(self, "_last_validation_step", None) == self.optimizer_step:
@@ -1288,16 +1494,20 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         finally:
             policy.train(was_training)
         if metrics is None:
-            if self._uses_validation_checkpoint(cfg):
+            if self._uses_validation_checkpoint(cfg) or self._early_stopping_options(cfg) is not None:
                 raise ValueError("Validation-based checkpoint selection requires a non-empty validation split")
             return None
+        epoch = self.epoch if completed_epoch is None else int(completed_epoch)
+        if completed_epoch is not None:
+            metrics.update(self._update_early_stopping(cfg, metrics, epoch))
         self._last_validation_step = self.optimizer_step
         self._last_validation_metrics = metrics
         if self.is_main_process:
-            record = dict(metrics, epoch=self.epoch, global_step=self.global_step, optimizer_step=self.optimizer_step)
+            record = dict(metrics, epoch=epoch, global_step=self.global_step, optimizer_step=self.optimizer_step)
             json_logger.log(record)
             self._log_wandb(wandb_run, record, step=self.global_step)
-            plot_path = self._update_validation_plot(self.epoch, self.optimizer_step, metrics)
+            self._print_loss_record("val", record)
+            plot_path = self._update_validation_plot(epoch, self.optimizer_step, metrics)
             if plot_path is not None:
                 self._log_wandb(
                     wandb_run,
@@ -1474,7 +1684,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
             x,
             [item["val_loss"] for item in history],
             marker="o",
-            label="diffusion val_loss",
+            label="Validation loss",
         )
         axes[0].plot(
             x,

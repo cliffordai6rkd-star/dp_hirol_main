@@ -63,8 +63,6 @@ render_net:
   rendering_mode: residual
   shared_condition_backbone: true # 条件头读取交叉注意力后的低分辨率融合特征，与 RGB 复用一次编码。
   separate_gate_path: false
-  spatial_modulation:
-    enabled: true # 在 RGB decoder 前两层后启用 FiLM，使用融合特征与条件 region 调制。
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
   wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
@@ -174,7 +172,7 @@ training:
     allow_tf32: true
   compile:
     enabled: true
-    render_backbone: true # 编译共享 encoder 和含 FiLM 的 RGB decoder。
+    render_backbone: true # 编译共享 encoder 和 RGB decoder。
     student_dino: true
     backend: inductor
     mode: default

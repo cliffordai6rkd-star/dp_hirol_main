@@ -383,8 +383,10 @@ def test_policy_freeze_selectors_exclude_cross_attention_from_optimizer():
     assert policy.get_freeze_config()["freeze_modules"] == ("cross_attn",)
 
 
-def test_factr_blur_scheduler_has_fixed_quarter_boundaries():
-    scheduler = FactrBlurScheduler(total_steps=200_000)
+def test_factr_blur_scheduler_preserves_explicit_phase_boundaries():
+    scheduler = FactrBlurScheduler(
+        total_steps=200_000, start_fraction=0.25, end_fraction=0.75
+    )
     assert scheduler.sigma(0) == pytest.approx(5.0)
     assert scheduler.sigma(49_999) == pytest.approx(5.0)
     assert scheduler.sigma(50_000) == pytest.approx(5.0)
@@ -397,10 +399,24 @@ def test_factr_blur_scheduler_has_fixed_quarter_boundaries():
 
 def test_factr_blur_scheduler_scales_with_total_steps():
     scheduler = FactrBlurScheduler(total_steps=100_000)
-    assert scheduler.sigma(25_000) == pytest.approx(5.0)
-    assert scheduler.sigma(50_000) == pytest.approx(2.5)
-    assert scheduler.sigma(75_000) == pytest.approx(0.0)
+    assert scheduler.sigma(0) == pytest.approx(5.0)
+    assert scheduler.sigma(10_000) == pytest.approx(5.0)
+    assert scheduler.sigma(45_000) == pytest.approx(2.5)
+    assert scheduler.sigma(79_999) > 0
+    assert scheduler.sigma(80_000) == pytest.approx(0.0)
     assert scheduler.sigma(100_000) == pytest.approx(0.0)
+    assert scheduler.sigma(120_000) == pytest.approx(0.0)
+
+
+def test_factr_blur_scheduler_waits_for_runtime_training_budget():
+    scheduler = FactrBlurScheduler()
+    assert scheduler.auto_total_steps
+    with pytest.raises(RuntimeError, match="optimizer-step budget"):
+        scheduler.sigma(0)
+    scheduler.set_total_steps(200)
+    assert scheduler.sigma(20) == pytest.approx(5.0)
+    assert scheduler.sigma(90) == pytest.approx(2.5)
+    assert scheduler.sigma(160) == pytest.approx(0.0)
 
 
 def test_contact_blur_scope_is_deterministic():

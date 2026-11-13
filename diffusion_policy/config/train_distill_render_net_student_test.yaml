@@ -44,8 +44,6 @@ render_net:
     conv_block: bottleneck
   rendering_mode: residual
   separate_gate_path: true # 独立 gate 路径；RGB 阶段训练完整 RGB 主干。
-  spatial_modulation:
-    enabled: true # 在 /8、/4 decoder 插入空间调制。
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
   wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。

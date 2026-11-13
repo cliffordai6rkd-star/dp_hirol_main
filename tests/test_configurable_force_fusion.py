@@ -282,7 +282,7 @@ def test_image_query_training_configs_omit_visual_query_residual(name):
 
 
 @pytest.mark.parametrize("sa_layers,ca_layers", [(0, 1), (1, 0)])
-@pytest.mark.parametrize("scope", ["full_context", "current_observation"])
+@pytest.mark.parametrize("scope", ["all", "full_context", "current_observation"])
 def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
     monkeypatch, sa_layers, ca_layers, scope,
 ):
@@ -311,10 +311,14 @@ def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
         loss.backward()
         assert policy.obs_encoder.wrench_projection.weight.grad is not None
         assert policy.last_curriculum_metrics["curriculum/blur_sigma"] == 3
-        assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == 0.5
+        expected_fraction = {"all": 1.0, "full_context": 0.5, "current_observation": 0.25}[scope]
+        assert policy.last_curriculum_metrics["curriculum/blurred_image_fraction"] == expected_fraction
         for key in IMAGE_SHAPES:
             assert not torch.equal(captured[0][key][0, -1], originals[key][0, -1])
-            torch.testing.assert_close(captured[0][key][1], originals[key][1], rtol=0, atol=0)
+            if scope == "all":
+                assert not torch.equal(captured[0][key][1], originals[key][1])
+            else:
+                torch.testing.assert_close(captured[0][key][1], originals[key][1], rtol=0, atol=0)
             if scope == "current_observation":
                 torch.testing.assert_close(captured[0][key][0, 0], originals[key][0, 0], rtol=0, atol=0)
             torch.testing.assert_close(obs[key], originals[key], rtol=0, atol=0)
