@@ -366,7 +366,7 @@ class ForceAwareObsEncoder(nn.Module):
         return tokens[:, 0], tokens[:, patch_start:]
 
     def _encode_image_streams(self, images, image_keys, batch_size, obs_steps,
-                              *, input_grad=False):
+                              *, input_grad=False, selected_observation_indices=None):
         """Shared visual path, before wrench encoding or attention fusion."""
         camera_groups = {}
         for key in image_keys:
@@ -376,15 +376,41 @@ class ForceAwareObsEncoder(nn.Module):
 
         encoded_camera_patches = {}
         flat_camera_batch = batch_size * obs_steps
+        selected_count = (flat_camera_batch if selected_observation_indices is None
+                          else selected_observation_indices.numel())
         for grouped_keys in camera_groups.values():
-            flat_images = torch.cat([
-                images[key].reshape(-1, *images[key].shape[2:]) for key in grouped_keys
-            ], dim=0)
+            camera_images = [images[key].reshape(-1, *images[key].shape[2:])
+                             for key in grouped_keys]
+            if selected_observation_indices is not None:
+                camera_images = [value.index_select(0, selected_observation_indices)
+                                 for value in camera_images]
+            if selected_count == 0:
+                # No backbone call is needed, but retain a zero input gradient
+                # so an empty selection is safe for standalone backward calls.
+                for key, selected_images in zip(grouped_keys, camera_images):
+                    patch_count = self.patch_counts.get(key)
+                    if patch_count is None:
+                        patch_size = getattr(self.backbone.config, "patch_size", None)
+                        if patch_size is None:
+                            raise ValueError("Empty image selection requires a configured DINO patch size")
+                        patch_h, patch_w = ((int(patch_size), int(patch_size))
+                                            if isinstance(patch_size, int) else map(int, patch_size))
+                        patch_count = (images[key].shape[-2] // patch_h
+                                       * (images[key].shape[-1] // patch_w))
+                    encoded_camera_patches[key] = images[key].new_zeros(
+                        batch_size, obs_steps, patch_count, self.n_emb,
+                    ) + selected_images.sum() * 0
+                continue
+            flat_images = torch.cat(camera_images, dim=0)
             _, grouped_patches = self._encode_dino(flat_images, input_grad=input_grad)
             grouped_patches = self.image_projection(grouped_patches)
-            for key, patch_image in zip(grouped_keys, grouped_patches.split(flat_camera_batch)):
+            for key, patch_image in zip(grouped_keys, grouped_patches.split(selected_count)):
                 if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
                     raise ValueError(f"DINO patch count does not match configured camera {key!r}")
+                if selected_observation_indices is not None:
+                    patch_image = patch_image.new_zeros(
+                        flat_camera_batch, patch_image.shape[1], self.n_emb,
+                    ).index_copy(0, selected_observation_indices, patch_image)
                 encoded_camera_patches[key] = patch_image.reshape(
                     batch_size, obs_steps, patch_image.shape[1], self.n_emb
                 )
@@ -398,13 +424,18 @@ class ForceAwareObsEncoder(nn.Module):
             camera_patch_tokens.append(patch_image)
         return encoded_camera_patches, camera_patch_tokens
 
-    def encode_image_context(self, images, *, input_grad=False, apply_fusion_ffn=False):
+    def encode_image_context(self, images, *, input_grad=False, apply_fusion_ffn=False,
+                             observation_mask=None, selected_observation_indices=None):
         """Encode images using the existing visual weights, embeddings and output norm.
 
         This path never runs the wrench encoder or fusion attention. Frozen
         backbone weights can still propagate gradients to rendered RGB inputs.
         Training-only distillation can replay each fusion FFN with a zero
         attention update, matching the image-query teacher when alpha is zero.
+        A boolean [B, To] mask skips unselected observations and leaves their
+        output tokens zero. Compiled callers can supply its flattened nonzero
+        indices, calculated before entering the compiled function, instead.
+        Explicit indices take precedence when both arguments are supplied.
         """
         if apply_fusion_ffn and (
             self.cross_attn_query != "image" or not self.cross_attn_layers
@@ -426,13 +457,35 @@ class ForceAwareObsEncoder(nn.Module):
                 raise ValueError("Image context requires matching [B, To, 3, H, W] inputs")
             if key in self.image_shapes and tuple(value.shape[2:]) != self.image_shapes[key]:
                 raise ValueError(f"image {key!r} must have shape {self.image_shapes[key]}")
+        if observation_mask is not None:
+            if observation_mask.shape != (batch_size, obs_steps) or observation_mask.dtype != torch.bool:
+                raise ValueError("observation_mask must be bool [B, To] matching the images")
+            if observation_mask.device != images[keys[0]].device:
+                raise ValueError("observation_mask must be on the image device")
+            if selected_observation_indices is None:
+                selected_observation_indices = observation_mask.reshape(-1).nonzero().flatten()
+        if selected_observation_indices is not None:
+            if selected_observation_indices.ndim != 1 or selected_observation_indices.dtype != torch.long:
+                raise ValueError("selected_observation_indices must be a one-dimensional long tensor")
+            if selected_observation_indices.device != images[keys[0]].device:
+                raise ValueError("selected_observation_indices must be on the image device")
         _, tokens = self._encode_image_streams(
             images, keys, batch_size, obs_steps, input_grad=input_grad,
+            selected_observation_indices=selected_observation_indices,
         )
         context = torch.cat(tokens, dim=2).reshape(batch_size * obs_steps, -1, self.n_emb)
+        if selected_observation_indices is not None:
+            tokens_per_observation = context.shape[1]
+            context = context.index_select(0, selected_observation_indices)
         if apply_fusion_ffn:
             for block in (self, *self.extra_cross_attention_layers):
                 context = self.finish_cross_attention(block, context, torch.zeros_like(context))
+        if selected_observation_indices is not None:
+            context = self.context_norm(context)
+            context = context.new_zeros(
+                batch_size * obs_steps, tokens_per_observation, self.n_emb,
+            ).index_copy(0, selected_observation_indices, context)
+            return context.reshape(batch_size, obs_steps * tokens_per_observation, self.n_emb)
         return self.context_norm(context.reshape(batch_size, -1, self.n_emb))
 
     def forward(

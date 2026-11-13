@@ -1,6 +1,8 @@
 """
 Usage:
 Training:
+export CIVI_DATASET_PATH=data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+python train.py  # Train the configured teacher, then its RenderNet student.
 python train.py --config-name=train_diffusion_lowdim_workspace
 python train.py -c diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml
 
@@ -35,6 +37,15 @@ Notes:
 """
 
 import sys
+
+# The no-argument command runs the current teacher/student pipeline. Explicit
+# Hydra arguments below continue to select a single configured workspace.
+if __name__ == "__main__" and len(sys.argv) == 1:
+    from train_pipeline import main as pipeline_main
+
+    pipeline_main()
+    raise SystemExit(0)
+
 import inspect
 # use line-buffering for both stdout and stderr
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)

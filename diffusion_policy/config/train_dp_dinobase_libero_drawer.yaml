@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - train_civi_teacher
+  - train_civi_teacher_libero
   - _self_
 
 name: train_dp_dinobase_libero_drawer

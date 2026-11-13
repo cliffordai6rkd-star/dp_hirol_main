@@ -3,8 +3,8 @@ defaults:
   - _self_
 
 name: train_civi_teacher_huanggua_clean
-dataset_path: data/huanggua1103_25hz_3cam_lerobotv3_clean
-output_dir: data/outputs/civi/clean_tau_ext_20261111_rounds/huanggua/teacher
+dataset_path: data/huanggua1103_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+output_dir: data/outputs/civi/contact_interface/huanggua/teacher
 
 task:
   name: huanggua_clean_25hz_tau_ext

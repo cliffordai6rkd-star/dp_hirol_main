@@ -42,6 +42,7 @@ is_teacher = Path(__file__).name == 'sim_force_aware_dp_train.py'
 if is_teacher:
     if os.environ.get('CIVI_FAIL_TEACHER'):
         sys.exit(7)
+    (output/'dataset_path.txt').write_text(cfg.task.dataset.dataset_path)
     (output/'checkpoints').mkdir()
     for step, mse in ((1, 0.5), (2, 0.1), (3, 0.3)):
         checkpoint = output/'checkpoints'/f'step={step}.ckpt'
@@ -78,6 +79,44 @@ def test_all_trains_teacher_then_student_from_lowest_inference_mse(repository):
     assert selected["dataset_path"] == "/new/data" and selected["gpus"] == "0"
     assert (root / "outputs/teacher/pipeline.json").is_file()
     assert all(stage["status"] == "completed" for stage in plan["stages"].values())
+
+
+@pytest.mark.parametrize("override", [None, "/explicit/override/data"])
+def test_exported_dataset_reaches_both_stages_and_cli_override_wins(
+        repository, tmp_path, monkeypatch, override):
+    root, teacher, _ = repository
+    exported_path = str(tmp_path / "dataset with spaces = selected")
+    monkeypatch.setenv("CIVI_DATASET_PATH", exported_path)
+    config = OmegaConf.load(teacher)
+    config.dataset_path = "${oc.env:CIVI_DATASET_PATH,null}"
+    OmegaConf.save(config, teacher)
+    extra = ["--teacher-override", f"dataset_path={override}"] if override else []
+
+    plan = civi.run_civi(_args(repository, *extra), root)
+
+    expected = override or exported_path
+    assert plan["status"] == "completed"
+    assert (root / "outputs/teacher/dataset_path.txt").read_text() == expected
+    selected = json.loads((root / "outputs/student/selection.json").read_text())
+    assert selected["dataset_path"] == expected
+
+
+@pytest.mark.parametrize("exported_path", [None, "", "   "])
+def test_missing_exported_dataset_fails_before_creating_outputs(
+        repository, monkeypatch, exported_path):
+    root, teacher, _ = repository
+    if exported_path is None:
+        monkeypatch.delenv("CIVI_DATASET_PATH", raising=False)
+    else:
+        monkeypatch.setenv("CIVI_DATASET_PATH", exported_path)
+    config = OmegaConf.load(teacher)
+    config.dataset_path = "${oc.env:CIVI_DATASET_PATH,null}"
+    OmegaConf.save(config, teacher)
+
+    with pytest.raises(ValueError, match="export CIVI_DATASET_PATH"):
+        civi.run_civi(_args(repository), root)
+
+    assert not (root / "outputs").exists()
 
 
 def test_student_only_reuses_teacher_config_without_retraining(repository):
@@ -177,10 +216,13 @@ def test_student_flag_alias_and_existing_output(repository):
     assert marker.read_text() == "unchanged"
 
 
-@pytest.mark.parametrize("config_name", [
-    "train_civi_teacher", "train_civi_teacher_joint", "train_dp_dinobase_libero_drawer",
+@pytest.mark.parametrize("config_name,source_key,contact_norm,threshold,filter_enabled", [
+    ("train_civi_teacher", "observation.tau_ext_unthresholded", "l1", 12.5, False),
+    ("train_civi_teacher_joint", "observation.tau_ext", "l2", 8.0, True),
+    ("train_dp_dinobase_libero_drawer", "observation.tau_ext", "l2", 8.0, True),
 ])
-def test_teacher_configs_require_only_causal_measured_tau_ext(config_name):
+def test_teacher_configs_use_causal_seven_axis_torque(config_name, source_key,
+                                                      contact_norm, threshold, filter_enabled):
     import torch
 
     from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
@@ -199,13 +241,15 @@ def test_teacher_configs_require_only_causal_measured_tau_ext(config_name):
     assert cfg.task.future_phase_wrench_key is None
     for config in (policy, cfg.task, cfg.task.dataset):
         assert list(config.contact_force_dims) == list(range(7))
-        assert config.contact_norm == "l2"
-    assert cfg.task.phase_source_key == cfg.task.dataset.phase_source_key == "observation.tau_ext"
-    assert cfg.task.dataset.wrench_filter.source_key == "observation.tau_ext"
+        assert config.contact_norm == contact_norm
+    assert policy.contact_threshold == threshold
+    assert cfg.task.phase_source_key == cfg.task.dataset.phase_source_key == source_key
+    assert cfg.task.dataset.wrench_filter.source_key == source_key
+    assert cfg.task.dataset.wrench_filter.enabled is filter_enabled
     windows = cfg.task.dataset.windowed_lowdim_feature_groups
     assert set(windows) == {"tau_ext"}
     window = windows.tau_ext
-    assert window.source_key == "observation.tau_ext"
+    assert window.source_key == source_key
     assert [window.start_offset + index * window.stride
             for index in range(window.steps)] == list(range(-7, 1))
 
@@ -240,7 +284,8 @@ def test_teacher_configs_require_only_causal_measured_tau_ext(config_name):
     assert future_contact is None
 
 
-def test_default_current_tau_ext_outputs_do_not_select_historical_teachers():
+def test_default_current_tau_ext_outputs_do_not_select_historical_teachers(monkeypatch):
+    monkeypatch.delenv("CIVI_DATASET_PATH", raising=False)
     teacher = load_config_reference(str(civi.REPO_ROOT / civi.DEFAULT_TEACHER_CONFIG))
     student = load_config_reference(str(civi.REPO_ROOT / civi.DEFAULT_STUDENT_CONFIG))
     teacher_output = Path(teacher.output_dir)
@@ -248,3 +293,7 @@ def test_default_current_tau_ext_outputs_do_not_select_historical_teachers():
     assert teacher_output.parent == student_output.parent == Path("data/outputs/civi/current_tau_ext")
     assert teacher_output != student_output
     assert student.teacher_checkpoint is None
+    assert teacher.dataset_path is None
+    assert teacher.free_threshold == teacher.contact_threshold == 12.5
+    assert teacher.contact_norm == "l1"
+    assert teacher.phase_resampling.precontact_seconds == teacher.policy.precontact_seconds == 0.5

@@ -33,13 +33,14 @@ def test_default_student_uses_checkpoint_data_config_and_allows_explicit_source(
 
 
 @pytest.fixture
-def repository(tmp_path):
+def repository(tmp_path, monkeypatch):
     root = tmp_path / "repo with spaces"
     root.mkdir()
+    monkeypatch.chdir(root)
     for config in (pipeline.DEFAULT_DP_CONFIG, pipeline.DEFAULT_DISTILL_CONFIG):
         path = root / config
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}\n")
+        path.write_text("training:\n  num_optimizer_steps: 200000\n  num_epochs: 1000\n")
     # Real subprocesses exercise ordering, argv quoting, logs and error propagation
     # without importing torch or allocating GPU memory.
     script = '''
@@ -69,7 +70,8 @@ else:
     (output/'checkpoints').mkdir()
     (output/'checkpoints/latest.ckpt').write_text('finished RenderDP')
 (output/'config.yaml').write_text('stage: teacher\\n' if is_dp else 'stage: student\\n')
-(output/'argv.json').write_text(json.dumps({'args':sys.argv[1:], 'gpus':os.environ.get('CUDA_VISIBLE_DEVICES')}))
+(output/'argv.json').write_text(json.dumps({'args':sys.argv[1:], 'gpus':os.environ.get('CUDA_VISIBLE_DEVICES'),
+    'dataset_path': os.environ.get('CIVI_DATASET_PATH')}))
 print('stage completed', flush=True)
 with events.open('a') as log:
     log.write(json.dumps(['teacher' if is_dp else 'student', 'end']) + '\\n')
@@ -124,6 +126,80 @@ def test_default_invocation_runs_teacher_then_student(repository, tmp_path):
     student_args = json.loads((output / "student/argv.json").read_text())["args"]
     assert "teacher_checkpoint=" + json.dumps(plan["teacher_checkpoint"]) in student_args
     assert not (output / "dp").exists() and not (output / "distill").exists()
+
+
+def test_exported_dataset_is_available_to_both_pipeline_children(repository, tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    exported_path = str(tmp_path / "dataset with spaces = selected")
+    monkeypatch.setenv("CIVI_DATASET_PATH", exported_path)
+    teacher = repository / pipeline.DEFAULT_DP_CONFIG
+    OmegaConf.save(OmegaConf.create({
+        "dataset_path": "${oc.env:CIVI_DATASET_PATH,null}",
+        "task": {"dataset": {"dataset_path": "${dataset_path}"}},
+    }), teacher)
+    output = tmp_path / "exported_dataset_run"
+    args = pipeline.make_parser().parse_args(["--output-dir", str(output)])
+
+    plan = pipeline.run_pipeline(args, repository)
+
+    assert plan["status"] == "completed"
+    for stage in ("teacher", "student"):
+        record = json.loads((output / stage / "argv.json").read_text())
+        assert record["dataset_path"] == exported_path
+        assert not any(argument.startswith("dataset_path=") for argument in record["args"])
+
+
+@pytest.mark.parametrize("exported_path", [None, "", "   "])
+def test_missing_exported_dataset_stops_pipeline_before_creating_outputs(
+        repository, tmp_path, monkeypatch, exported_path):
+    from omegaconf import OmegaConf
+
+    if exported_path is None:
+        monkeypatch.delenv("CIVI_DATASET_PATH", raising=False)
+    else:
+        monkeypatch.setenv("CIVI_DATASET_PATH", exported_path)
+    teacher = repository / pipeline.DEFAULT_DP_CONFIG
+    OmegaConf.save(OmegaConf.create({
+        "dataset_path": "${oc.env:CIVI_DATASET_PATH,null}",
+        "task": {"dataset": {"dataset_path": "${dataset_path}"}},
+    }), teacher)
+    output = tmp_path / "missing_dataset_run"
+    args = pipeline.make_parser().parse_args(["--output-dir", str(output)])
+
+    with pytest.raises(ValueError, match="export CIVI_DATASET_PATH"):
+        pipeline.run_pipeline(args, repository)
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("dataset,task_name,expected_task", [
+    ("board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5", None, "board"),
+    ("huanggua1103_25hz_3cam_lerobotv3_clean_ma5_l1_12p5", None, "huanggua1103"),
+    ("board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5", "press_button", "press_button"),
+])
+def test_default_pipeline_names_experiment_for_task_and_keeps_teacher_student_layout(
+        repository, monkeypatch, dataset, task_name, expected_task):
+    from omegaconf import OmegaConf
+
+    monkeypatch.setenv("CIVI_DATASET_PATH", "data/" + dataset)
+    if task_name is None:
+        monkeypatch.delenv("CIVI_TASK_NAME", raising=False)
+    else:
+        monkeypatch.setenv("CIVI_TASK_NAME", task_name)
+    OmegaConf.save(OmegaConf.create({
+        "dataset_path": "${oc.env:CIVI_DATASET_PATH,null}",
+        "task": {"dataset": {"dataset_path": "${dataset_path}"}},
+    }), repository / pipeline.DEFAULT_DP_CONFIG)
+
+    plan = pipeline.build_plan(pipeline.make_parser().parse_args([]), repository)
+
+    output = Path(plan["output_dir"])
+    assert output.parent.parent == repository / "data/outputs"
+    assert output.name.endswith(f"_fdp_dis_{expected_task}")
+    assert Path(plan["stages"]["dp"]["output_dir"]) == output / "teacher"
+    assert Path(plan["stages"]["distill"]["output_dir"]) == output / "student"
+    assert not output.exists()
 
 
 def test_dp_failure_stops_before_distillation(repository, tmp_path, monkeypatch):

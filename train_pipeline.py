@@ -16,10 +16,15 @@ import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import signal
 import subprocess
 import sys
+
+from omegaconf import OmegaConf
+
+from diffusion_policy.common.config_cli import load_config_reference
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -101,20 +106,41 @@ def build_plan(args, repo_root=REPO_ROOT):
             teacher = select_teacher(args.teacher_run, args.teacher_selection)
         else:
             raise ValueError("distill mode requires --teacher-checkpoint or --teacher-run")
+    teacher_config = None
+    dataset_path = os.environ.get("CIVI_DATASET_PATH")
+    if args.stage in {"dp", "all"}:
+        teacher_config = resolve_config(args.dp_config, repo_root)
+        teacher_cfg = load_config_reference(str(teacher_config), args.dp_override)
+        dataset_cfg = OmegaConf.select(teacher_cfg, "task.dataset")
+        if dataset_cfg is not None and "dataset_path" in dataset_cfg:
+            dataset_path = dataset_cfg.dataset_path
+            if not dataset_path or not str(dataset_path).strip():
+                raise ValueError(
+                    "Set the training data path first: export CIVI_DATASET_PATH=/path/to/lerobot_dataset "
+                    "(or pass --dp-override dataset_path=...)"
+                )
+    # The data exports identify the task; sampling-rate and processing suffixes
+    # describe the dataset version, rather than the experiment's task name.
+    dataset_name = Path(str(dataset_path)).name if dataset_path else "task"
+    task_name = os.environ.get("CIVI_TASK_NAME") or re.split(
+        r"_\d+(?:\.\d+)?hz(?:_|$)", dataset_name, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
     now = datetime.datetime.now().astimezone()
     output = Path(args.output_dir).expanduser().resolve() if args.output_dir else (
-        repo_root / "data/outputs" / now.strftime("%Y.%m.%d") / now.strftime("%H.%M.%S_%f_dp_distill_pipeline")
+        repo_root / "data/outputs" / now.strftime("%Y.%m.%d")
+        / (now.strftime("%H.%M.%S_%f_") + f"fdp_dis_{task_name}")
     ).resolve()
     if output.exists():
         raise FileExistsError(f"Pipeline output already exists; choose a new --output-dir: {output}")
     stages = {}
     if args.stage in {"dp", "all"}:
-        stages["dp"] = {"script": "sim_force_aware_dp_train.py", "config": str(resolve_config(args.dp_config, repo_root)),
+        stages["dp"] = {"script": "sim_force_aware_dp_train.py", "config": str(teacher_config),
                         "overrides": args.dp_override, "output_dir": str(output / "teacher")}
     if args.stage in {"distill", "all"}:
         stages["distill"] = {"script": "train_distill_render_net.py", "config": str(resolve_config(args.distill_config, repo_root)),
                              "overrides": args.distill_override, "output_dir": str(output / "student")}
     return {"status": "planned", "stage": args.stage, "output_dir": str(output), "stages": stages,
+            "task_name": task_name, "dataset_path": str(dataset_path) if dataset_path else None,
             "teacher_checkpoint": str(teacher) if teacher else None, "teacher_selection": args.teacher_selection,
             "nproc_per_node": args.nproc_per_node, "gpus": args.gpus, "created_at": now.isoformat()}
 

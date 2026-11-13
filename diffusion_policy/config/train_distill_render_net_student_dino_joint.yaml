@@ -1,0 +1,194 @@
+# 完整学生训练配置；直接通过 train_distill_render_net.py --config 使用。
+name: train_distill_render_net_student
+_target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
+# 数据路径由教师 YAML 读取 CIVI_DATASET_PATH；学生继承相同字段映射和时间窗。
+# 未指定权重时从教师 output_dir 按动作 MSE 选教师。
+# train_civi.py --teacher-config 会覆盖此处；单独启动学生也能直接使用本配置。
+teacher_config: diffusion_policy/config/train_civi_teacher.yaml
+teacher_config_overrides: []
+teacher_output_dir: null # 默认读取 teacher-config 的 output_dir。
+teacher_checkpoint: null # 填入 .ckpt 路径可直接指定权重；null 时按 MSE 自动选择。
+output_dir: data/outputs/civi/current_tau_ext/student
+
+# 冻结当前 tau_ext 教师，以其 context tokens 监督学生 RGB 渲染。
+distillation:
+  objective: token_mse
+  token_region_phases: [1, 2] # 仅 pre-contact/contact 参与 token、region 损失；CE、alpha 使用全部阶段。
+  skip_unselected_observations: true # 训练仅为选中观测解码 RGB、反传 DINO；条件头仍看全部阶段。
+  use_teacher_ffn: true # 学生复用冻结教师的融合 FFN，对齐教师最终 context token。
+  phase_ce_weight: 1.0
+  alpha_loss_weight: 1.0
+  token_loss_weight: 0.0
+  demo_loss_weight: 0.0
+  validation_seed: 42
+
+teacher_cache:
+  enabled: true
+  cleanup_on_exit: true
+  dtype: float16 # 缓存存储精度；loss 仍以 FP32 计算。
+  precision: float32 # teacher context-effect 成对计算使用 FP32。
+  directory: data/cache/render_net_teacher
+  batch_size: 16
+  num_workers: 4
+  load_into_ram: false
+  only: false
+
+render_net:
+  phase_prediction:
+    enabled: true
+    hidden_dim: 64
+    freeze_wrench_encoder: true
+  backbone:
+    image_encoder: dino_lora
+    wrench_encoder: lstm
+    image_self_attn_layers: 0 # 复用预训练 DINO 的视觉建模，不额外堆叠图像自注意力。
+    cross_attn_layers: 2
+    decoder_layers: 3
+    patch_size: 16
+    embed_dim: 128
+    num_heads: 4
+    mlp_ratio: 4.0
+    dropout: 0.0
+    base_channels: 32
+    conv_block: bottleneck
+    dino:
+      pretrained_model_name_or_path: null # null 时读取教师视觉编码器的预训练模型路径，独立加载学生权重。
+      local_files_only: true
+      lora:
+        rank: 8
+        alpha: 16
+        dropout: 0.0
+        target_modules: [q_proj, v_proj]
+      intermediate_layers: null # 默认选取三个中间层，提供 RGB 解码器的多尺度特征。
+  rendering_mode: residual
+  shared_condition_backbone: true # 条件头读取交叉注意力后的低分辨率融合特征，与 RGB 复用一次编码。
+  separate_gate_path: false
+  spatial_modulation:
+    enabled: true # 在 RGB decoder 前两层后启用 FiLM，使用融合特征与条件 region 调制。
+  initialize_wrench_from_teacher: true
+  conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
+  wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
+  max_obs_steps: 2
+  image_keys: [side, wrist]
+  residual_scale: 1.0
+  high_attention_render:
+    enabled: true
+    source: context
+    selection: soft
+    activation: sigmoid
+    initial_strength: 0.1
+    threshold: 0.1 # 渲染 gate=M*(M>threshold)；设 0.0 可取消强度截断。
+    normalization: image_minmax
+    strength_scale: null
+    percentile: 90.0
+    prediction_threshold: 0.5 # 仅 binary_top_percentile 模式使用。
+    baseline: raw_zero
+    percentiles: [80.0, 99.0]
+    intensity_loss_weight: 1.0
+    context_patch_loss_weight: 1.0
+    pixel_loss_weight: 0.0
+    smoothness_loss_weight: 0.02
+    detach_for_rgb: false # 联合阶段的 token 蒸馏同时更新条件图与 RGB 分支。
+    teacher_seed: 42
+
+# 数据集和时间窗口读取 teacher-config；normalizer 读取所选教师 checkpoint。
+# 这里只列学生对教师数据配置的覆盖项，单独划分学生验证集。
+dataset:
+  # 滤波配置随教师继承，确保 tau_ext 预处理一致。
+  val_ratio: 0.1
+  video_backend: pyav
+  video_decode_device: cuda:0
+  preload_images: true
+  image_randomer_config: null
+  load_result_add: ram
+  image_cache_dtype: uint8
+
+dataloader:
+  batch_size: 4 # 联合阶段需反传 RGB、条件分支及冻结 DINO 的输入梯度。
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 8
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.999
+
+logging:
+  progress_bar: true
+  progress_bar_non_tty: false
+  tqdm_interval_sec: 1.0
+  tqdm_leave: false
+  status_interval_sec: 60.0
+  enable_plots: false # 仅保存 JSON 指标；需要曲线时离线生成。
+  plot_every_steps: 100 # enable_plots=true 时使用；0 表示仅 epoch 结束画图。
+
+training:
+  seed: 42
+  device: cuda:0
+  resume_from: null
+  use_ema: true
+  lr_scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 8
+    threshold: 0.0001
+    min_lr: 0.00001
+  distributed:
+    enabled: false
+    backend: nccl
+    batch_size_is_global: true
+    # The condition-only warmup intentionally skips the RGB residual branch.
+    find_unused_parameters: true
+    timeout_seconds: 86400
+  num_epochs: 1000
+  render_stages:
+    enabled: true
+    condition_warmup_epochs: 1 # 先预热条件头，再联合优化条件头与 RGB 渲染分支。
+  max_steps: null
+  max_grad_norm: 1.0
+  log_every: 10
+  max_val_batches: null
+  early_stopping:
+    enabled: true
+    patience: 30
+    min_delta: 0.0001
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  compile:
+    enabled: true
+    render_backbone: true # 编译共享 encoder 和含 FiLM 的 RGB decoder。
+    student_dino: true
+    backend: inductor
+    mode: default
+
+hydra:
+  job_logging:
+    formatters:
+      concise:
+        format: '%(asctime)s %(levelname).1s | %(message)s'
+        datefmt: '%H:%M:%S'
+    handlers:
+      console:
+        formatter: concise
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

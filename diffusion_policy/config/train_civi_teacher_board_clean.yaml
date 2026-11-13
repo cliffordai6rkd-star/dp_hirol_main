@@ -3,8 +3,8 @@ defaults:
   - _self_
 
 name: train_civi_teacher_board_clean
-dataset_path: data/board_25hz_3cam_lerobotv3_clean
-output_dir: data/outputs/civi/clean_tau_ext_20261111_rounds/board/teacher
+dataset_path: data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+output_dir: data/outputs/civi/contact_interface/board/teacher
 
 task:
   name: board_clean_25hz_tau_ext

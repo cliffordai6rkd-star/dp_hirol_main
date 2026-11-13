@@ -8,8 +8,8 @@ exp_name: ${name}
 dataset_path: null
 task_name: ${task.name}
 # Thresholds label confirmed contact; the network reads unthresholded torque.
-free_threshold: 14.0
-contact_threshold: 14.0
+free_threshold: 12.5
+contact_threshold: 12.5
 contact_norm: l1
 
 shape_meta:
@@ -30,8 +30,8 @@ policy:
   shape_meta: ${shape_meta}
   action_representation: joint_position
   relative_pose_actions: false
-  free_threshold: 14.0
-  contact_threshold: 14.0
+  free_threshold: 12.5
+  contact_threshold: 12.5
   contact_norm: l1
 
 dataloader:
@@ -47,8 +47,8 @@ training:
 
 task:
   name: xarm_clean_25hz
-  free_threshold: 14.0
-  contact_threshold: 14.0
+  free_threshold: 12.5
+  contact_threshold: 12.5
   contact_norm: l1
   phase_source_key: observation.tau_ext_unthresholded
   image_shape: [3, 224, 224]
@@ -66,7 +66,7 @@ task:
     relative_pose_actions: false
     timestamp_step_sec: 0.04
     observation_validity_key: null
-    contact_threshold: 14.0
+    contact_threshold: 12.5
     contact_norm: l1
     phase_source_key: observation.tau_ext_unthresholded
     windowed_lowdim_feature_groups:

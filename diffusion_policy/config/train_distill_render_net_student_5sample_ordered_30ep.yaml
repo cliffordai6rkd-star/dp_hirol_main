@@ -1,0 +1,239 @@
+name: train_distill_render_net_student
+_target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
+teacher_config: null
+teacher_config_overrides: []
+teacher_output_dir: null
+teacher_checkpoint: /home/lcy/code/dp_hirol_main/data/outputs/2026.11.12/20.05.59_876448_fdp_dis_board/teacher/checkpoints/optimizer_step=00180000-action_mse=0.00470914.ckpt
+output_dir: data/outputs/2026.11.13/token_mse_5sample_ordered_30ep/student
+distillation:
+  objective: token_mse
+  token_region_phases:
+  - 1
+  - 2
+  skip_unselected_observations: false
+  use_teacher_ffn: true
+  phase_ce_weight: 1.0
+  alpha_loss_weight: 1.0
+  token_loss_weight: 0.0
+  demo_loss_weight: 0.0
+  validation_seed: 42
+teacher_cache:
+  enabled: false
+  cleanup_on_exit: true
+  dtype: float16
+  precision: float32
+  directory: data/cache/render_net_teacher
+  batch_size: 16
+  num_workers: 4
+  load_into_ram: false
+  only: false
+render_net:
+  phase_prediction:
+    enabled: true
+    hidden_dim: 64
+    freeze_wrench_encoder: true
+  rendering_mode: residual
+  shared_condition_backbone: true
+  separate_gate_path: false
+  spatial_modulation:
+    enabled: true
+  initialize_wrench_from_teacher: true
+  conditioning_dim: 256
+  wrench_history_steps: 8
+  max_obs_steps: 2
+  image_keys:
+  - side
+  - wrist
+  residual_scale: 1.0
+  high_attention_render:
+    enabled: true
+    source: context
+    selection: soft
+    activation: sigmoid
+    initial_strength: 0.1
+    threshold: 0.0
+    normalization: image_minmax
+    strength_scale: null
+    percentile: 90.0
+    prediction_threshold: 0.5
+    baseline: raw_zero
+    percentiles:
+    - 80.0
+    - 99.0
+    intensity_loss_weight: 1.0
+    context_patch_loss_weight: 1.0
+    pixel_loss_weight: 0.0
+    smoothness_loss_weight: 0.02
+    detach_for_rgb: true
+    teacher_seed: 42
+  wrench_layers: 2
+  wrench_dropout: 0.1
+  image_encoder: dino_lora
+  wrench_encoder: lstm
+  image_self_attn_layers: 0
+  cross_attn_layers: 2
+  decoder_layers: 3
+  patch_size: 16
+  embed_dim: 128
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.0
+  base_channels: 32
+  conv_block: bottleneck
+  dino:
+    pretrained_model_name_or_path: model/model/dinov3-vitb16-pretrain-lvd1689m
+    local_files_only: true
+    lora:
+      rank: 8
+      alpha: 16
+      dropout: 0.0
+      target_modules:
+      - q_proj
+      - v_proj
+    intermediate_layers: null
+dataset:
+  val_ratio: 0.1
+  video_backend: pyav
+  video_decode_device: cuda:0
+  preload_images: false
+  image_randomer_config: null
+  load_result_add: ram
+  image_cache_dtype: uint8
+  contact_label_config:
+    version: 5
+    precontact_seconds: 0.5
+    future_contact_mode: legacy_rollout
+    n_obs_steps: 2
+    wrench_key: tau_ext
+    phase_wrench_key: tau_ext
+    future_phase_wrench_key: null
+    contact_detector_type: hysteresis
+    contact_detector:
+      force_dims:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      history_reducer: max
+      norm: l1
+      free_threshold: 12.5
+      contact_threshold: 12.5
+      enter_frames: 5
+      exit_frames: 5
+    input_gate:
+      threshold: 0.0
+      enabled: false
+      norm: l1
+dataloader:
+  batch_size: 5
+  num_workers: 0
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+val_dataloader:
+  batch_size: 5
+  num_workers: 0
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+optimizer:
+  lr: 0.0002
+  weight_decay: 0.0001
+  betas:
+  - 0.9
+  - 0.999
+ema:
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.999
+logging:
+  progress_bar: true
+  progress_bar_non_tty: false
+  tqdm_interval_sec: 1.0
+  tqdm_leave: false
+  status_interval_sec: 60.0
+  enable_plots: false
+  plot_every_steps: 100
+training:
+  seed: 42
+  device: cuda:0
+  resume_from: null
+  use_ema: true
+  lr_scheduler:
+    enabled: false
+    factor: 0.5
+    patience: 8
+    threshold: 0.0001
+    min_lr: 1.0e-05
+  distributed:
+    enabled: false
+    backend: nccl
+    batch_size_is_global: true
+    find_unused_parameters: true
+    timeout_seconds: 86400
+  num_epochs: 30
+  render_stages:
+    enabled: true
+    condition_warmup_epochs: 10
+    rgb_warmup_epochs: 10
+  max_steps: null
+  max_grad_norm: 1.0
+  log_every: 10
+  max_val_batches: null
+  early_stopping:
+    enabled: false
+    patience: 30
+    min_delta: 0.0001
+  amp:
+    enabled: true
+    dtype: bfloat16
+    allow_tf32: true
+  debug_train_samples: 5
+  debug_validation_samples: 5
+  compile:
+    enabled: false
+    render_backbone: true
+    student_dino: true
+    backend: inductor
+    mode: default
+teacher_selection: null
+wrench_preprocessing:
+  version: 5
+  precontact_seconds: 0.5
+  future_contact_mode: legacy_rollout
+  n_obs_steps: 2
+  wrench_key: tau_ext
+  phase_wrench_key: tau_ext
+  future_phase_wrench_key: null
+  contact_detector_type: hysteresis
+  contact_detector:
+    force_dims:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    history_reducer: max
+    norm: l1
+    free_threshold: 12.5
+    contact_threshold: 12.5
+    enter_frames: 5
+    exit_frames: 5
+  input_gate:
+    threshold: 0.0
+    enabled: false
+    norm: l1
+
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

@@ -61,6 +61,13 @@ def build_plan(args, repo_root=REPO_ROOT):
             raise ValueError(f"{key} is managed by train_civi.py; use the config paths, --teacher-checkpoint and output_dir instead")
     teacher_path = resolve_config(args.teacher_config, repo_root)
     teacher_cfg = load_config_reference(str(teacher_path), args.teacher_override, include_hydra=True)
+    dataset_cfg = OmegaConf.select(teacher_cfg, "task.dataset")
+    if (dataset_cfg is not None and "dataset_path" in dataset_cfg
+            and (not dataset_cfg.dataset_path or not str(dataset_cfg.dataset_path).strip())):
+        raise ValueError(
+            "Set the training data path first: export CIVI_DATASET_PATH=/path/to/lerobot_dataset "
+            "(or pass --teacher-override dataset_path=...)"
+        )
     teacher_output = configured_output_dir(teacher_cfg)
     requested_checkpoint = args.teacher_checkpoint
     stages = {}

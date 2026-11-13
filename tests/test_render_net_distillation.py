@@ -585,7 +585,8 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
                and record["step_seconds"] >= 0 and record["samples_per_second"] > 0 for record in steps)
     epochs_logged = [record for record in records if "epoch_train_mse" in record]
     assert epochs_logged[-1]["epoch_samples"] == (4 if max_steps == 5 else 5)
-    assert (tmp_path / "training_metrics.png").is_file()
+    assert summary["metrics_png"] is None
+    assert not (tmp_path / "training_metrics.png").exists()
 
 
 @pytest.mark.parametrize("max_batches,expected,samples", [(None, 2.6, 5), (2, 2.0, 4)])

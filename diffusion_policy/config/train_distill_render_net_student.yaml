@@ -1,7 +1,8 @@
-# 完整学生训练配置；直接通过 train_distill_render_net.py --config 使用。
+# 默认学生：独立小型条件网络 -> 冻结条件 -> 轻量 CNN+ViT RenderNet。
 name: train_distill_render_net_student
 _target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
-# 从教师 YAML 获取数据路径；未指定权重时从其 output_dir 按动作 MSE 选教师。
+# 数据路径由教师 YAML 读取 CIVI_DATASET_PATH；学生继承相同字段映射和时间窗。
+# 未指定权重时从教师 output_dir 按动作 MSE 选教师。
 # train_civi.py --teacher-config 会覆盖此处；单独启动学生也能直接使用本配置。
 teacher_config: diffusion_policy/config/train_civi_teacher.yaml
 teacher_config_overrides: []
@@ -12,6 +13,8 @@ output_dir: data/outputs/civi/current_tau_ext/student
 # 冻结当前 tau_ext 教师，以其 context tokens 监督学生 RGB 渲染。
 distillation:
   objective: token_mse
+  token_region_phases: [1, 2] # 仅 pre-contact/contact 参与 token、region 损失；CE、alpha 使用全部阶段。
+  skip_unselected_observations: true # 训练仅为选中观测解码 RGB、反传 DINO；条件头仍看全部阶段。
   use_teacher_ffn: true # 学生复用冻结教师的融合 FFN，对齐教师最终 context token。
   phase_ce_weight: 1.0
   alpha_loss_weight: 1.0
@@ -38,20 +41,32 @@ render_net:
   backbone:
     image_encoder: cnn
     wrench_encoder: lstm
-    image_self_attn_layers: 6
+    image_self_attn_layers: 2
     cross_attn_layers: 2
     decoder_layers: 3
     patch_size: 8
-    embed_dim: 128
+    embed_dim: 96
     num_heads: 4
-    mlp_ratio: 4.0
+    mlp_ratio: 3.0
     dropout: 0.0
-    base_channels: 32
+    base_channels: 16
+    conv_block: bottleneck
+  condition_backbone:
+    base_channels: 16
+    embed_dim: 64
+    image_self_attn_layers: 0
+    cross_attn_layers: 1
+    decoder_layers: 0 # 在 patch 网格预测 region 后上采样，无 RGB decoder。
+    patch_size: 8
+    num_heads: 4
+    mlp_ratio: 2.0
+    dropout: 0.0
     conv_block: bottleneck
   rendering_mode: residual
-  separate_gate_path: true # 条件分支与 RGB 分支独立；warmup 后同时优化。
+  shared_condition_backbone: false
+  separate_gate_path: true # 两条视觉路径独立；冻结条件不会限制 render encoder 的训练。
   spatial_modulation:
-    enabled: false # 暂时关闭 FiLM，保留实现供后续对比。
+    enabled: true # 在 RGB decoder 前两层后启用 FiLM，使用融合特征与条件 region 调制。
   initialize_wrench_from_teacher: true
   conditioning_dim: 256 # 由 teacher checkpoint 的 LSTM 配置解析。
   wrench_history_steps: 8 # 与 max_obs_steps、image_keys 一起由 teacher 解析。
@@ -64,7 +79,7 @@ render_net:
     selection: soft
     activation: sigmoid
     initial_strength: 0.1
-    threshold: 0.1 # 渲染 gate=M*(M>threshold)；设 0.0 可取消强度截断。
+    threshold: 0.0 # 保留较弱区域的连续渲染信号。
     normalization: image_minmax
     strength_scale: null
     percentile: 90.0
@@ -75,7 +90,7 @@ render_net:
     context_patch_loss_weight: 1.0
     pixel_loss_weight: 0.0
     smoothness_loss_weight: 0.02
-    detach_for_rgb: false # 联合阶段的 token 蒸馏同时更新条件图与 RGB 分支。
+    detach_for_rgb: true # 第二阶段还会冻结整个条件网络，包括 alpha 和上游特征。
     teacher_seed: 42
 
 # 数据集和时间窗口读取 teacher-config；normalizer 读取所选教师 checkpoint。
@@ -98,7 +113,7 @@ dataloader:
   persistent_workers: true
 
 val_dataloader:
-  batch_size: 16
+  batch_size: 32
   num_workers: 0
   shuffle: false
   pin_memory: true
@@ -122,7 +137,8 @@ logging:
   tqdm_interval_sec: 1.0
   tqdm_leave: false
   status_interval_sec: 60.0
-  plot_every_steps: 100
+  enable_plots: false # 仅保存 JSON 指标；需要曲线时离线生成。
+  plot_every_steps: 100 # enable_plots=true 时使用；0 表示仅 epoch 结束画图。
 
 training:
   seed: 42
@@ -139,13 +155,19 @@ training:
     enabled: false
     backend: nccl
     batch_size_is_global: true
-    # The condition-only warmup intentionally skips the RGB residual branch.
+    # Each stage updates only its own branch.
     find_unused_parameters: true
     timeout_seconds: 86400
-  num_epochs: 1000
+  num_epochs: 120 # 两阶段最大预算之和；条件早停后仍保留完整 render 预算。
   render_stages:
     enabled: true
-    condition_warmup_epochs: 1 # 先预热条件头，再联合优化条件头与 RGB 渲染分支。
+    condition_warmup_epochs: 20
+    rgb_warmup_epochs: 100
+    joint_after_rgb: false # 严格两阶段，不再进入 joint。
+    condition_early_stopping:
+      enabled: true
+      patience: 5
+      min_delta: 0.0001
   max_steps: null
   max_grad_norm: 1.0
   log_every: 10
@@ -160,7 +182,7 @@ training:
     allow_tf32: true
   compile:
     enabled: true
-    render_backbone: false
+    render_backbone: true # 第二阶段编译独立 render encoder 和含 FiLM 的 decoder。
     student_dino: true
     backend: inductor
     mode: default

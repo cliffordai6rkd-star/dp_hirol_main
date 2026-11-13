@@ -3,7 +3,7 @@
 # The current LIBERO socket adapter accepts EE poses only; this config is for
 # training/offline prediction until a JOINT_POSITION execution path is added.
 defaults:
-  - train_civi_teacher
+  - train_civi_teacher_libero
   - _self_
 
 name: train_civi_teacher_joint

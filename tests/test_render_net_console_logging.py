@@ -100,7 +100,7 @@ def test_console_progress_is_throttled_without_losing_step_or_epoch_metrics(monk
     assert len([row for row in rows if "val_mse" in row]) == 2
     assert (tmp_path / "run/checkpoints/latest.ckpt").is_file()
     assert (tmp_path / "run/checkpoints/best.ckpt").is_file()
-    assert (tmp_path / "run/training_metrics.png").is_file()
+    assert not (tmp_path / "run/training_metrics.png").exists()
 
 
 @pytest.mark.parametrize("tty", [False, True])

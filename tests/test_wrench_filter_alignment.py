@@ -114,16 +114,14 @@ def test_legacy_data_config_without_filter_keeps_original_values(aligned_dataset
     np.testing.assert_array_equal(dataset._load_column(config["phase_source_key"], np.float32), raw)
 
 
-@pytest.mark.parametrize("name,source_key", [
-    ("train_distill_render_net", "observation.tau_ext"),
-    ("train_distill_render_net_student", "observation.tau_ext"),
-    ("train_distill_render_net_student_test", "observation.wrench"),
+@pytest.mark.parametrize("name,teacher_name,source_key,filter_enabled", [
+    ("train_distill_render_net", "train_civi_teacher_libero", "observation.tau_ext", True),
+    ("train_distill_render_net_student", "train_civi_teacher", "observation.tau_ext_unthresholded", False),
+    ("train_distill_render_net_student_test", "train_civi_teacher_libero", "observation.wrench", True),
 ])
-def test_student_configs_select_matching_teacher_first_order_two_hz(name, source_key):
-    teacher = OmegaConf.load(ROOT / "diffusion_policy/config/train_civi_teacher.yaml")
-    assert teacher.task.dataset.wrench_filter.enabled
-    assert teacher.task.dataset.wrench_filter.cutoff_hz == 2
-    assert teacher.task.dataset.wrench_filter.source_key == "observation.tau_ext"
+def test_student_configs_inherit_matching_teacher_torque_preprocessing(
+        name, teacher_name, source_key, filter_enabled):
+    teacher = OmegaConf.load(ROOT / f"diffusion_policy/config/{teacher_name}.yaml")
     workspace = TrainDistillRenderNetWorkspace.__new__(TrainDistillRenderNetWorkspace)
     workspace.cfg = OmegaConf.load(ROOT / f"diffusion_policy/config/{name}.yaml")
     workspace.teacher_cfg = teacher
@@ -131,12 +129,16 @@ def test_student_configs_select_matching_teacher_first_order_two_hz(name, source
     if source_key == "observation.tau_ext":
         assert "wrench_filter" not in workspace.cfg.dataset
         assert workspace._dataset_config().wrench_filter == teacher.task.dataset.wrench_filter
+    elif name == "train_distill_render_net_student":
+        assert "wrench_filter" not in workspace.cfg.dataset
+        assert workspace._dataset_config().wrench_filter == teacher.task.dataset.wrench_filter
     else:
         # The historical student keeps its explicit filter for its wrench checkpoint.
         assert workspace.cfg.dataset.wrench_filter.source_key == source_key
     effective_filter = workspace._dataset_config().wrench_filter
-    assert effective_filter.enabled
-    assert effective_filter.cutoff_hz == 2
+    assert effective_filter.enabled is filter_enabled
+    if filter_enabled:
+        assert effective_filter.cutoff_hz == 2
     assert effective_filter.source_key == source_key
 
 

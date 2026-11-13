@@ -181,9 +181,9 @@ def _worker(rank, root):
         distill.hydra.utils.instantiate = lambda cfg: TinyDataset(root / "data")
 
         class MainLogger(RenderNetTrainingLogger):
-            def __init__(self, *args):
+            def __init__(self, *args, **kwargs):
                 assert rank == 0, "Only rank 0 may open the shared log"
-                super().__init__(*args)
+                super().__init__(*args, **kwargs)
 
             def save_plot(self):
                 pass

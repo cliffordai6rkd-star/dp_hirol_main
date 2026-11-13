@@ -19,8 +19,9 @@ def make_workspace(monkeypatch, tmp_path):
     monkeypatch.setattr(distill.hydra.utils, "instantiate", lambda _: TinyDataset(tmp_path / "data"))
     monkeypatch.setattr(distill.RenderNetTrainingLogger, "save_plot", lambda self: None)
 
-    def make(name, *, epochs=3, resume=None, enabled=True):
+    def make(name, *, epochs=3, resume=None, enabled=True, device="cpu"):
         config = _config(tmp_path)
+        config.training.device = device
         config.teacher_cache.enabled = False
         config.optimizer.lr = 0.01
         config.training.num_epochs = epochs
@@ -110,6 +111,55 @@ def test_resumed_ema_matches_uninterrupted_training(make_workspace):
     assert_same_parameters(reference.model, resumed.model)
     assert_same_parameters(reference.ema_model, resumed.ema_model)
     assert resumed.latest_val_loss == reference.latest_val_loss
+
+
+@pytest.mark.parametrize("device", [
+    "cpu", "meta",
+    pytest.param("cuda:0", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA is unavailable",
+    )),
+])
+def test_resume_keeps_shared_fitted_normalizer_on_workspace_device(
+        make_workspace, monkeypatch, device):
+    # DictOfTensorMixin rebuilds its ParameterDict from the CPU checkpoint.
+    # Exercise a populated normalizer: the empty fixture cannot expose a
+    # normalizer silently moving wrench inputs back off the workspace device.
+    def instantiate_teacher(payload, config, target_device, **kwargs):
+        teacher = TinyTeacher()
+        teacher.normalizer.fit({"wrench": torch.tensor([[-2.0], [0.0], [4.0]])},
+                               mode="gaussian")
+        return teacher.to(target_device)
+
+    def make_preprocessor(teacher):
+        preprocessor = TinyPreprocessor()
+        preprocessor.normalizer = teacher.normalizer
+        return preprocessor
+
+    monkeypatch.setattr(distill, "instantiate_policy", instantiate_teacher)
+    monkeypatch.setattr(distill.WrenchPreprocessor, "from_policy", make_preprocessor)
+    first = make_workspace("cpu_checkpoint", epochs=1)
+    first.run()
+    expected = first.normalizer["wrench"].normalize(torch.tensor([[[1.0]]]))
+    resumed = make_workspace("resumed_on_device", epochs=2, device=device,
+                             resume=first.get_checkpoint_path("latest"))
+
+    assert resumed.normalizer is resumed.teacher_policy.normalizer
+    assert resumed.normalizer is resumed.wrench_preprocessor.normalizer
+    target = torch.device(device)
+    assert all(value.device == target for value in resumed.normalizer.state_dict().values())
+    raw_wrench = torch.tensor([[[1.0]]], device=target)
+    normalized = resumed.normalizer["wrench"].normalize(raw_wrench)
+    assert normalized.device == target
+    # The real wrench path combines this output with a mask on the input
+    # device; before the fix, a CUDA/meta resume left normalized on CPU.
+    gated = torch.where(torch.ones_like(raw_wrench, dtype=torch.bool),
+                        normalized, torch.zeros_like(normalized))
+    assert gated.device == target
+    assert all(not parameter.requires_grad for parameter in resumed.teacher_policy.parameters())
+    if device != "meta":
+        torch.testing.assert_close(normalized.cpu(), expected)
+        resumed.run()
+        assert resumed.global_step == 4 and resumed.epoch == 2
 
 
 def test_legacy_checkpoint_initializes_ema_from_restored_student(make_workspace):

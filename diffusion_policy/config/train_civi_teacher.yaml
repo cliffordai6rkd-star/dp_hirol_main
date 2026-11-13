@@ -1,42 +1,32 @@
+# Complete contact-informed teacher for the clean 25 Hz xArm demonstrations.
+# export CIVI_DATASET_PATH=/path/to/*_clean_ma5_l1_12p5, then python train.py.
 name: train_civi_teacher
+exp_name: ${name}
 _target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
-# Training requires observation.tau_ext; the bundled LIBERO dataset lacks it.
-# Override task.dataset.dataset_path with a compatible seven-axis torque dataset.
-dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
+output_dir: data/outputs/civi/current_tau_ext/teacher
+dataset_path: ${oc.env:CIVI_DATASET_PATH,null}
 dino_model_path: model/model/dinov3-vitb16-pretrain-lvd1689m
-task_name: libero_open_top_drawer_put_bowl_20hz_force_aware
+task_name: xarm_clean_25hz_tau_ext
+
+# 25 Hz, two RGB views, seven measured joint-torque channels and seven joint targets.
 shape_meta:
   obs:
-    wrist:
-      shape:
-      - 3
-      - 192
-      - 256
-      type: rgb
-    side:
-      shape:
-      - 3
-      - 192
-      - 256
-      type: rgb
-    tau_ext:
-      shape:
-      - 8
-      - 7
-      type: low_dim
+    side: {shape: [3, 224, 224], type: rgb}
+    wrist: {shape: [3, 224, 224], type: rgb}
+    tau_ext: {shape: [8, 7], type: low_dim}
   action:
-  # xyz + quaternion + gripper
-    shape:
-    - 8
-exp_name: train_civi_teacher
+    shape: [7]
+
 horizon: 9
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
-dataset_obs_steps: 2
-free_threshold: 8.0
-contact_threshold: 10.0
-contact_norm: l2
+dataset_obs_steps: ${n_obs_steps}
+free_threshold: 12.5
+contact_threshold: 12.5
+contact_norm: l1
+
+# A confirmed onset opens fusion over the preceding half-second.
 phase_resampling:
   enabled: true
   precontact_seconds: 0.5
@@ -44,32 +34,13 @@ phase_resampling:
     free: 1.0
     precontact: 1.0
     contact: 1.0
+
 freeze_dino_backbone: true
 freeze_modules: []
+
 policy:
   _target_: diffusion_policy.policy.force_aware_diffusion_transformer_policy.ForceAwareDiffusionTransformerPolicy
-  shape_meta:
-    obs:
-      wrist:
-        shape:
-        - 3
-        - 192
-        - 256
-        type: rgb
-      side:
-        shape:
-        - 3
-        - 192
-        - 256
-        type: rgb
-      tau_ext:
-        shape:
-        - 8
-        - 7
-        type: low_dim
-    action:
-      shape:
-      - 8
+  shape_meta: ${shape_meta}
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
     num_train_timesteps: 100
@@ -80,20 +51,19 @@ policy:
     set_alpha_to_one: true
     steps_offset: 0
     prediction_type: epsilon
-  horizon: 9
-  n_action_steps: 8
-  n_obs_steps: 2
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
   wrench_key: tau_ext
   phase_wrench_key: tau_ext
   future_phase_wrench_key: null
-  # Offline demonstration labels open fusion linearly before contact;
-  # wrench inputs still contain only current/past measurements.
   precontact_seconds: ${phase_resampling.precontact_seconds}
   wrench_history_steps: 8
   relative_pose_actions: false
   action_reference_key: action_reference
+  action_representation: joint_position
   num_inference_steps: 8
-  dino_model_name_or_path: model/model/dinov3-vitb16-pretrain-lvd1689m
+  dino_model_name_or_path: ${dino_model_path}
   dino_local_files_only: true
   freeze_dino_backbone: true
   freeze_modules: []
@@ -111,20 +81,13 @@ policy:
   p_drop_emb: 0.0
   p_drop_attn: 0.1
   causal_attn: false
-  free_threshold: 8.0
-  contact_threshold: 8.0
+  free_threshold: ${free_threshold}
+  contact_threshold: ${contact_threshold}
   contact_enter_frames: 5
   contact_exit_frames: 5
-  contact_force_dims:
-  - 0
-  - 1
-  - 2
-  - 3
-  - 4
-  - 5
-  - 6
+  contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
   contact_history_reducer: max
-  contact_norm: l2
+  contact_norm: ${contact_norm}
   input_gate_enabled: false
   image_blur_scope: full_context
   image_blur_schedule:
@@ -134,6 +97,7 @@ policy:
     end_sigma: 0.0
     start_fraction: 0.25
     end_fraction: 0.75
+
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
   update_after_step: 0
@@ -141,42 +105,41 @@ ema:
   power: 0.75
   min_value: 0.0
   max_value: 0.9999
+
 dataloader:
-  batch_size: 128
+  batch_size: 32
   num_workers: 4
   shuffle: true
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
 val_dataloader:
-  batch_size: 128
+  batch_size: 32
   num_workers: 0
   shuffle: false
   pin_memory: true
   persistent_workers: false
   prefetch_factor: null
+
 optimizer:
   learning_rate: 0.0001
   action_expert_weight_decay: 0.001
-  fusion_weight_decay: 1.0e-06
-  betas:
-  - 0.9
-  - 0.95
+  fusion_weight_decay: 0.000001
+  betas: [0.9, 0.95]
+
 training:
   device: cuda:0
   seed: 42
   debug: false
   resume: false
-  amp:
-    enabled: true
-    dtype: bfloat16
-    allow_tf32: true
+  amp: {enabled: true, dtype: bfloat16, allow_tf32: true}
   distributed:
     enabled: true
     backend: nccl
     batch_size_is_global: true
     find_unused_parameters: false
     run_rank0_eval: false
+    timeout_seconds: 86400
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: null
@@ -193,22 +156,16 @@ training:
   max_train_steps: null
   max_val_steps: null
   tqdm_interval_sec: 1.0
+
 logging:
   project: nero_force_aware_diffusion
   resume: false
   mode: disabled
-  name: 2026.11.08-15.45.34_train_civi_teacher_libero_open_top_drawer_put_bowl_20hz_force_aware
-  tags:
-  - libero
-  - 20hz
-  - force-aware
-  - current-tau-ext
-  - dinov3
-  - image-query
-  - lstm2
-  - gripper
+  name: ${name}
+  tags: [xarm, 25hz, clean, tau-ext, precontact-ramp, joint-position, dual-camera, image-query, lstm2]
   id: null
-  group: libero_20hz_lstm2_gripper
+  group: xarm_clean_25hz_tau_ext
+
 checkpoint:
   topk:
     monitor_key: checkpoint_action_mse
@@ -223,119 +180,65 @@ checkpoint:
     episode_selection: all
     seed: 42
     batch_size: 16
+
 task:
-  name: libero_open_top_drawer_put_bowl_20hz_force_aware
+  name: ${task_name}
   wrench_key: tau_ext
   phase_wrench_key: tau_ext
   future_phase_wrench_key: null
   wrench_history_steps: 8
   phase_wrench_steps: 8
   phase_wrench_stride: 1
-  free_threshold: 8.0
-  contact_threshold: 8.0
+  free_threshold: ${free_threshold}
+  contact_threshold: ${contact_threshold}
   contact_enter_frames: 5
   contact_exit_frames: 5
-  contact_force_dims:
-  - 0
-  - 1
-  - 2
-  - 3
-  - 4
-  - 5
-  - 6
+  contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
   contact_history_reducer: max
-  contact_norm: l2
-  phase_source_key: observation.tau_ext
+  contact_norm: ${contact_norm}
+  phase_source_key: observation.tau_ext_unthresholded
   input_gate_enabled: false
   relative_pose_actions: false
   action_reference_key: action_reference
-  image_shape:
-  - 3
-  - 192
-  - 256
-  shape_meta:
-    obs:
-      wrist:
-        shape:
-        - 3
-        - 192
-        - 256
-        type: rgb
-      side:
-        shape:
-        - 3
-        - 192
-        - 256
-        type: rgb
-      tau_ext:
-        shape:
-        - 8
-        - 7
-        type: low_dim
-    action:
-      shape:
-      - 8
+  image_shape: [3, 224, 224]
+  shape_meta: ${shape_meta}
   env_runner: null
-  normalizer:
-    mode: gaussian
-    last_n_dims: 1
+  normalizer: {mode: gaussian, last_n_dims: 1}
   dataset:
     _target_: diffusion_policy.dataset.lerobot_v3_dataset.LeRobotV3ImageDataset
-    shape_meta:
-      obs:
-        wrist:
-          shape:
-          - 3
-          - 192
-          - 256
-          type: rgb
-        side:
-          shape:
-          - 3
-          - 192
-          - 256
-          type: rgb
-        tau_ext:
-          shape:
-          - 8
-          - 7
-          type: low_dim
-      action:
-        shape:
-        - 8
-    dataset_path: data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3
-    horizon: 9
+    shape_meta: ${shape_meta}
+    dataset_path: ${dataset_path}
+    horizon: ${horizon}
     pad_before: 1
     pad_after: 0
-    n_obs_steps: 2
-    n_latency_steps: 0
+    n_obs_steps: ${n_obs_steps}
+    n_latency_steps: ${n_latency_steps}
     seed: 42
     val_ratio: 0.0
     window_sampling_strategy: timestamp
     image_feature_map:
-      wrist: observation.images.wrist
-      side: observation.images.side
+      side: observation.images.front
+      wrist: observation.images.right_wrist
     windowed_lowdim_feature_groups:
       tau_ext:
-        source_key: observation.tau_ext
+        source_key: observation.tau_ext_unthresholded
         steps: 8
-        # Causal measured history ending at each observation: t-7, ..., t.
         start_offset: -7
         stride: 1
-    action_feature_fields:
-    - observation.ee_pose
-    - action
+    action_feature_fields: [action.joint]
+    action_feature_columns: null
+    action_feature_offsets: null
     action_layout: per_step
     relative_pose_actions: false
     timestamp_key: timestamp
+    # The saved torque bundle is already causally filtered; keep its continuous pre-threshold signal.
     wrench_filter:
-      enabled: true
-      cutoff_hz: 2.0
-      source_key: observation.tau_ext
-      timestamp_key: timing.state_timestamp_ns
-    timestamp_step_sec: 0.05
+      enabled: false
+      source_key: observation.tau_ext_unthresholded
+      timestamp_key: timestamp
+    timestamp_step_sec: 0.04
     timestamp_tolerance_sec: null
-    observation_validity_key: timing.camera_valid
+    observation_validity_key: null
     local_files_only: true
     video_backend: pyav
     video_decode_device: auto
@@ -344,21 +247,13 @@ task:
     image_cache_dtype: uint8
     image_cache_chunk_frames: 64
     phase_resampling_enabled: true
-    # Sampling phase follows the current measured, debounced joint torques.
     phase_label_mode: current_wrench
-    phase_source_key: observation.tau_ext
-    contact_threshold: 8.0
+    phase_source_key: observation.tau_ext_unthresholded
+    contact_threshold: ${contact_threshold}
     contact_enter_frames: 5
     contact_exit_frames: 5
-    contact_force_dims:
-    - 0
-    - 1
-    - 2
-    - 3
-    - 4
-    - 5
-    - 6
-    contact_norm: l2
+    contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
+    contact_norm: ${contact_norm}
     precontact_seconds: ${phase_resampling.precontact_seconds}
     image_randomer_config:
       shared_across_sequence: true
@@ -366,12 +261,10 @@ task:
       random_crop: false
       rotation: false
       color_jitter: true
-      color_jitter_params:
-        brightness: 0.1
-        contrast: 0.15
-        saturation: 0.1
-        hue: 0.03
-    action_feature_columns:
-      action:
-      - 6
-output_dir: data/outputs/civi/current_tau_ext/teacher
+      color_jitter_params: {brightness: 0.1, contrast: 0.15, saturation: 0.1, hue: 0.03}
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

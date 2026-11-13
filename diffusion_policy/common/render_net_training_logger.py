@@ -3,6 +3,8 @@
 from array import array
 import json
 import math
+import logging
+import multiprocessing as mp
 import numbers
 from pathlib import Path
 
@@ -11,6 +13,9 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from diffusion_policy.common.json_logger import JsonLogger
+
+
+log = logging.getLogger(__name__)
 
 
 class MetricHistory:
@@ -23,11 +28,19 @@ class MetricHistory:
                  "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
                  "initial_train_mse")
+    region_keys = {"train_mask_mse", "train_context_patch_mse", "train_intensity_loss"}
+    scope_dependent_keys = {
+        "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+        "train_open_token_mse", "train_closed_token_mse", "train_loss",
+        "train_condition_loss", "val_condition_loss", "initial_train_mse", "epoch_train_mse",
+        "val_mse", "epoch_val_mse", "epoch_best_val_mse",
+    } | region_keys
 
     def __init__(self):
         self.series = {}
         self.step = self.epoch = 0
         self.objective = "token_mse"
+        self.metric_scope = "all"
 
     def _append(self, name, x, y):
         if not math.isfinite(float(y)):
@@ -40,18 +53,35 @@ class MetricHistory:
             ys.append(y)
 
     def record(self, metrics):
+        scope = metrics.get("metric_scope", self.metric_scope)
+        if scope != self.metric_scope:
+            # Keep the full JSON history, but plot only measurements with the
+            # current selection rule. Auxiliary phase/alpha and runtime
+            # histories remain comparable across this change.
+            for key in self.scope_dependent_keys:
+                self.series.pop(key, None)
+            self.metric_scope = scope
         warmup = metrics.get("objective") == "condition_warmup"
         if "objective" in metrics and not warmup:
             self.objective = metrics["objective"]
         step, epoch = metrics.get("global_step", self.step), metrics.get("epoch", self.epoch)
         self.step, self.epoch = step, epoch
         token_measured = metrics.get("train_token_mse_measured", not warmup)
+        region_count = metrics.get("train_token_region_observation_count",
+                                   metrics.get("token_region_observation_count"))
         if warmup and "train_mse" in metrics:
             self._append("train_condition_loss", step, metrics["train_mse"])
+        elif warmup and "initial_train_mse" in metrics and not token_measured:
+            self._append("train_condition_loss", step, metrics["initial_train_mse"])
         for key in self.step_keys:
             if (not token_measured and key in {
                     "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
-                    "train_open_token_mse", "train_closed_token_mse"}):
+                    "train_open_token_mse", "train_closed_token_mse", "initial_train_mse"}):
+                continue
+            if region_count == 0 and key in self.region_keys:
+                continue
+            if (key == "train_open_token_mse" and metrics.get("train_open_token_count") == 0
+                    or key == "train_closed_token_mse" and metrics.get("train_closed_token_count") == 0):
                 continue
             if key in metrics:
                 self._append(key, step, metrics[key])
@@ -59,7 +89,11 @@ class MetricHistory:
                 and metrics.get("epoch_train_token_mse_measured", not warmup)):
             self._append("epoch_train_mse", epoch, metrics["epoch_train_mse"])
         val = metrics.get("val_mse", metrics.get("initial_val_mse"))
-        if val is not None:
+        val_token_measured = metrics.get("val_token_mse_measured", not warmup)
+        if val is not None and warmup and not val_token_measured:
+            self._append("val_condition_loss", step, val)
+        if (val is not None and val_token_measured
+                and metrics.get("val_token_region_observation_count") != 0):
             self._append("val_mse", step, val)
             self._append("epoch_val_mse", epoch, val)
             best = metrics.get("best_val_mse", val)
@@ -110,12 +144,16 @@ def save_training_plot(history, destination):
         axes[1].plot(x[best], y[best], "*", color="tab:red", markersize=13,
                      label=f"Best {y[best]:.6g} @ epoch {x[best]:g}")
     metric_label = "Denoiser output MSE" if history.objective == "denoiser_mse" else "Context token MSE"
+    if history.metric_scope == "phases_1_2":
+        metric_label += "\npre-contact / contact"
     curve(axes[2], "train_mse", metric_label, linewidth=0.9)
     if history.objective == "denoiser_mse":
         curve(axes[2], "train_token_mse", "Token MSE (diagnostic)", linewidth=0.8, alpha=0.65)
         curve(axes[2], "train_demo_mse", "Demonstration loss", linewidth=0.8, alpha=0.65)
     curve(axes[2], "train_mask_mse", "Region MSE", linewidth=0.9)
     curve(axes[2], "train_condition_loss", "Condition warmup loss", linewidth=0.9)
+    curve(axes[2], "val_condition_loss", "Condition validation loss", linewidth=0.9,
+          marker="o", color="tab:orange")
     curve(axes[2], "train_phase_ce", "Contact phase CE", linewidth=0.8, alpha=0.8)
     curve(axes[2], "train_alpha_mse", "Alpha MSE", linewidth=0.8, alpha=0.8)
     curve(axes[2], "train_loss", "Total loss", linewidth=0.9)
@@ -158,22 +196,85 @@ def save_training_plot(history, destination):
     return destination
 
 
+def _plot_worker(log_path, destination, request_event, stop_event, poll_seconds):
+    """Render plots outside the training process and never block optimizer steps."""
+    log_path = Path(log_path)
+    destination = Path(destination)
+    last_mtime = None
+    while True:
+        requested = request_event.wait(float(poll_seconds))
+        request_event.clear()
+        stopping = stop_event.is_set()
+        try:
+            mtime = log_path.stat().st_mtime_ns
+            if requested or stopping or mtime != last_mtime:
+                history = MetricHistory.from_json(log_path)
+                save_training_plot(history, destination)
+                last_mtime = mtime
+        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+            # The logger may be opening or truncating the file during startup.
+            pass
+        except Exception:
+            log.exception("Asynchronous RenderNet plot update failed")
+        if stopping:
+            return
+
+
 class RenderNetTrainingLogger(JsonLogger):
-    def __init__(self, directory, plot_every_steps=100):
+    def __init__(self, directory, plot_every_steps=100, enable_plots=True,
+                 async_plots=True, plot_interval_sec=20.0):
         self.directory = Path(directory)
         super().__init__(str(self.directory / "logs.json.txt"), filter_fn=lambda key, value:
-                         isinstance(value, numbers.Number) or key in {"objective", "metric_name"})
+                         isinstance(value, numbers.Number) or key in {"objective", "metric_name", "metric_scope"})
         self.history = MetricHistory()
+        self.enable_plots = bool(enable_plots)
+        self.async_plots = bool(async_plots)
+        self.plot_interval_sec = float(plot_interval_sec)
+        if self.plot_interval_sec <= 0:
+            raise ValueError("logging.plot_interval_sec must be positive")
         self.plot_every_steps = int(plot_every_steps)
         if self.plot_every_steps < 0:
             raise ValueError("logging.plot_every_steps must be nonnegative (0 = epoch only)")
+        self._plot_process = None
+        self._plot_request = None
+        self._plot_stop = None
 
     def start(self):
         super().start()
-        self.history = MetricHistory.from_json(self.path)
+        if self.enable_plots:
+            self.history = MetricHistory.from_json(self.path)
+            if self.async_plots:
+                context = mp.get_context("spawn")
+                self._plot_request = context.Event()
+                self._plot_stop = context.Event()
+                self._plot_process = context.Process(
+                    target=_plot_worker,
+                    args=(self.path, self.directory / "training_metrics.png",
+                          self._plot_request, self._plot_stop, self.plot_interval_sec),
+                    name="render-net-plotter",
+                    daemon=True,
+                )
+                self._plot_process.start()
+
+    def stop(self):
+        if self._plot_process is not None:
+            # Request one final plot before closing the JSON file, then wait
+            # briefly so the PNG is complete when the training run exits.
+            self._plot_stop.set()
+            self._plot_request.set()
+            self._plot_process.join(timeout=30.0)
+            if self._plot_process.is_alive():
+                self._plot_process.terminate()
+                self._plot_process.join(timeout=5.0)
+            self._plot_process = None
+            self._plot_request = None
+            self._plot_stop = None
+        super().stop()
 
     def log(self, data):
         super().log(data)
+        if not self.enable_plots:
+            return
         self.history.record(self.get_last_log())
         step = data.get("global_step", 0)
         if (self.plot_every_steps and "train_mse" in data
@@ -181,4 +282,9 @@ class RenderNetTrainingLogger(JsonLogger):
             self.save_plot()
 
     def save_plot(self):
+        if not self.enable_plots:
+            return None
+        if self.async_plots:
+            self._plot_request.set()
+            return self.directory / "training_metrics.png"
         return save_training_plot(self.history, self.directory / "training_metrics.png")
