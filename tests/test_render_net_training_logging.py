@@ -52,12 +52,12 @@ def test_force_context_components_and_selection_survive_json_and_plotting(tmp_pa
     combined = panels["Combined force-context loss"]
     assert combined["ylabel"] == "Loss"
     assert combined["curves"] == {
-        "Train batch": [1.2], "Train epoch mean": [1.3], "Validation": [1.4],
+        "Train loss": [1.3], "Validation loss": [1.4],
     }
-    assert panels["Context token MSE"]["curves"]["Validation"] == [.3]
-    assert panels["Force difference MSE (raw)"]["curves"]["Validation"] == [.005]
-    assert panels["Force difference loss (normalized)"]["curves"]["Validation"] == [.5]
-    assert panels["Context region RGB loss"]["curves"]["Validation"] == [.6]
+    assert panels["Context token MSE"]["curves"]["Validation loss"] == [.3]
+    assert panels["Force difference MSE (raw)"]["curves"]["Validation loss"] == [.005]
+    assert panels["Force difference loss (normalized)"]["curves"]["Validation loss"] == [.5]
+    assert panels["Context region RGB loss"]["curves"]["Validation loss"] == [.6]
     with Image.open(tmp_path / "force_context.png") as image:
         assert image.format == "PNG" and np.asarray(image).std() > 10
 

@@ -1,0 +1,31 @@
+defaults:
+  - train_distill_render_net_student_response_adapter
+  - _self_
+
+name: student_dual_path_ablation
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_student_dual_path
+render_net:
+  high_attention_render:
+    threshold: 0.2
+  context_adapter:
+    enabled: true
+    kind: linear
+    hidden_dim: 128
+  dual_path:
+    enabled: false
+    decoder_film: false
+ablation:
+  seed: 42
+  optimizer_steps: 5000
+  calibration_steps: 2000
+  calibration_batch_size: 64
+  validation_every: 1000
+  log_every: 50
+  source_initialization: data/outputs/2026.11.15/00.24.22_response_adapter_restart_region02/inputs/student_rgb_initial.ckpt
+training:
+  early_stopping:
+    enabled: false
+  compile:
+    render_backbone: false
+    student_dino: true
+

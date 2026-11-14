@@ -19,7 +19,7 @@ import hydra
 import numpy as np
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf, open_dict
+from omegaconf import ListConfig, OmegaConf, open_dict
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Subset
@@ -143,6 +143,9 @@ def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
 
 
 class TrainDistillRenderNetWorkspace(BaseWorkspace):
+    # Additive statistics, reduced across batches/ranks before normalization.
+    contact_total_keys = ("contact_samples", "contact_token_sum", "contact_denoiser_sum",
+                          "contact_response_numerator", "contact_response_weight_sum")
     exclude_keys = ("teacher_policy", "_training_model")
     include_keys = ("global_step", "epoch", "best_val_loss", "initial_train_mse",
                     "initial_val_mse", "shape_info", "teacher_state_key", "latest_val_loss",
@@ -338,6 +341,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.started_at = time.monotonic()
         self.resume_from = None
         resume_path = cfg.training.get("resume_from")
+        warm_start_path = cfg.training.get("warm_start_from")
+        if resume_path and warm_start_path:
+            raise ValueError("Set only one of training.resume_from and training.warm_start_from")
         if resume_path:
             resume_path = pathlib.Path(str(resume_path)).expanduser().resolve()
             if not resume_path.is_file():
@@ -401,6 +407,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 raise ValueError("Cannot resume with a different distillation objective: "
                                  f"checkpoint={saved_objective}, configured={self.objective}. "
                                  "Start a new run so checkpoint selection metrics remain comparable.")
+            saved_phases = restored["cfg"].get("training", {}).get("sample_phases")
+            saved_phases = None if saved_phases is None else tuple(sorted(set(saved_phases)))
+            if saved_phases != self.sample_phases:
+                raise ValueError("Cannot resume with different training.sample_phases; use "
+                                 "training.warm_start_from in a new run to reset validation selection.")
             if self.ema_model is not None and "ema_model" not in restored["state_dicts"]:
                 self.ema_model.load_state_dict(self.model.state_dict())
                 log.info("Checkpoint has no student EMA: initialize from restored RenderNet; "
@@ -429,6 +440,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.stop_reason = None
             log.info("Resuming RenderNet from %s: epoch=%d step=%d best_val_mse=%.8f",
                      resume_path, self.epoch, self.global_step, self.best_val_loss)
+        elif warm_start_path:
+            # A new objective must start fresh optimization/selection counters,
+            # while retaining the already trained renderer and frozen conditions.
+            warm_start_path = pathlib.Path(str(warm_start_path)).expanduser().resolve()
+            restored = torch.load(warm_start_path, pickle_module=dill, map_location="cpu")
+            state_key = "ema_model" if "ema_model" in restored["state_dicts"] else "model"
+            self.model.load_state_dict(restored["state_dicts"][state_key], strict=True)
+            self.training_stage = "rgb"
+            self.stage_transition_reason = "warm_start:pretrained_student_to_rgb"
+            if self.ema_model is not None:
+                self.ema_model.load_state_dict(self.model.state_dict(), strict=True)
+            log.info("Warm-start RGB weights from %s (%s); new optimizer, EMA schedule and metrics",
+                     warm_start_path, state_key)
         self.num_epochs = int(cfg.training.num_epochs)
         self.intensity_warmup_epochs = int(cfg.training.get("intensity_warmup_epochs", 2))
         self.max_steps = cfg.training.max_steps
@@ -532,12 +556,26 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     @property
     def metric_name(self):
         if getattr(self, "training_stage", "joint") == "adapter":
-            return "zero-wrench baseline token MSE"
-        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
-            return "region/alpha loss"
-        if self.response_loss_weight > 0:
-            return "global + response-weighted token MSE"
-        return "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
+            name = "zero-wrench baseline token MSE"
+        elif self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            name = "region/alpha loss"
+        elif self.response_loss_weight > 0:
+            name = "global + response-weighted token MSE"
+        else:
+            name = "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
+        if self.sample_phases is not None:
+            name += f" on anchor phases {list(self.sample_phases)}"
+        return name
+
+    @property
+    def sample_phases(self):
+        phases = getattr(self, "cfg", {}).get("training", {}).get("sample_phases")
+        return None if phases is None else tuple(sorted(set(phases)))
+
+    @property
+    def metric_scope(self):
+        return ("all" if self.sample_phases is None else
+                "anchor_phases_" + "_".join(map(str, self.sample_phases)))
 
     @property
     def condition_prediction_enabled(self):
@@ -578,6 +616,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      previous_lr, current_lr, self.epoch, self.metric_name, validation_mse)
 
     def _validate_distillation_config(self):
+        phases = self.cfg.get("training", {}).get("sample_phases")
+        if phases is not None and (
+                not isinstance(phases, (list, tuple, ListConfig)) or not phases
+                or any(isinstance(p, bool) or not isinstance(p, int) or p not in (0, 1, 2)
+                       for p in phases)):
+            raise ValueError("training.sample_phases must be null or a nonempty list of "
+                             "0=free, 1=pre-contact, 2=contact")
         if self.objective not in {"token_mse", "denoiser_mse"}:
             raise ValueError("distillation.objective must be token_mse or denoiser_mse")
         if (self.cfg.get("render_net", {}).get("context_adapter", {}).get("enabled", False)
@@ -1070,6 +1115,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             if student_tokens.shape != teacher_tokens.shape:
                 raise RuntimeError(f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}")
             token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
+            response = None
             response_mse = response_numerator = response_weight_sum = token_mse.new_zeros(())
             if self.response_loss_weight > 0:
                 response = torch.cat([
@@ -1107,7 +1153,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         patch_losses.append(F.smooth_l1_loss(predicted_patches[key], target))
                     patch_mse = torch.stack(patch_losses).mean()
             denoiser_mse = demo_mse = token_mse.new_zeros(())
-            if self.objective == "denoiser_mse" and not getattr(self, "render_stages_enabled", False):
+            if self.objective == "denoiser_mse":
                 denoiser_mse, demo_mse = self._denoiser_losses(
                     action, student_tokens, teacher_tokens.to(student_tokens.dtype),
                 )
@@ -1141,10 +1187,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                             "so the teacher context-effect field can supervise the gate"
                         )
                     loss = intensity_loss
-                elif self.training_stage == "rgb":
-                    # RGB stage updates the complete RGB branch; the
-                    # independently trained gate path is frozen.
-                    loss = student_loss
+                # RGB retains the selected token/DiT objective computed above;
+                # the independently trained condition network stays frozen.
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
                                  "response_mse": float(response_mse.detach()),
                                  "response_numerator": float(response_numerator.detach()),
@@ -1167,6 +1211,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                  "mask_measured": measure_regions,
                                  "joint_training": self._joint_training_active(),
                                  "training_stage": getattr(self, "training_stage", "joint")}
+            self.loss_metrics.update(self._contact_loss_metrics(
+                obs, student_tokens, teacher_tokens, response=response,
+            ))
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
@@ -1210,6 +1257,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         # no_grad here would sever the RenderNet -> DINO -> DiT gradient path.
         prediction = teacher.model(noisy_action, timesteps, student_tokens)
         denoiser_mse = F.mse_loss(prediction.float(), target.float())
+        self._denoiser_per_sample = (
+            prediction.detach().float() - target.detach().float()
+        ).square().flatten(1).mean(1)
         prediction_type = teacher.noise_scheduler.config.prediction_type
         if prediction_type == "epsilon":
             demo_target = noise
@@ -1220,6 +1270,42 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         else:
             raise ValueError(f"unsupported prediction type {prediction_type!r}")
         return denoiser_mse, F.mse_loss(prediction.float(), demo_target.float())
+
+    @torch.no_grad()
+    def _contact_loss_metrics(self, obs, student_tokens, teacher_tokens, *, response=None):
+        """Measure full outputs of phase=2 anchors; never change the training loss."""
+        phases = obs.get("contact_phase")
+        if phases is None:
+            return {}
+        anchor = getattr(self.teacher_policy, "n_obs_steps", phases.shape[-1]) - 1
+        selected = (phases if phases.ndim == 1 else phases[:, anchor]) == 2
+        errors = (student_tokens.detach().float() - teacher_tokens.detach().float()).square().mean(-1)
+        mask = selected.to(errors.dtype)
+        zero = errors.new_zeros(())
+        numerator = denominator = denoiser_sum = zero
+        if response is not None:
+            weights = (response.detach().float() - self.response_noise_floor).clamp_min(0)
+            weights = weights * mask[:, None]
+            numerator, denominator = (errors * weights).sum(), weights.sum()
+        if self.objective == "denoiser_mse":
+            denoiser_sum = (self._denoiser_per_sample * mask).sum()
+        totals = torch.stack((mask.sum(), (errors.mean(1) * mask).sum(), denoiser_sum,
+                              numerator, denominator)).cpu().tolist()
+        return {**dict(zip(self.contact_total_keys, totals)), **self._contact_means(totals)}
+
+    def _contact_means(self, totals):
+        count, token_sum, denoiser_sum, numerator, weight_sum = totals
+        result = {"contact_samples": int(count)}
+        if count == 0:
+            return result  # Missing measurements must not appear as zero loss.
+        token = token_sum / count
+        response = numerator / max(weight_sum, torch.finfo(torch.float32).eps)
+        result.update(contact_token_mse=token, contact_response_mse=response,
+                      contact_mse=(denoiser_sum / count if self.objective == "denoiser_mse"
+                                   else token + self.response_loss_weight * response))
+        if self.objective == "denoiser_mse":
+            result["contact_denoiser_mse"] = denoiser_sum / count
+        return result
 
     def _token_mse(self, loss):
         # Fallback permits lightweight callers that replace _loss in loop tests.
@@ -1439,6 +1525,35 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         log.info("Complete teacher cache ready; training/validation will read cached targets")
         return tuple(prepared)
 
+    def _select_phase_dataset(self, dataset, *, split):
+        """Select complete windows by measured anchor phase, after cache indexing.
+
+        Historical observations and the full action horizon stay intact. The
+        predicted alpha and future-contact masks do not select training data.
+        """
+        if self.sample_phases is None:
+            return dataset
+        source = dataset.dataset if isinstance(dataset, CachedTeacherDataset) else dataset
+        get_labels = getattr(source, "get_phase_labels", None)
+        if not callable(get_labels):
+            raise ValueError("training.sample_phases requires dataset.get_phase_labels()")
+        labels = np.asarray(get_labels())
+        if labels.shape != (len(dataset),) or not np.isin(labels, (0, 1, 2)).all():
+            raise ValueError("Dataset anchor phase labels must align with the complete sample/cache indices")
+        indices = np.flatnonzero(np.isin(labels, self.sample_phases))
+        if not len(indices):
+            raise ValueError(f"No {split} samples in selected anchor phases {self.sample_phases}")
+        if not hasattr(self, "phase_selection"):
+            self.phase_selection = {}
+        self.phase_selection[split] = {
+            "phases": list(self.sample_phases), "total_samples": len(dataset),
+            "selected_samples": len(indices),
+            "source_phase_counts": {str(p): int((labels == p).sum()) for p in (0, 1, 2)},
+        }
+        log.info("%s phase selection: anchor phases=%s, %d/%d samples; original cache indices retained",
+                 split, self.sample_phases, len(indices), len(dataset))
+        return Subset(dataset, indices.tolist())
+
     def _loader(self, dataset, config, *, validation=False):
         kwargs = OmegaConf.to_container(config, resolve=True)
         context = self.distributed_context
@@ -1496,9 +1611,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         component_keys = (
             "token_mse", "denoiser_mse", "demo_mse", "mask_mse",
             "context_patch_mse", "intensity_smoothness", "intensity_loss",
-            "contact_open_ratio", "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse",
+            "contact_open_ratio", "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse", "loss",
         )
         component_totals = {key: 0.0 for key in component_keys}
+        contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
         response_numerator = response_weight_sum = 0.0
         open_token_sum = closed_token_sum = open_token_count = closed_token_count = 0.0
         started = last_status = time.monotonic()
@@ -1516,6 +1632,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             for key in component_totals:
                 component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * size
             metrics = getattr(self, "loss_metrics", {})
+            contact_totals += [metrics.get(key, 0.0) for key in self.contact_total_keys]
             response_numerator += metrics.get("response_numerator", 0.0)
             response_weight_sum += metrics.get("response_weight_sum", 0.0)
             open_token_sum += metrics.get("open_token_mse", 0.0) * metrics.get("open_token_count", 0.0)
@@ -1539,12 +1656,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.validation_samples_per_second = count / max(self.validation_seconds, 1e-6)
         totals = self._sum(list(component_totals.values()) + [
             open_token_sum, closed_token_sum, open_token_count, closed_token_count,
-        ])
+        ] + contact_totals.tolist())
         component_count = len(component_totals)
         self.validation_metrics = {
             key: value / count for key, value in zip(component_totals, totals[:component_count])
         }
-        open_sum, closed_sum, open_count, closed_count = totals[component_count:]
+        open_sum, closed_sum, open_count, closed_count = totals[component_count:component_count + 4]
+        self.validation_metrics.update(self._contact_means(totals[component_count + 4:]))
         self.validation_metrics["open_token_mse"] = open_sum / open_count if open_count else 0.0
         self.validation_metrics["closed_token_mse"] = closed_sum / closed_count if closed_count else 0.0
         self.validation_metrics["open_token_count"] = open_count
@@ -1595,6 +1713,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "wrench_preprocessing": OmegaConf.to_container(self.cfg.wrench_preprocessing, resolve=True),
             "render_net": OmegaConf.to_container(self.cfg.render_net, resolve=True),
             "validation_enabled": self.validation_enabled,
+            "metric_scope": self.metric_scope,
+            "phase_selection": getattr(self, "phase_selection", None),
             "distillation": OmegaConf.to_container(OmegaConf.create(self.distillation_config), resolve=True),
             "objective": self.logging_objective,
             "validation_metric": f"{self.metric_name} (excludes auxiliary losses)" if self.validation_enabled else None,
@@ -1621,6 +1741,59 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             **(self.shape_info or {}), **self._gpu_metrics(),
         }
         pathlib.Path(self.output_dir, "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    def _log_initial_losses(self, train_dataset, val_loader, logger):
+        """Evaluate full splits before updates, including every contact anchor."""
+        log.info("Initial %s evaluation: complete training split and validation split", self.training_stage)
+        baseline_cfg = copy.deepcopy(self.cfg.val_dataloader)
+        with open_dict(baseline_cfg):
+            baseline_cfg.shuffle = False
+            baseline_cfg.drop_last = False
+        previous_limit = self.max_val_batches
+        saved_validation = {key: value for key, value in self.__dict__.items()
+                            if key.startswith("validation_")}
+        self.max_val_batches = None
+        loader = self._loader(train_dataset, baseline_cfg, validation=True)
+        try:
+            self.initial_train_mse = self._validate(loader)
+            initial_metrics = dict(self.validation_metrics)
+            initial_samples = self.validation_samples
+        finally:
+            if getattr(loader, "_iterator", None) is not None:
+                loader._iterator._shutdown_workers()
+            self.max_val_batches = previous_limit
+            for key in list(self.__dict__):
+                if key.startswith("validation_") and key not in saved_validation:
+                    delattr(self, key)
+            self.__dict__.update(saved_validation)
+        metadata = {"global_step": self.global_step, "epoch": self.epoch,
+                    "objective": self.logging_objective, "training_stage": self.training_stage,
+                    "metric_scope": self.metric_scope,
+                    "student_state_key": self.evaluation_state_key,
+                    "response_loss_weight": self.response_loss_weight}
+        logger.log({**metadata, "initial_train_mse": self.initial_train_mse,
+                    "initial_train_samples": initial_samples,
+                    **{f"initial_train_{key}": value for key, value in initial_metrics.items()},
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
+        if val_loader is not None:
+            self.initial_val_mse = self._validate(val_loader)
+            self.latest_val_loss = self.best_val_loss = self.initial_val_mse
+            self.best_epoch, self.best_step = self.epoch, self.global_step
+            self.early_stopping_best_loss = self.initial_val_mse
+            self._step_lr_scheduler(self.initial_val_mse)
+            if self.is_main_process:
+                self.save_checkpoint(tag="best", use_thread=False)
+                if self.training_stage == "adapter":
+                    self.save_checkpoint(tag="best_adapter", use_thread=False)
+                if self.condition_prediction_enabled and self.training_stage == "intensity":
+                    self.save_checkpoint(tag="best_condition", use_thread=False)
+            logger.log({**metadata, "initial_val_mse": self.initial_val_mse,
+                        "initial_val_samples": self.validation_samples,
+                        **{f"initial_val_{key}": value for key, value in self.validation_metrics.items()},
+                        "val_seconds": self.validation_seconds,
+                        "elapsed_seconds": time.monotonic() - self.started_at})
+        logger.save_plot()
 
     def _validate_and_save(self, loader, logger):
         if loader is None:
@@ -1736,6 +1909,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 if self.distributed_context.enabled:
                     dist.barrier()
                 return
+            train_dataset = self._select_phase_dataset(train_dataset, split="train")
+            if self.validation_enabled:
+                validation_dataset = self._select_phase_dataset(validation_dataset, split="validation")
             train_loader = self._loader(train_dataset, self.cfg.dataloader)
             val_loader = (self._loader(validation_dataset, self.cfg.val_dataloader, validation=True)
                           if self.validation_enabled else None)
@@ -1765,52 +1941,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             logger_context = (RenderNetTrainingLogger(output, logging_config.get("plot_every_steps", 100))
                               if self.is_main_process else contextlib.nullcontext(_NullTrainingLogger()))
             with logger_context as logger:
+                if self.sample_phases is not None:
+                    logger.log({"global_step": self.global_step, "epoch": self.epoch,
+                                "metric_scope": self.metric_scope})
                 if self.is_main_process:
                     log.info(f"Local metrics: {logger.path}; PNG: {output / 'training_metrics.png'}")
                 if self.resume_from is None:
-                    self.model.eval()
-                    log.info(f"Initial evaluation started: one training batch "
-                             f"(per_rank_batch={train_loader.batch_size}, "
-                             f"global_batch={train_loader.batch_size * self.distributed_context.world_size}); "
-                             f"validation={self.validation_enabled}")
-                    with torch.no_grad(), self._validation_probes():
-                        initial_batch = next(self._iterate_loader(train_loader))
-                        initial_loss = self._batch_loss(initial_batch)
-                        size = next(iter(initial_batch["obs"].values())).shape[0]
-                        total, count = self._sum([self._selection_mse(initial_loss) * size, size])
-                        self.initial_train_mse = total / count
-                    log.info(f"Initial training batch complete: {self.metric_name}={self.initial_train_mse:.8f}")
-                    logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                "objective": self.logging_objective,
-                                "lr": self.optimizer.param_groups[0]["lr"],
-                                "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
-                    logger.save_plot()
-                    if self.validation_enabled:
-                        self.initial_val_mse = self._validate(val_loader)
-                        self.latest_val_loss = self.initial_val_mse
-                        self.best_val_loss = self.initial_val_mse
-                        self.early_stopping_best_loss = self.initial_val_mse
-                        self._step_lr_scheduler(self.initial_val_mse)
-                        if self.is_main_process:
-                            self.save_checkpoint(tag="best", use_thread=False)
-                            if self.training_stage == "adapter":
-                                self.save_checkpoint(tag="best_adapter", use_thread=False)
-                            if self.condition_prediction_enabled and self.training_stage == "intensity":
-                                self.save_checkpoint(tag="best_condition", use_thread=False)
-                        log.info(f"Initial train_mse={self.initial_train_mse:.8f}, val_mse={self.initial_val_mse:.8f}")
-                        logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                    "objective": self.logging_objective,
-                                    "student_state_key": self.evaluation_state_key,
-                                    "initial_val_mse": self.initial_val_mse,
-                                    "val_seconds": getattr(self, "validation_seconds", 0.0),
-                                    "val_samples_per_second": getattr(self, "validation_samples_per_second", 0.0),
-                                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
-                        logger.save_plot()
+                    self._log_initial_losses(train_dataset, val_loader, logger)
                 else:
                     log.info("Skipping initial evaluation; restored checkpoint state will be continued")
                 self._summary("running")
                 for epoch_index in range(self.epoch, self.num_epochs):
-                    self._maybe_transition_stage(completed_epochs=self.epoch)
+                    if self._maybe_transition_stage(completed_epochs=self.epoch):
+                        self._log_initial_losses(train_dataset, val_loader, logger)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                         break
@@ -1826,6 +1969,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     )}
                     epoch_open_token_sum = epoch_closed_token_sum = 0.0
                     epoch_open_token_count = epoch_closed_token_count = 0.0
+                    epoch_contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
                     epoch_started = previous_end = last_status = time.monotonic()
                     batches = len(train_loader)
                     if self.max_steps is not None:
@@ -1873,10 +2017,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                             open_count,
                             metrics_for_batch.get("closed_token_mse", 0.0) * closed_count,
                             closed_count,
+                            *[metrics_for_batch.get(key, 0.0) for key in self.contact_total_keys],
                         ])
                         regular_count = len(epoch_components)
                         regular_totals = component_totals[:regular_count]
-                        open_total, open_count_total, closed_total, closed_count_total = component_totals[regular_count:]
+                        open_total, open_count_total, closed_total, closed_count_total = component_totals[regular_count:regular_count + 4]
+                        contact_totals = component_totals[regular_count + 4:]
+                        epoch_contact_totals += contact_totals
                         epoch_total += primary_total
                         epoch_samples += global_size
                         epoch_loss_total += loss_total
@@ -1905,6 +2052,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                             "train_open_token_mse": metrics_for_batch.get("open_token_mse", 0.0),
                             "train_closed_token_mse": metrics_for_batch.get("closed_token_mse", 0.0),
                         })
+                        metrics.update({f"train_{key}": value for key, value in
+                                        self._contact_means(contact_totals).items()})
                         logger.log(metrics)
                         progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
                                              mse=f"{epoch_total / epoch_samples:.4f}",
@@ -1927,6 +2076,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
                                 "objective": self.logging_objective,
+                                "training_stage": self.training_stage,
+                                **{f"epoch_train_{key}": value for key, value in
+                                   self._contact_means(epoch_contact_totals).items()},
                                 "epoch_train_mse": epoch_total / epoch_samples,
                                 "epoch_train_loss": epoch_loss_total / epoch_samples,
                                 "epoch_train_mask_mse": epoch_mask_total / epoch_samples,

@@ -22,9 +22,13 @@ def main():
     for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                      "NUMEXPR_NUM_THREADS"):
         os.environ[variable] = "1"
-    from diffusion_policy.common.render_net_training_logger import MetricHistory, save_training_plot
+    from diffusion_policy.common.render_net_training_logger import (
+        MetricHistory, save_training_plot, export_curve_log,
+    )
 
     log_path = args.run_directory / "logs.json.txt"
+    if not log_path.exists():
+        log_path = args.run_directory / "log.json"
     destination = args.output or args.run_directory / "training_metrics.png"
     last_mtime = None
     while True:
@@ -38,6 +42,8 @@ def main():
         if mtime != last_mtime:
             history = MetricHistory.from_json(log_path)
             print(save_training_plot(history, destination), flush=True)
+            if log_path.suffix != ".json":
+                export_curve_log(log_path, destination.parent / "log.json")
             last_mtime = mtime
         if not args.watch or finished:
             break

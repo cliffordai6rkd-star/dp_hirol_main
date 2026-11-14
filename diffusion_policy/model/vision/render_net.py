@@ -519,7 +519,8 @@ class RenderNet(nn.Module):
                  rendering_mode="residual", glow=None, patch_residual_refine=True,
                  spatial_modulation=None, backbone=None, architecture_version=None,
                  separate_gate_path=False, transformer=None,
-                 condition_prediction=None, condition_backbone=None, context_adapter=None):
+                 condition_prediction=None, condition_backbone=None, context_adapter=None,
+                 dual_path=None):
         super().__init__()
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints.  The active implementation is the CNN
@@ -597,7 +598,15 @@ class RenderNet(nn.Module):
             cross_attn_layers=int(cross_attn_layers),
             decoder_layers=effective_decoder_layers,
         )
-        if rendering_mode == "gaussian_glow":
+        self.dual_path_enabled = bool((dual_path or {}).get("enabled", False))
+        if self.dual_path_enabled:
+            if rendering_mode != "residual":
+                raise ValueError("dual_path requires rendering_mode=residual")
+            from diffusion_policy.model.vision.dual_path_render_net import DualPathConvAttentionBackbone
+            dual_options = dict(dual_path)
+            dual_options.pop("enabled", None)
+            self.backbone = DualPathConvAttentionBackbone(**backbone_options, **dual_options)
+        elif rendering_mode == "gaussian_glow":
             self.backbone = GaussianGlowBackbone(glow=glow, **backbone_options)
         elif rendering_mode == "patch_residual":
             self.backbone = PatchResidualBackbone(
@@ -701,7 +710,18 @@ class RenderNet(nn.Module):
     def compile_backbone(self, **kwargs):
         # Compile only the image path. LSTM stays in cuDNN; state_dict keys stay
         # unchanged, and evaluation does not compile a second forward-only graph.
-        self._compiled_backbone_forward = torch.compile(self.backbone.forward, **kwargs)
+        forward = (self._forward_spatial_backbone if self.spatial_modulation_enabled
+                   else self.backbone.forward)
+        self._compiled_backbone_forward = torch.compile(forward, **kwargs)
+
+    def _forward_spatial_backbone(self, image, wrench_tokens, camera_embedding, *, modulation_gate,
+                                 contact_alpha=None):
+        extra = {"contact_alpha": contact_alpha} if self.dual_path_enabled else {}
+        return self.backbone(
+            image, wrench_tokens, camera_embedding,
+            spatial_modulations=self.spatial_modulations, modulation_gate=modulation_gate,
+            **extra,
+        )
 
     def _set_requires_grad(self, module, enabled):
         if module is not None:
@@ -981,15 +1001,20 @@ class RenderNet(nn.Module):
             rgb_camera = self.camera_embedding.weight[self.image_keys.index(key)].reshape(1, 1, -1)
             backbone_forward = (self._compiled_backbone_forward
                                 if self._compiled_backbone_forward is not None
-                                and not self.spatial_modulation_enabled
                                 and self.training and torch.is_grad_enabled() else self.backbone)
             backbone_kwargs = {}
+            if self.dual_path_enabled:
+                backbone_kwargs["contact_alpha"] = (alpha.reshape(-1, 1, 1, 1)
+                    if alpha is not None else flat_image.new_ones(flat_image.shape[0], 1, 1, 1))
+                backbone_kwargs["modulation_gate"] = (flat_gate.detach()
+                    if self.detach_intensity_for_rgb else flat_gate)
             if self.spatial_modulation_enabled and self.rendering_mode == "residual":
                 backbone_kwargs.update(
-                    spatial_modulations=self.spatial_modulations,
                     modulation_gate=(flat_gate.detach()
                                      if self.detach_intensity_for_rgb else flat_gate),
                 )
+                if backbone_forward is self.backbone:
+                    backbone_kwargs["spatial_modulations"] = self.spatial_modulations
             raw_residual, _ = backbone_forward(
                 flat_image, wrench_tokens, rgb_camera, **backbone_kwargs,
             )

@@ -93,3 +93,98 @@ context = encode_student_context(
 2026-11-14 实测：新增 14 项测试通过（含真实两进程 DDP 阶段切换）；另有 147 项相关回归通过。历史训练循环测试中有 6 个已有断言要求 `metrics_png is None`，仍与现有生成曲线 PNG 的行为不一致；没有为了通过这些断言关闭绘图。真实教师 eager 与编译试跑各完成 9 次更新，重新加载 checkpoint 后训练/推理 context 最大差均为 0，教师可训练参数为 0。试跑摘要分别见 `data/diagnostics/2026.11.14/student_adapter_smoke/summary.json` 与 `student_adapter_compiled_smoke/summary.json`。
 
 完整数据训练后，应把零力矩校准残差与教师力矩信号量级一起评估，再决定是否使用 MLP；不能把适配阶段的 loss 降低直接等同于动作效果改善。
+
+## 双卡训练的数据预取
+
+BF16 AMP、TF32 和 RGB 阶段的学生 DINO 编译已在默认配置中开启。教师目标缓存可复用；渲染图像随参数更新而变化，因此不跨更新复用学生 DINO 的 K/V。
+
+2026-11-14 在双 RTX 4090、约 128 GB 内存服务器上，原先每步约 55 ms 等待数据、32 ms 计算。已为本地 LeRobot Parquet 读取器补充 pickle 恢复方法，允许 DDP 使用 `spawn` worker。样本和教师缓存仍按原顺序对齐。
+
+本次运行采用每卡 8 个训练 worker、4 个验证 worker，均设置 `persistent_workers=true`，总 batch 16、每卡 8。独立读取测试的 0/2/4/8 worker 吞吐分别约 132/180/291/556 samples/s。真实 adapter 训练各取 200 个稳定步骤比较，读取等待中位数从 55.3 ms 降到 0.33 ms，日志中的步吞吐中位数从 183 提升到 473 samples/s，约 2.58 倍。这不包含首次启动 worker 的耗时，也不代表 RGB 阶段已获得相同比例的提速。
+
+独立测速代码位于 `test/benchmark_distill_input_pipeline.py`。在训练原工作目录运行，复用已有图像与教师缓存：
+
+```bash
+python test/benchmark_distill_input_pipeline.py \
+  --run-dir /path/to/student \
+  --output /path/to/input_pipeline.json \
+  --workers 0 2 4 8
+```
+
+`test/test_distill_training_acceleration.py` 验证真实 LeRobot 读取器及成对教师缓存通过 pickle 和 spawn 后的数值与洗牌顺序一致。本次新增验证及相关读取器/数据集/教师缓存回归共 103 项通过。
+
+## 冻结 DiT 的行为蒸馏
+
+`train_distill_render_net_student_frozen_dit` 使用相同的渲染器、冻结视觉适配器和区域/alpha 网络，
+将 RGB 阶段的主要目标改为冻结 DiT 的输出 MSE：教师读取正常融合 context，学生读取渲染图像的 context，
+两路使用同一条加噪动作和同一个扩散时间步。教师目标停止梯度；学生分支允许梯度穿过冻结 DiT、
+context_norm、adapter、DINO，更新 RGB 分支及其 wrench 编码器。验证固定噪声/时间步，选模、降学习率和
+早停均监控 DiT 输出 MSE。这里每次更新使用单步去噪输出，不展开完整扩散采样。
+
+```bash
+python train_distill_render_net.py \
+  --config-name=train_distill_render_net_student_frozen_dit \
+  training.warm_start_from=/absolute/path/to/student/checkpoints/best.ckpt
+```
+
+`warm_start_from` 只严格加载学生 EMA 权重（没有 EMA 时加载在线权重），直接进入 RGB 阶段；
+优化器、EMA 计数和验证指标从头开始，允许从原 token 蒸馏切换目标。继续同一个 DiT 实验则使用
+`training.resume_from`，保留优化器和轮数，且将 `training.warm_start_from=null`；两个参数不能同时指定。
+不指定 warm start 时，仍依次训练 adapter、条件网络和 RGB。
+
+此配置保留区域阈值 0.2、预测 alpha、batch 16 和 RGB patience 10。token MSE 保留为诊断，
+token 辅助项、响应加权项和演示动作损失的训练权重均为 0；它们不会覆盖 DiT 目标。
+已有教师 context 缓存可以复用，DiT 输出随新采样的噪声和时间步即时计算。
+
+新增分阶段回归位于 `test/test_staged_frozen_dit.py`，检查实际训练目标、固定验证探针、
+RGB/wrench 梯度、冻结分支、跨目标权重初始化及优化状态重置。
+
+## 只用接触阶段继续蒸馏
+
+`train_distill_render_net_student_frozen_dit_contact` 设置 `training.sample_phases=[2]`，
+按数据集的当前观测锚点标签筛选接触样本，排除自由空间（0）和预接触（1）。每个入选样本仍保留
+完整历史观测和动作序列，历史中可以包含非接触帧；筛选不依赖学生预测的 alpha 或区域 mask。
+筛选位于教师缓存加载之后，使用原始样本索引，现有全量缓存可以直接复用。
+
+```bash
+python train_distill_render_net.py \
+  --config-name=train_distill_render_net_student_frozen_dit_contact \
+  training.warm_start_from=/absolute/path/to/all_phase_student/checkpoints/best.ckpt \
+  teacher_cache.directory=/absolute/path/to/data/cache_response_adapter_teacher
+```
+
+从已有学生最佳 EMA 权重启动独立 RGB 实验，adapter、区域和 alpha 网络继续冻结。
+训练、验证、选模和早停都只使用接触锚点样本，验证基线重新计算，不能直接与旧实验的全阶段均值比较。
+`training_summary.json` 记录两个划分的入选数量和原始阶段分布。该筛选不会自动改变推理时的渲染门控。
+恢复同一实验时不能修改筛选阶段；改阶段应使用 `warm_start_from` 新建实验。
+接触筛选及缓存对齐回归位于 `test/test_distill_contact_samples.py`。
+
+## 接触 loss 统计和绘图
+
+RGB 蒸馏现在在每个已有 batch 内额外统计真实 `contact_phase[:, n_obs_steps-1] == 2`
+的样本。统计包含这些样本的完整历史 context 或 DiT 动作输出，不用预测 alpha、区域 mask、
+未来接触门控来筛选。它是诊断统计，不修改训练样本、优化目标、选模或早停规则。
+DiT 配置报告去噪输出 MSE；token 配置报告全局 token MSE 加原配置权重的响应加权项。
+普通项按接触样本数汇总，响应项先跨 batch/卡累加分子和有效权重，再归一化。
+没有接触样本或尚在 adapter/条件预训练阶段时，不把缺失的接触 loss 画成零。
+
+训练输出目录新增 `contact_loss.png`，只显示接触样本的 Train loss 和 Validation loss。
+主图 `training_metrics.png` 的 loss 面板也只保留这两条线：训练为每轮平均值，验证为每轮评估值，
+不再显示逐 batch 线或滑动平均线。初始 loss 会直接连接到曲线起点。
+新实验及阶段切换时，初始训练 loss 会遍历完整入选训练集（使用评估模式和 EMA，如果启用），
+后续训练点为在线模型更新过程中的平均 loss；验证按原固定噪声/时间步和验证配置计算。
+完整初始评估会增加启动耗时，不产生优化更新。
+
+`log.json` 是标准 JSON 文档，`records` 保存初始值、每轮均值、验证值及接触样本计数。
+主要字段为 `initial_train_contact_mse`、`initial_val_contact_mse`、
+`epoch_train_contact_mse`、`val_contact_mse`，各自对应同前缀的 `contact_samples`。
+原 `logs.json.txt` 继续保留逐 batch 的详细数据。恢复训练会保留已有记录。
+
+```bash
+python -m diffusion_policy.scripts.plot_render_net_training /absolute/path/to/student
+```
+
+上述命令重新生成主图、接触图和 `log.json`；若只有 `log.json`，也支持用其重建曲线。
+旧日志可以去掉逐 batch 线并接入已有初始值，但缺失的历史接触指标不会被补成零或推算出来。
+新统计回归位于 `test/test_contact_loss_logging.py`，真实三阶段短测试使用
+`test/smoke_student_context_adapter.py`。

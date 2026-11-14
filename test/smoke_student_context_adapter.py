@@ -44,6 +44,9 @@ class TinyDataset(Dataset):
                 if key is not None:
                     obs[key] = raw.squeeze(0).cpu()
             obs['contact_alpha'] = sample['true_alpha'].squeeze(0)
+            obs['contact_phase'] = torch.where(obs['contact_alpha'] >= 1, 2,
+                                               torch.where(obs['contact_alpha'] > 0, 1, 0))
+            obs['contact_phase'][teacher.n_obs_steps - 1] = phase
             self.rows.append({'obs': obs, 'action': sample['action'].squeeze(0)})
 
     def __len__(self):
@@ -111,6 +114,14 @@ def main():
         log_path = Path(temporary) / 'logs.json.txt'
         if log_path.is_file():
             shutil.copy2(log_path, args.output_dir / log_path.name)
+        for name in ('log.json', 'training_metrics.png', 'contact_loss.png'):
+            shutil.copy2(Path(temporary) / name, args.output_dir / name)
+        records = json.loads((args.output_dir / 'log.json').read_text())['records']
+        rgb_initial = next(row for row in records if row.get('training_stage') == 'rgb'
+                           and 'initial_train_contact_mse' in row)
+        assert rgb_initial['initial_train_samples'] == 3
+        assert rgb_initial['initial_train_contact_samples'] == 1
+        assert summary['latest_validation_metrics']['contact_samples'] == 1
         (args.output_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps({k: summary[k] for k in ('global_step', 'checkpoint_stages', 'inference_max_abs',
                                                  'adapter_parameters', 'gpu_peak_allocated_mib')}, indent=2))

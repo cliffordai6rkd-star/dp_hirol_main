@@ -1,0 +1,8 @@
+defaults:
+  - student_dual_path_c_film_linear
+  - _self_
+name: student_dual_path_c_film_mlp
+render_net:
+  context_adapter:
+    kind: mlp
+    hidden_dim: 128

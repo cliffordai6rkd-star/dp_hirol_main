@@ -338,19 +338,16 @@ class VectorThresholdGate(nn.Module):
 
 
 class FactrBlurScheduler(nn.Module):
-    """FACTR's pixel blur curriculum with the project's three fixed phases.
+    """Hold Gaussian blur, then linearly open vision between two step fractions.
 
-    FACTR keeps a large Gaussian scale for an initial portion of training and
-    linearly reduces it to zero over the remaining curriculum window.  This
-    implementation makes the requested boundaries explicit: the first 25%
-    holds ``start_sigma``, the middle 50% is linear, and the final 25% is
-    exactly clear.  Optimizer steps outside the configured range are clamped,
-    which keeps resumed runs deterministic after the last scheduled update.
+    Fractions are relative to the planned optimizer-update budget. A null
+    budget is supplied by the training workspace after building dataloaders;
+    explicit budgets and phase boundaries retain historical run behavior.
     """
 
     def __init__(
         self,
-        total_steps: int,
+        total_steps: Optional[int] = None,
         schedule_type: str = "linear",
         start_sigma: float = 5.0,
         end_sigma: float = 0.0,
@@ -360,9 +357,6 @@ class FactrBlurScheduler(nn.Module):
         super().__init__()
         if schedule_type != "linear":
             raise ValueError("FACTR blur schedule_type must be 'linear'")
-        total_steps = int(total_steps)
-        if total_steps <= 0:
-            raise ValueError("total_steps must be positive")
         start_sigma = float(start_sigma)
         end_sigma = float(end_sigma)
         if not math.isfinite(start_sigma) or not math.isfinite(end_sigma):
@@ -377,14 +371,25 @@ class FactrBlurScheduler(nn.Module):
             or not 0.0 <= start_fraction < end_fraction <= 1.0
         ):
             raise ValueError("blur phase fractions must satisfy 0 <= start < end <= 1")
-        self.total_steps = total_steps
+        self.auto_total_steps = total_steps is None
+        self.total_steps = None
+        if total_steps is not None:
+            self.set_total_steps(total_steps)
         self.schedule_type = schedule_type
         self.start_sigma = start_sigma
         self.end_sigma = end_sigma
         self.start_fraction = start_fraction
         self.end_fraction = end_fraction
 
+    def set_total_steps(self, total_steps: int) -> None:
+        total_steps = int(total_steps)
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        self.total_steps = total_steps
+
     def sigma(self, optimizer_step: int) -> float:
+        if self.total_steps is None:
+            raise RuntimeError("Set the optimizer-step budget before using the blur curriculum")
         progress = min(max(int(optimizer_step), 0), self.total_steps) / self.total_steps
         if progress <= self.start_fraction:
             return self.start_sigma

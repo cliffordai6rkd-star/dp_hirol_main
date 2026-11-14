@@ -277,9 +277,9 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             FactrBlurScheduler(**image_blur_schedule)
             if image_blur_schedule is not None else None
         )
-        if image_blur_scope not in {"current_observation", "full_context"}:
+        if image_blur_scope not in {"current_observation", "full_context", "precontact_contact"}:
             raise ValueError(
-                "image_blur_scope must be 'current_observation' or 'full_context'"
+                "image_blur_scope must be 'current_observation', 'full_context', or 'precontact_contact'"
             )
         self.image_blur_scope = str(image_blur_scope)
         self.normalizer = LinearNormalizer()
@@ -505,9 +505,23 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         if self.blur_scheduler is not None and apply_curriculum_mask:
             sigma = self.blur_scheduler.sigma(self.optimizer_step)
             if sigma > 0:
-                blurred_images = select_contact_blur_mask(
-                    blur_contact, scope=self.image_blur_scope
-                )
+                if self.image_blur_scope == "precontact_contact":
+                    # Use offline per-frame phase labels, not alpha: the first
+                    # pre-contact frame has alpha=0 but must still be blurred.
+                    phase = obs_dict.get("contact_phase")
+                    if (phase is None or phase.ndim != 2
+                            or phase.shape[0] != contact.shape[0]
+                            or phase.shape[1] < self.n_obs_steps):
+                        raise ValueError(
+                            "precontact_contact blur requires obs['contact_phase'] "
+                            "with shape [B, T >= n_obs_steps] (0=free, 1=precontact, 2=contact)"
+                        )
+                    phase = phase[:, :self.n_obs_steps]
+                    blurred_images = (phase == 1) | (phase == 2)
+                else:
+                    blurred_images = select_contact_blur_mask(
+                        blur_contact, scope=self.image_blur_scope
+                    )
             if blurred_images.any():
                 images = {key: value.clone() for key, value in images.items()}
                 for key, value in images.items():

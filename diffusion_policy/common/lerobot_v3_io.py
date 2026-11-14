@@ -37,8 +37,17 @@ def _repo_id_from_root(root: Path, repo_id: Optional[str] = None) -> str:
     return root.name or "local_lerobot_dataset"
 
 
+def _restore_local_reader_dataset(dataset_class):
+    # The local Parquet shim is a dynamic subclass. Reconstruct it by its
+    # importable base class so spawn workers can restore the existing state.
+    return object.__new__(_local_reader_dataset_class(dataset_class))
+
+
 def _local_reader_dataset_class(dataset_class):
     class LocalLeRobotDataset(dataset_class):
+        def __reduce__(self):
+            return _restore_local_reader_dataset, (dataset_class,), self.__dict__
+
         def load_hf_dataset(self):
             import datasets
             import pyarrow as pa

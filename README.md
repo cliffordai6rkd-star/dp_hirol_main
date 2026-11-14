@@ -19,7 +19,7 @@ export CIVI_DATASET_PATH=data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
 python train.py
 ```
 
-默认入口为 `train_civi_teacher.yaml` 和 `train_distill_render_net_student.yaml`。数据接口沿用当前 xArm 配置：front/right-wrist 双相机、8 帧七轴 `tau_ext_unthresholded` 历史和七维关节位置动作；接触阈值为 L1 12.5 Nm。教师使用历史版本的 contact-window 图像模糊课程：前 25% 保持模糊，中间 50% 逐步恢复，最后 25% 清晰。
+默认入口为 `train_civi_teacher.yaml` 和 `train_distill_render_net_student.yaml`。数据接口沿用当前 xArm 配置：front/right-wrist 双相机、8 帧七轴 `tau_ext_unthresholded` 历史和七维关节位置动作；接触阈值为 L1 12.5 Nm。教师模糊课程按逐帧 `contact_phase` 标签选择图像：free 保持清晰，precontact（接触前 0.5 秒）与 contact 在进入 DINO 前进行整图高斯模糊，覆盖两个相机。前 1/3 计划优化步固定 σ=5，后 2/3 线性降至 σ=0；总步数由训练预算确定，支持按 epoch 训练与梯度累积。验证、推理及学生蒸馏目标均使用清晰图像。
 
 无参数 `python train.py` 先训练教师，再将教师 checkpoint 交给学生。每次创建新目录：
 

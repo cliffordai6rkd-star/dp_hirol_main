@@ -29,7 +29,8 @@ policy:
   n_layer: 6
   n_emb: 256
   n_head: 4
-  # Inherit FACTR's global blur: first 2/3 at sigma=5, last 1/3 decays to 0.
+  # Inherit phase blur: free stays clear; precontact/contact hold sigma=5 for
+  # the first 1/3 of optimizer updates, then decay to zero over the last 2/3.
   # No contact alpha is applied to the joint self-attention token sequence.
 
 training:

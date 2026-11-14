@@ -87,28 +87,28 @@ def test_selfattn_outputs_use_model_output_and_hydra_follows_override(name):
 
 
 @pytest.mark.parametrize("name", ["train_civi_teacher", "train_civi_teacher_board_selfattn"])
-def test_civi_blur_covers_all_phases_and_uses_training_percentages(name):
+def test_civi_blur_selects_precontact_contact_and_uses_training_percentages(name):
     cfg = compose_teacher(name)
-    assert cfg.policy.image_blur_scope == "all"
+    assert cfg.policy.image_blur_scope == "precontact_contact"
     assert cfg.policy.image_blur_schedule == {
         "schedule_type": "linear",
         "total_steps": None,
         "start_sigma": 5.0,
         "end_sigma": 0.0,
-        "start_fraction": 2 / 3,
+        "start_fraction": 1 / 3,
         "end_fraction": 1.0,
     }
 
 
 @pytest.mark.parametrize("name", ["train_civi_teacher", "train_civi_teacher_board_selfattn"])
-def test_configured_factr_blur_holds_two_thirds_then_opens_linearly(name):
+def test_configured_factr_blur_holds_one_third_then_opens_linearly(name):
     cfg = compose_teacher(name)
     scheduler = FactrBlurScheduler(**OmegaConf.to_container(
         cfg.policy.image_blur_schedule, resolve=True,
     ))
     assert scheduler.auto_total_steps is True
     scheduler.set_total_steps(300)
-    assert [scheduler.sigma(step) for step in (0, 200, 250, 300)] == pytest.approx(
+    assert [scheduler.sigma(step) for step in (0, 100, 200, 300)] == pytest.approx(
         [5.0, 5.0, 2.5, 0.0],
     )
 

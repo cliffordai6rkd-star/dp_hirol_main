@@ -1,0 +1,10 @@
+defaults:
+  - student_dual_path_base
+  - _self_
+name: student_dual_path_b_interleaved
+render_net:
+  backbone:
+    image_self_attn_layers: 4
+  dual_path:
+    enabled: true
+
