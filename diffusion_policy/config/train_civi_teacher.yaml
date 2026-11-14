@@ -57,7 +57,6 @@ policy:
   wrench_key: tau_ext
   phase_wrench_key: tau_ext
   future_phase_wrench_key: null
-  precontact_seconds: ${phase_resampling.precontact_seconds}
   wrench_history_steps: 8
   relative_pose_actions: false
   action_reference_key: action_reference
@@ -69,6 +68,7 @@ policy:
   freeze_modules: []
   force_temporal_encoder: lstm
   force_encoder_layers: 2
+  # 2026-11-12 13:51 (ada3341): dense image-query fusion followed by the DiT.
   pre_cross_self_attn_layers: 0
   cross_attn_query: image
   cross_attn_layers: 2
@@ -89,18 +89,15 @@ policy:
   contact_history_reducer: max
   contact_norm: ${contact_norm}
   input_gate_enabled: false
-  # Blur every training image, including free and pre-contact observations.
-  image_blur_scope: all
+  image_blur_scope: full_context
   image_blur_schedule:
     schedule_type: linear
-    # Resolved from the training optimizer-update budget after loader creation.
-    total_steps: null
+    total_steps: 200000
     start_sigma: 5.0
     end_sigma: 0.0
-    # FACTR default: hold maximum blur for 2/3 of the planned updates,
-    # then linearly restore clarity until the budget endpoint; no clear tail.
-    start_fraction: 0.6666666666666666
-    end_fraction: 1.0
+    # Historical FACTR curriculum: blurred 25%, decay 50%, clear 25%.
+    start_fraction: 0.25
+    end_fraction: 0.75
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

@@ -14,7 +14,6 @@ from diffusion_policy.common.pose_util import (
 from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
     ContextTransformerForDiffusion,
 )
-from diffusion_policy.model.act.factr_transformer import FactrActionTransformer
 from diffusion_policy.model.vision.contact_curriculum import (
     ContactDetector,
     FactrBlurScheduler,
@@ -39,16 +38,12 @@ def normalize_pose_quaternions(action: torch.Tensor, eps: float = 1e-8) -> torch
 
 
 class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
-    """Image/torque teacher with a configurable DiT or ACT action head.
-
-    The historical class name remains stable for existing checkpoints.
-    Both action heads consume the observation encoder's selected fused context.
-    """
+    """Image plus low-dimensional signal Diffusion Transformer."""
 
     def __init__(
         self,
         shape_meta: dict,
-        noise_scheduler: Optional[SchedulerMixin],
+        noise_scheduler: SchedulerMixin,
         horizon: int,
         n_action_steps: int,
         n_obs_steps: int,
@@ -94,32 +89,16 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_layers: int = 1,
         cross_attn_query: str = "wrench",
         cross_attn_query_residual: bool = True,
-        fusion_downsample_factor: int = 1,
-        fusion_highres_skip: bool = True,
-        fusion_output_mode: str = "all",
-        fusion_upsample: bool = True,
         future_contact_mode: str = "legacy_rollout",
         precontact_seconds: Optional[float] = None,
         action_representation: str = "ee_pose",
-        action_head_backbone: str = "dit",
-        act_loss_type: str = "l1",
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
-        if action_head_backbone not in {"dit", "act"}:
-            raise ValueError("action_head_backbone must be 'dit' or 'act'")
-        if act_loss_type not in {"l1", "mse"}:
-            raise ValueError("act_loss_type must be 'l1' or 'mse'")
-        if action_head_backbone == "dit" and noise_scheduler is None:
-            raise ValueError("the dit action head requires a noise_scheduler")
-        if action_head_backbone == "act" and causal_attn:
-            raise ValueError("the FACTR ACT action head uses non-causal action queries")
-        self.action_head_backbone = action_head_backbone
-        self.act_loss_type = act_loss_type
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
         self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
         if self.precontact_seconds is not None and future_phase_wrench_key is not None:
-            raise ValueError("Pre-contact gating requires current wrench history and future_phase_wrench_key=None")
+            raise ValueError("Pre-contact gating requires causal wrench history")
         obs_shape_meta = shape_meta.get("obs", {})
         configured_image_keys = tuple(
             sorted(
@@ -242,10 +221,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 cross_attn_layers=cross_attn_layers,
                 cross_attn_query=cross_attn_query,
                 cross_attn_query_residual=cross_attn_query_residual,
-                fusion_downsample_factor=fusion_downsample_factor,
-                fusion_highres_skip=fusion_highres_skip,
-                fusion_output_mode=fusion_output_mode,
-                fusion_upsample=fusion_upsample,
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
@@ -261,35 +236,23 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             )
         context_tokens = n_obs_steps * obs_encoder.context_tokens_per_observation
         if action_expert is None:
-            if action_head_backbone == "act":
-                action_expert = FactrActionTransformer(
-                    n_emb=n_emb,
-                    n_head=n_head,
-                    num_encoder_layers=n_cond_layers,
-                    num_decoder_layers=n_layer,
-                    dim_feedforward=4 * n_emb,
-                    dropout=p_drop_attn,
-                    horizon=horizon,
-                    action_dim=action_dim,
-                )
-            else:
-                action_expert = ContextTransformerForDiffusion(
-                    input_dim=action_dim,
-                    output_dim=action_dim,
-                    horizon=horizon,
-                    n_emb=n_emb,
-                    n_head=n_head,
-                    n_layer=n_layer,
-                    n_cond_layers=n_cond_layers,
-                    max_context_tokens=context_tokens,
-                    p_drop_emb=p_drop_emb,
-                    p_drop_attn=p_drop_attn,
-                    causal_attn=causal_attn,
-                )
+            action_expert = ContextTransformerForDiffusion(
+                input_dim=action_dim,
+                output_dim=action_dim,
+                horizon=horizon,
+                n_emb=n_emb,
+                n_head=n_head,
+                n_layer=n_layer,
+                n_cond_layers=n_cond_layers,
+                max_context_tokens=context_tokens,
+                p_drop_emb=p_drop_emb,
+                p_drop_attn=p_drop_attn,
+                causal_attn=causal_attn,
+            )
 
         self.obs_encoder = obs_encoder
         self.model = action_expert
-        self.noise_scheduler = noise_scheduler if action_head_backbone == "dit" else None
+        self.noise_scheduler = noise_scheduler
         self.contact_detector = ContactDetector(
             threshold=contact_threshold, force_dims=contact_force_dims,
             history_reducer=contact_history_reducer,
@@ -314,9 +277,9 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             FactrBlurScheduler(**image_blur_schedule)
             if image_blur_schedule is not None else None
         )
-        if image_blur_scope not in {"all", "current_observation", "full_context"}:
+        if image_blur_scope not in {"current_observation", "full_context"}:
             raise ValueError(
-                "image_blur_scope must be 'all', 'current_observation' or 'full_context'"
+                "image_blur_scope must be 'current_observation' or 'full_context'"
             )
         self.image_blur_scope = str(image_blur_scope)
         self.normalizer = LinearNormalizer()
@@ -344,7 +307,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         self._latest_processed_wrench = None
         self._latest_normalized_wrench = None
         self.set_freeze_modules(self.freeze_modules)
-        self.num_inference_steps = 1 if action_head_backbone == "act" else (
+        self.num_inference_steps = (
             int(num_inference_steps)
             if num_inference_steps is not None
             else int(noise_scheduler.config.num_train_timesteps)
@@ -531,21 +494,19 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             self.prepare_context_inputs_with_future_contact(obs_dict)
         )
         future_has_contact = future_contact.any(dim=-1)
-        # Retain the contact-window selection for existing experiments.
-        # Global blur selects every observation independently of contact.
-        # Without a future phase signal, the contact scope uses current state.
+        # The curriculum degrades image evidence only for windows whose
+        # *future* reaches contact.  The current observation is often still
+        # free in these windows, so using ``contact`` would blur the wrong
+        # phase (or miss the future-contact window entirely).  Configurations
+        # without a future phase signal use their current contact state.
         blur_contact = future_has_contact
         sigma = 0.0
         blurred_images = torch.zeros_like(blur_contact, dtype=torch.bool)
         if self.blur_scheduler is not None and apply_curriculum_mask:
             sigma = self.blur_scheduler.sigma(self.optimizer_step)
             if sigma > 0:
-                blurred_images = (
-                    torch.ones_like(blur_contact, dtype=torch.bool)
-                    if self.image_blur_scope == "all"
-                    else select_contact_blur_mask(
-                        blur_contact, scope=self.image_blur_scope
-                    )
+                blurred_images = select_contact_blur_mask(
+                    blur_contact, scope=self.image_blur_scope
                 )
             if blurred_images.any():
                 images = {key: value.clone() for key, value in images.items()}
@@ -585,10 +546,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         context: torch.Tensor,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> torch.Tensor:
-        if self.action_head_backbone == "act":
-            # ACT starts from learned action queries. It never consumes a noisy
-            # ground-truth action, a diffusion timestep, or a random generator.
-            return self.model(context)
         trajectory = randn_tensor(
             shape,
             device=context.device,
@@ -684,10 +641,6 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             apply_curriculum_mask=self.training,
             generator=generator,
         )
-        if self.action_head_backbone == "act":
-            prediction = self.model(context)
-            loss_fn = F.l1_loss if self.act_loss_type == "l1" else F.mse_loss
-            return loss_fn(prediction, normalized_action)
         noise = torch.randn(
             normalized_action.shape,
             device=normalized_action.device,

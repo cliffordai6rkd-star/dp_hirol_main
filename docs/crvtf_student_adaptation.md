@@ -118,6 +118,33 @@ python train_distill_render_net.py \
 
 日志保留 `token_mse`、未归一化的 `force_delta_mse`、归一化的 `force_delta_loss` 和 `context_region_loss`。训练 batch、训练 epoch 与验证均记录这些分项；自动曲线和离线绘图分别展示各项及选模用的综合损失。`selection_metric="force context loss"` 时，历史兼容字段 `train_mse`/`val_mse` 表示综合损失，不能读作纯 token MSE。
 
+要接在正在运行的教师之后，可启动一次等待任务。指定教师主进程 PID（四卡训练指定 `torchrun` 主进程 PID）和对应 run 目录：
+
+```bash
+python train_pipeline.py distill \
+  --teacher-run /absolute/path/to/teacher \
+  --wait-for-teacher-pid 12345 \
+  --teacher-selection best \
+  --distill-config diffusion_policy/config/train_distill_render_net_board_selfattn.yaml \
+  --output-dir model_output/board_student_followup \
+  --gpus 0
+```
+
+该任务等待原教师进程退出，并检查 `latest.ckpt` 已达到训练预算或记录了早停完成，再选择最终的 `best.ckpt`。学生随后自动预缓存真实／零力矩教师输出并训练；等待期间不占用 GPU。`--output-dir` 指定一个尚不存在的目录，学生产物写入其 `student/`，接续状态记录在 `pipeline.json`。四卡学生使用 `--gpus 0,1,2,3 --nproc-per-node 4`，全局 batch size 仍由学生配置决定。先加 `--dry-run` 可预览命令。
+
+显存较保守的四卡接续可追加：
+
+```bash
+  --gpus 0,1,2,3 --nproc-per-node 4 \
+  --distill-override dataloader.batch_size=8 \
+  --distill-override val_dataloader.batch_size=8 \
+  --distill-override teacher_cache.batch_size=2 \
+  --distill-override training.compile.enabled=false \
+  --oom-retries 3 --monitor-interval 60
+```
+
+此时每卡训练和验证 batch 为 2，缓存由 rank 0 以 batch 2 生成。监控在等待教师时写根目录 `gpu_usage.jsonl`，学生启动后写 `student/gpu_usage.jsonl`，持续到该阶段退出。每次学生尝试另存 `attempt_001.log` 等日志。明确发生 CUDA OOM 时，最多重试指定次数：降低训练、验证和缓存 batch，关闭编译，并在存在 `latest.ckpt` 时续训；尚未保存的进度会重做。其他错误直接记录为失败。降低缓存 batch 会生成新的缓存目录。最终状态和重试记录均保存在 `pipeline.json`。
+
 数据字段、时间窗与力矩预处理继承指定教师，normalizer 使用教师 checkpoint。默认按整条 episode 留出 10% 验证数据；使用相同 board 数据和 seed=42 时延续教师的 episode 划分。阶段重采样关闭，不生成学生训练不需要的 contact/alpha 标签。
 
 ## 信息保留与诊断的边界

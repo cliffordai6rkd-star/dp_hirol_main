@@ -121,7 +121,8 @@ def load_render_net(checkpoint, device=None):
 def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, use_attention_mask=None):
     """Use the same physical gating and normalization as teacher and student training."""
     images = {key: obs[key][:, :n_obs_steps] for key in image_keys}
-    predict_phase = bool(getattr(model, "phase_prediction_enabled", False))
+    predict_phase = bool(getattr(model, "phase_prediction_enabled", False)
+                         or getattr(model, "condition_prediction_enabled", False))
     # Dataset phase/alpha targets use future contact onset.  Deployment must
     # infer its gate from the causal RGB and measured wrench observations.
     preprocessing_obs = ({key: value for key, value in obs.items()
@@ -135,6 +136,18 @@ def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, us
                        if not predict_phase and "contact_alpha" in obs else None),
         use_attention_mask=use_attention_mask,
     )
+
+
+def encode_student_context(model, preprocessor, obs, obs_encoder, n_obs_steps, *, input_grad=False):
+    """Deployment context, including the checkpoint's always-on visual adapter.
+
+    Use this context with the frozen DiT. Rendering RGB alone is insufficient
+    for adapter-enabled checkpoints. Offline alpha labels are never required.
+    """
+    _, rendered = render_observations(model, preprocessor, obs, obs_encoder.image_keys, n_obs_steps)
+    adapter = getattr(model, "context_adapter", None)
+    kwargs = {"context_adapter": adapter} if adapter is not None else {}
+    return obs_encoder.encode_image_context(rendered, input_grad=input_grad, **kwargs)
 
 
 def _to_rgb(values):

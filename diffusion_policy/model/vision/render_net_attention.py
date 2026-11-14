@@ -141,8 +141,31 @@ def context_effect_patch_weights(
     return weights_by_camera
 
 
+def zero_wrench_reference(teacher, obs):
+    """Build a physical-zero reference and discard the original alpha label."""
+    reference = dict(obs)
+    reference.pop("contact_alpha", None)
+    keys = dict.fromkeys(getattr(teacher, name, None) for name in
+                         ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
+    for key in keys:
+        if key is not None:
+            reference[key] = torch.zeros_like(obs[key])
+    return reference
+
+
 @torch.no_grad()
-def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero"):
+def teacher_zero_context_target(teacher, obs):
+    """Frozen teacher final context for the same image and raw zero torque."""
+    if teacher.training or any(p.requires_grad for p in teacher.parameters()):
+        raise ValueError("Zero-context supervision requires a frozen eval teacher")
+    device = next(iter(obs.values())).device
+    with torch.autocast(device_type=device.type, enabled=False):
+        return teacher._encode_context(zero_wrench_reference(teacher, obs),
+                                       apply_curriculum_mask=False).detach()
+
+
+@torch.no_grad()
+def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero", return_zero=False):
     """Exact final-fusion delta-Z magnitudes, with paired FP32 encoder calls.
 
     Returns ordinary normal tokens and raw [B, To, P] effects per camera. No
@@ -153,15 +176,9 @@ def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero"):
         raise ValueError("Context-effect supervision requires a frozen eval teacher")
     if baseline != "raw_zero":
         raise ValueError("Context-effect region supervision currently supports raw_zero")
-    reference = dict(obs)
+    reference = zero_wrench_reference(teacher, obs)
     # The Dataset label describes the original sample. Recompute it from the
     # zero-wrench counterfactual so its force-attention update is disabled.
-    reference.pop("contact_alpha", None)
-    keys = dict.fromkeys(getattr(teacher, name, None) for name in
-                         ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
-    for key in keys:
-        if key is not None:
-            reference[key] = torch.zeros_like(obs[key])
     device = next(iter(obs.values())).device
     with torch.autocast(device_type=device.type, enabled=False):
         normal = teacher._encode_context(obs, apply_curriculum_mask=False).detach()
@@ -182,7 +199,7 @@ def teacher_context_effect_targets(teacher, obs, *, baseline="raw_zero"):
         end = offset + int(encoder.patch_counts[key])
         maps[key] = delta[..., offset:end].detach()
         offset = end
-    return normal, maps
+    return (normal, maps, zero) if return_zero else (normal, maps)
 
 
 def _query_slot_attention_maps(context_relevance, fusion):

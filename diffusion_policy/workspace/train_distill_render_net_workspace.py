@@ -38,16 +38,14 @@ from diffusion_policy.dataset.render_net_teacher_cache import (
 from diffusion_policy.dataset.image_result_cache import use_shared_ram_result_cache
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.vision.render_net import RenderNet, build_render_net
-from diffusion_policy.model.vision.force_context_distillation import (
-    raw_zero_wrench_observations, teacher_context_pair, compute_force_context_losses,
-)
+from diffusion_policy.model.vision.response_distillation import response_weighted_token_mse
 from diffusion_policy.model.vision.render_net_attention import (
     attention_regions, context_effect_patch_weights, context_effect_regions,
     percentile_region, teacher_attention_targets, teacher_context_effect_targets,
-    validate_percentiles,
+    validate_percentiles, teacher_zero_context_target,
 )
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor, validate_precontact_seconds,
+    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor,
 )
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
     instantiate_policy, load_checkpoint_payload, patch_grid,
@@ -92,10 +90,8 @@ class _NullTrainingLogger:
 
 def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
                            return_contact=False, image_context_encoder=None,
-                           use_teacher_ffn=False, return_phase=False,
-                           condition_only=False, observation_mask=None,
-                           selected_observation_indices=None, return_rendered=False):
-    """Render and encode with teacher supervision; student alpha is predicted causally."""
+                           use_teacher_ffn=False, return_condition=False):
+    """Render RGB, encode it, and retain any student-owned visual calibration."""
     prepare_with_future = getattr(teacher, "prepare_context_inputs_with_future_contact", None)
     if prepare_with_future is not None:
         images, wrench, contact, future_contact = prepare_with_future(obs)
@@ -105,47 +101,38 @@ def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
         images, wrench, contact, future_contact = teacher.prepare_context_inputs(obs)
         if future_contact is None:
             future_contact = contact
-    # Offline labels supervise the condition field; the student predicts the
-    # blend weight from the observations that are available at inference.
+    # The Dataset alpha is shared with the teacher; the complete future mask
+    # also lets render-only callers compute the same continuous blend weight.
     renderer_impl = getattr(render_net, "module", render_net)
+    condition = None
     if isinstance(renderer_impl, RenderNet):
-        # Offline alpha is the teacher target. A phase-enabled student must
-        # learn and use its own causal alpha for both training and deployment.
-        student_alpha = (
-            obs["contact_alpha"][:, :teacher.n_obs_steps]
-            if (renderer_impl.use_contact_alpha and "contact_alpha" in obs
-                and not renderer_impl.phase_prediction_enabled)
-            else None
-        )
+        predict_condition = renderer_impl.condition_prediction_enabled
         result = render_net(
             images, wrench, future_contact=future_contact, return_aux=True,
-            contact_alpha=student_alpha, return_phase=return_phase or condition_only,
-            condition_only=condition_only, render_observation_mask=observation_mask,
+            contact_alpha=(obs["contact_alpha"][:, :teacher.n_obs_steps]
+                           if not predict_condition and "contact_alpha" in obs else None),
+            **({"return_condition": True} if predict_condition else {}),
         )
-        if return_phase or condition_only:
-            rendered, masks, phase_predictions = result
+        if predict_condition:
+            rendered, masks, condition = result
         else:
             rendered, masks = result
-            phase_predictions = None
-        if condition_only:
-            return None, masks, future_contact, phase_predictions
     else:
         # Lightweight test/render adapters from older checkpoints may expose
         # only the original two-input signature.
         rendered, masks = render_net(images, wrench, return_aux=True)
-        phase_predictions = None
     encode = teacher.obs_encoder.encode_image_context if image_context_encoder is None else image_context_encoder
-    encode_kwargs = {}
-    if selected_observation_indices is not None:
-        encode_kwargs["selected_observation_indices"] = selected_observation_indices
+    adapter = getattr(renderer_impl, "context_adapter", None)
     if use_teacher_ffn:
-        tokens = encode(rendered, input_grad=True, apply_fusion_ffn=True, **encode_kwargs)
+        if adapter is not None:
+            raise ValueError("Student adapter cannot be combined with teacher FFN replay")
+        tokens = encode(rendered, input_grad=True, apply_fusion_ffn=True)
+    elif adapter is not None:
+        tokens = encode(rendered, input_grad=True, context_adapter=adapter)
     else:
-        tokens = encode(rendered, input_grad=True, **encode_kwargs)
-    if return_rendered:
-        return tokens, rendered
-    if return_phase:
-        return tokens, masks, future_contact, phase_predictions
+        tokens = encode(rendered, input_grad=True)
+    if return_condition:
+        return tokens, masks, future_contact, condition
     if return_aux and return_contact:
         return tokens, masks, future_contact
     if return_aux:
@@ -162,10 +149,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     "best_epoch", "best_step", "epochs_without_improvement",
                     "early_stopping_best_loss", "stop_reason", "training_stage", "stage_step",
                     "stage_epoch", "stage_transition_reason", "render_stages_enabled",
-                    "condition_warmup_epochs", "resume_architecture_report",
-                    "condition_best_state", "condition_best_metric", "condition_best_epoch",
-                    "condition_transition_pending", "force_difference_scale", "force_region_scale",
-                    "force_context_statistics")
+                    "intensity_epochs", "adapter_epochs", "resume_architecture_report")
 
     def __init__(self, cfg, output_dir=None, distributed=None):
         super().__init__(cfg, output_dir)
@@ -205,36 +189,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         del payload
         if self.teacher_policy.obs_encoder.cross_attn_query != "image":
             raise ValueError("RenderNet distillation requires teacher cross_attn_query: image")
-        if int(cfg.render_net.get("cross_camera_attn_layers", 0)) > 0:
-            encoder = self.teacher_policy.obs_encoder
-            if (getattr(encoder, "fusion_output_mode", "all") != "visual"
-                    or not encoder.pre_cross_self_attn_layers or encoder.cross_attn_layers):
-                raise ValueError(
-                    "Cross-camera RenderNet requires a visual-output joint self-attention "
-                    "teacher checkpoint; use the newly trained teacher, not an old all-token checkpoint"
-                )
         self.teacher_policy.eval().requires_grad_(False)
-        log.info("Student token supervision: frozen image encoder%s; deployment uses RenderNet only",
-                 " + teacher fusion FFNs" if self.use_teacher_ffn else "")
+        log.info("Student token supervision: frozen image encoder%s; deployment retains visual adapter=%s",
+                 " + teacher fusion FFNs" if self.use_teacher_ffn else "",
+                 bool(cfg.render_net.get("context_adapter", {}).get("enabled", False)))
         self.normalizer = self.teacher_policy.normalizer
-        if cfg.render_net.get("phase_prediction", {}).get("enabled", False):
-            source_policy = (self.teacher_source_cfg.policy
-                             if self.teacher_source_cfg is not None else self.teacher_cfg.policy)
-            duration = validate_precontact_seconds(source_policy.get("precontact_seconds"))
-            if duration is None:
-                raise ValueError(
-                    "Phase-enabled student requires policy.precontact_seconds in the teacher source config; "
-                    "set it to 0.5 to construct offline pre-contact ramp targets"
-                )
-            if self.teacher_policy.future_phase_wrench_key is not None:
-                raise ValueError("Pre-contact distillation requires a teacher with causal current wrench history")
-            # This changes the frozen teacher's data path and alpha labels,
-            # not its learned weights. Persist the effective configuration so
-            # cached targets cannot be mistaken for the legacy binary gate.
-            self.teacher_policy.precontact_seconds = duration
-            with open_dict(self.teacher_cfg.policy):
-                self.teacher_cfg.policy.precontact_seconds = duration
-            log.info("Frozen teacher pre-contact fusion: %.3gs linear ramp; retain causal measured tau_ext", duration)
         self.wrench_preprocessor = WrenchPreprocessor.from_policy(self.teacher_policy).eval().requires_grad_(False)
         with open_dict(self.cfg):
             self.cfg.wrench_preprocessing = self.wrench_preprocessor.get_config()
@@ -247,6 +206,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             wrench_history_steps=int(encoder.wrench_history_steps),
             max_obs_steps=int(encoder.max_obs_steps),
         )
+        if render_config.get("context_adapter", {}).get("enabled", False):
+            # The adapter operates in the teacher's projected visual dimension.
+            render_config["conditioning_dim"] = int(encoder.n_emb)
         if render_config.get("initialize_wrench_from_teacher", True):
             teacher_force_encoder = getattr(encoder, "force_encoder", None)
             if teacher_force_encoder is None:
@@ -264,34 +226,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     wrench_dropout=float(teacher_force_encoder.dropout),
                 )
         render_config.update(backbone_config)
-        if render_config.get("image_encoder", "cnn") == "dino_lora":
-            dino_config = dict(render_config.get("dino") or {})
-            dino_path = dino_config.get("pretrained_model_name_or_path")
-            if dino_path is None:
-                dino_path = getattr(encoder, "pretrained_model_name_or_path", None)
-            if not dino_path:
-                raise ValueError(
-                    "DINO RenderNet requires dino.pretrained_model_name_or_path or a teacher "
-                    "obs_encoder.pretrained_model_name_or_path"
-                )
-            dino_config["pretrained_model_name_or_path"] = str(dino_path)
-            render_config["dino"] = dino_config
-            log.info("Student DINO loads independent pretrained weights from %s; "
-                     "frozen base with LoRA=%s", dino_path, dino_config.get("lora", {}))
         with open_dict(self.cfg):
             self.cfg.render_net = OmegaConf.create(render_config)
         self.model = build_render_net(wrench_dim, render_config).to(self.device)
-        if isinstance(self.model, RenderNet):
-            log.info("RGB residual modulation: spatial region gate=%s, contact alpha=%s",
-                     self.model.use_region_gate, self.model.use_contact_alpha)
         if (isinstance(self.model, RenderNet) and self.model.initialize_wrench_from_teacher
                 and hasattr(self.teacher_policy.obs_encoder, "force_encoder")):
             self.model.initialize_wrench_encoder(self.teacher_policy.obs_encoder)
-        phase_config = cfg.render_net.get("phase_prediction", {})
-        if (isinstance(self.model, RenderNet)
-                and phase_config.get("freeze_wrench_encoder", False)
-                and hasattr(self.model, "freeze_wrench_encoder")):
-            self.model.freeze_wrench_encoder()
         self.ema_model = self.ema = None
         if cfg.training.get("use_ema", False):
             self.ema_model = copy.deepcopy(self.model)
@@ -345,38 +285,25 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self._student_image_encoder = None
         self._training_model = None
         stage_config = cfg.training.get("render_stages", {})
-        # joint_after_rgb=false selects condition training followed by a
-        # frozen-condition renderer; legacy joint schedules remain supported.
+        # A staged run needs a supervised gate.  If high-attention rendering
+        # is disabled, there is no intensity objective to warm up, so retain a
+        # single joint RGB training stage.
         self.render_stages_enabled = (
             bool(stage_config.get("enabled", True)) and self.attention_enabled
-            and bool(getattr(self.model, "phase_prediction_enabled", False))
             and hasattr(self.model, "set_training_stage")
         )
-        self.condition_warmup_epochs = int(stage_config.get(
-            "condition_warmup_epochs", stage_config.get("warmup_epochs", 1),
+        self.intensity_epochs = int(stage_config.get(
+            "intensity_epochs", cfg.training.get("intensity_warmup_epochs", 2),
         ))
-        self.rgb_warmup_epochs = int(stage_config.get("rgb_warmup_epochs", 0))
-        # When false, RGB/render training remains the final stage. This keeps
-        # the condition branch frozen instead of re-opening the shared
-        # encoder in a joint phase after the render stage.
-        self.joint_after_rgb = bool(stage_config.get("joint_after_rgb", True))
-        self.condition_early_stopping = {"enabled": True, "patience": 5, "min_delta": 1e-4}
-        self.condition_early_stopping.update(stage_config.get("condition_early_stopping", {}))
-        self.condition_best_state = None
-        self.condition_best_metric = float("inf")
-        self.condition_best_epoch = None
-        self.condition_transition_pending = False
-        condition_patience = int(self.condition_early_stopping.get("patience", 5))
-        condition_delta = float(self.condition_early_stopping.get("min_delta", 1e-4))
-        if condition_patience < 1 or not math.isfinite(condition_delta) or condition_delta < 0:
-            raise ValueError("condition_early_stopping needs positive patience and finite nonnegative min_delta")
-        if self.condition_warmup_epochs < 0:
-            raise ValueError("training.render_stages.condition_warmup_epochs must be nonnegative")
-        if self.rgb_warmup_epochs < 0:
-            raise ValueError("training.render_stages.rgb_warmup_epochs must be nonnegative")
+        if self.intensity_epochs < 0:
+            raise ValueError("training.render_stages.intensity_epochs must be nonnegative")
+        self.adapter_epochs = int(stage_config.get("adapter_epochs", 20))
+        if self.context_adapter_enabled and self.adapter_epochs < 1:
+            raise ValueError("training.render_stages.adapter_epochs must be positive")
         self.training_stage = (
-            "condition_warmup" if self.render_stages_enabled and self.condition_warmup_epochs > 0
-            else "rgb" if self.strict_two_stage else "joint"
+            "adapter" if self.context_adapter_enabled else
+            "intensity" if self.render_stages_enabled and self.intensity_epochs > 0
+            else ("rgb" if self.render_stages_enabled else "joint")
         )
         self.stage_step = 0
         self.stage_epoch = 0
@@ -410,10 +337,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.stop_reason = None
         self.started_at = time.monotonic()
         self.resume_from = None
-        self.selection_metric_changed = False
-        self.force_difference_scale = self.force_context_config.get("difference_scale")
-        self.force_region_scale = self.force_context_config.get("region_scale")
-        self.force_context_statistics = None
         resume_path = cfg.training.get("resume_from")
         if resume_path:
             resume_path = pathlib.Path(str(resume_path)).expanduser().resolve()
@@ -433,18 +356,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 saved_render = saved_cfg.get("render_net", {})
                 saved_backbone = saved_render.get("backbone", {})
                 saved_base = saved_backbone.get("base_channels", saved_render.get("base_channels"))
-                saved_image_encoder = saved_backbone.get(
-                    "image_encoder", saved_render.get("image_encoder", "cnn")
-                )
-                current_image_encoder = cfg.render_net.get("image_encoder", "cnn")
                 current_base = cfg.render_net.get("backbone", {}).get(
                     "base_channels", cfg.render_net.get("base_channels")
                 )
                 mismatches = []
-                if saved_image_encoder != current_image_encoder:
-                    mismatches.append(
-                        f"image_encoder: checkpoint={saved_image_encoder}, current={current_image_encoder}"
-                    )
                 saved_state = restored.get("state_dicts", {}).get("model", {})
                 current_state = self.model.state_dict()
                 for key, value in saved_state.items():
@@ -462,8 +377,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     "status": "compatible" if not mismatches else "incompatible",
                     "saved_base_channels": saved_base,
                     "current_base_channels": current_base,
-                    "saved_image_encoder": saved_image_encoder,
-                    "current_image_encoder": current_image_encoder,
                     "mismatched_keys": mismatches[:32],
                     "mismatch_count": len(mismatches),
                 }
@@ -473,18 +386,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         f"{len(mismatches)} parameters (base_channels checkpoint={saved_base}, "
                         f"current={current_base}). Examples: " + "; ".join(mismatches[:8])
                     )
-                saved_stage_config = saved_cfg.get("training", {}).get("render_stages", {})
-                saved_strict = (bool(saved_stage_config.get("enabled", True))
-                                and self.attention_enabled
-                                and bool(getattr(self.model, "phase_prediction_enabled", False))
-                                and not bool(saved_stage_config.get("joint_after_rgb", True)))
-                if saved_strict != self.strict_two_stage:
-                    raise ValueError("Cannot resume across joint and strict two-stage schedules; start a new run")
                 self.load_payload(restored, include_keys=self.include_keys, exclude_keys=excluded)
-                # DictOfTensorMixin reconstructs normalizer parameters on the
-                # checkpoint's CPU device. This module is shared with the
-                # frozen teacher and must follow the resumed GPU inputs.
-                self.wrench_preprocessor.to(self.device)
+                # Loading the fitted normalizer rebuilds its ParameterDict on
+                # CPU; the teacher and inference preprocessor share this object.
+                self.normalizer.to(self.device)
             except (RuntimeError, KeyError, ValueError) as exc:
                 raise RuntimeError(
                     "RenderNet checkpoint could not be resumed with the current architecture. "
@@ -496,33 +401,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 raise ValueError("Cannot resume with a different distillation objective: "
                                  f"checkpoint={saved_objective}, configured={self.objective}. "
                                  "Start a new run so checkpoint selection metrics remain comparable.")
-            saved_force = restored["cfg"].get("distillation", {}).get("force_context", {})
-            if bool(saved_force.get("enabled", False)) != self.force_context_enabled:
-                raise ValueError("Cannot resume across token-only and force-context objectives; start a new run")
-            if self.force_context_enabled:
-                for name in ("difference_weight", "region_weight"):
-                    if saved_force.get(name, 1.0) != self.force_context_config.get(name, 1.0):
-                        raise ValueError(f"Cannot change force_context.{name} on resume; start a new run")
-                for name, saved_value in (("difference_scale", self.force_difference_scale),
-                                          ("region_scale", self.force_region_scale)):
-                    requested = self.force_context_config.get(name)
-                    if requested is not None and requested != saved_value:
-                        raise ValueError(f"Cannot change force_context.{name} on resume; start a new run")
-            saved_phases = restored["cfg"].get("distillation", {}).get("token_region_phases")
-            saved_phases = None if saved_phases is None else tuple(sorted(saved_phases))
-            self.selection_metric_changed = saved_phases != self.token_region_phases
-            if self.selection_metric_changed:
-                # Retain learned weights and optimizer momentum, but establish
-                # a new baseline for the newly selected observations.
-                self.initial_train_mse = self.initial_val_mse = self.latest_val_loss = None
-                self.best_val_loss = self.early_stopping_best_loss = float("inf")
-                self.best_epoch = self.best_step = self.epochs_without_improvement = 0
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.best = float("inf")
-                    self.lr_scheduler.num_bad_epochs = self.lr_scheduler.cooldown_counter = 0
-                log.info("Token/region supervision phases changed: %s -> %s; "
-                         "recompute validation baseline and reset best/plateau counters",
-                         saved_phases, self.token_region_phases)
             if self.ema_model is not None and "ema_model" not in restored["state_dicts"]:
                 self.ema_model.load_state_dict(self.model.state_dict())
                 log.info("Checkpoint has no student EMA: initialize from restored RenderNet; "
@@ -533,18 +411,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 log.info("Checkpoint has no LR scheduler: retain optimizer LR, use saved best "
                          "validation as baseline, and start plateau counting at zero")
             if "training_stage" not in restored.get("pickles", {}):
-                if self.render_stages_enabled and self.epoch < self.condition_warmup_epochs:
-                    self.training_stage = "condition_warmup"
-                elif (self.render_stages_enabled and self.rgb_warmup_epochs > 0
-                      and self.epoch < self.condition_warmup_epochs + self.rgb_warmup_epochs):
-                    self.training_stage = "rgb"
-                else:
-                    self.training_stage = "joint" if self.joint_after_rgb else "rgb"
+                self.training_stage = (
+                    "intensity" if self.render_stages_enabled and self.epoch < self.intensity_epochs
+                    else "rgb"
+                )
                 self.stage_transition_reason = "legacy_checkpoint_epoch_inference"
             if hasattr(self.model, "set_training_stage"):
                 self.model.set_training_stage(self.training_stage)
             if getattr(self, "ema", None) is not None:
-                # Keep frozen teacher-initialized encoders identical in the
+                # A resumed checkpoint may have been written before the stage
+                # transition fix.  Make the frozen gate snapshot identical in
                 # online and EMA models before validation or another update.
                 self.ema.sync_frozen_parameters(self.model)
             self.resume_from = str(resume_path)
@@ -554,28 +430,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             log.info("Resuming RenderNet from %s: epoch=%d step=%d best_val_mse=%.8f",
                      resume_path, self.epoch, self.global_step, self.best_val_loss)
         self.num_epochs = int(cfg.training.num_epochs)
+        self.intensity_warmup_epochs = int(cfg.training.get("intensity_warmup_epochs", 2))
         self.max_steps = cfg.training.max_steps
         self.max_val_batches = cfg.training.max_val_batches
         self.early_stopping_enabled = bool(cfg.training.early_stopping.enabled)
         self.patience = int(cfg.training.early_stopping.patience)
         self.min_delta = float(cfg.training.early_stopping.min_delta)
-        if self.num_epochs < 1 or any(
+        if self.num_epochs < 1 or self.intensity_warmup_epochs < 0 or any(
                 value is not None and int(value) < 1
                 for value in (self.max_steps, self.max_val_batches)):
-            raise ValueError("num_epochs must be positive; "
+            raise ValueError("num_epochs must be positive; intensity_warmup_epochs nonnegative; "
                              "max_steps/max_val_batches must be positive or null")
-        if self.render_stages_enabled and (
-                self.condition_warmup_epochs + self.rgb_warmup_epochs > self.num_epochs):
-            raise ValueError("training render warmup stages cannot exceed training.num_epochs")
-        if (self.strict_two_stage
-                and self.condition_warmup_epochs + max(1, self.rgb_warmup_epochs) > self.num_epochs):
-            raise ValueError("Strict two-stage training must reserve at least one render epoch")
-        if (self.distributed_context.enabled and self.render_stages_enabled
-                and self.condition_warmup_epochs > 0
-                and not bool(cfg.training.get("distributed", {}).get("find_unused_parameters", False))):
-            raise ValueError(
-                "Condition-only warmup with DDP requires training.distributed.find_unused_parameters=true"
-            )
+        if self.render_stages_enabled and self.intensity_epochs > self.num_epochs:
+            raise ValueError("training.render_stages.intensity_epochs cannot exceed training.num_epochs")
         if not resume_path:
             if hasattr(self.model, "set_training_stage"):
                 self.model.set_training_stage(self.training_stage)
@@ -584,9 +451,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if self.patience < 1 or not math.isfinite(self.min_delta) or self.min_delta < 0:
             raise ValueError("early_stopping.patience must be positive; min_delta must be finite and nonnegative")
         log.info(f"Teacher: {checkpoint} ({self.teacher_state_key}), cross_attn_query=image")
-        log.info("Trainable parameters: teacher=0, RenderNet=%s; RenderNet total=%s",
-                 f"{sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}",
-                 f"{sum(p.numel() for p in self.model.parameters()):,}")
+        log.info(f"Trainable parameters: teacher=0, RenderNet={sum(p.numel() for p in self.model.parameters()):,}")
         log.info("Student validation/inference weights=%s; EMA updates=%d",
                  self.evaluation_state_key, self.ema.optimization_step if self.ema is not None else 0)
         if self.lr_scheduler is not None:
@@ -628,16 +493,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                          "batched rollout on model device; student predicts region at inference; "
                          f"validation metric={self.metric_name}")
         log.info("Distillation objective=%s; token auxiliary weight=%g; demo weight=%g; "
-                 "teacher image encoder and action head stay frozen, student input gradients remain enabled",
+                 "DINO and DiT stay frozen, student input gradients remain enabled",
                  self.objective, self.distillation_config.get("token_loss_weight", 0.0),
                  self.distillation_config.get("demo_loss_weight", 0.0))
+        if self.condition_prediction_enabled:
+            condition = self.model.condition_network
+            log.info("Shared region/alpha network: parameters=%d, embed=%d, self-attn=%d, cross-attn=%d; "
+                     "pretrain without RGB/DINO, freeze best snapshot before RGB distillation",
+                     sum(p.numel() for p in condition.parameters()), condition.backbone.embed_dim,
+                     len(condition.backbone.image_self_attention), len(condition.backbone.cross_attention))
+        if self.response_loss_weight > 0:
+            log.info("Student loss = global token MSE + %g * teacher-response-weighted token MSE; "
+                     "raw response noise floor=%g; normalize by effective weight sum",
+                     self.response_loss_weight, self.response_noise_floor)
         log.info(f"Device={self.device}; AMP={self.amp_enabled} {self.amp_dtype}; "
               f"GPU={torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else 'CPU'}")
         log.info(f"Max epochs={self.num_epochs}; max steps={self.max_steps}; "
-                 f"condition warmup={self.render_stages_enabled} "
-                 f"(condition_epochs={self.condition_warmup_epochs}, "
-                 f"rgb_epochs={self.rgb_warmup_epochs}, joint_after_rgb={self.joint_after_rgb}, "
-                 f"current={self.training_stage}); "
+                 f"render stages={self.render_stages_enabled} "
+                 f"(intensity={self.intensity_epochs}, current={self.training_stage}); "
               f"validation={'all batches' if self.max_val_batches is None else self.max_val_batches}; "
               f"early stopping={self.early_stopping_enabled}, patience={self.patience} epochs, "
               f"min_delta={self.min_delta}")
@@ -657,57 +530,38 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return bool(self.distillation_config.get("use_teacher_ffn", False))
 
     @property
-    def force_context_config(self):
-        return self.distillation_config.get("force_context", {})
-
-    @property
-    def force_context_enabled(self):
-        return bool(self.force_context_config.get("enabled", False))
-
-    @property
-    def token_region_phases(self):
-        phases = self.distillation_config.get("token_region_phases")
-        return None if phases is None else tuple(sorted(set(int(phase) for phase in phases)))
-
-    @property
-    def skip_unselected_observations(self):
-        return bool(self.distillation_config.get("skip_unselected_observations", False))
-
-    @property
-    def strict_two_stage(self):
-        return (getattr(self, "render_stages_enabled", False)
-                and not getattr(self, "joint_after_rgb", True))
-
-    @property
-    def condition_selection(self):
-        return self.strict_two_stage and getattr(self, "training_stage", "joint") == "condition_warmup"
-
-    @property
     def metric_name(self):
-        if self.force_context_enabled:
-            return "force context loss"
-        if self.condition_selection:
-            return "condition loss (CE + alpha + region)"
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return "zero-wrench baseline token MSE"
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return "region/alpha loss"
+        if self.response_loss_weight > 0:
+            return "global + response-weighted token MSE"
         return "denoiser MSE" if self.objective == "denoiser_mse" else "context token MSE"
 
     @property
-    def metric_scope(self):
-        phases = self.token_region_phases
-        return "all" if phases is None else "phases_" + "_".join(map(str, phases))
+    def condition_prediction_enabled(self):
+        return bool(getattr(getattr(self, "model", None), "condition_prediction_enabled", False))
 
-    _REGION_TOKEN_METRICS = frozenset({
-        "token_mse", "mask_mse", "context_patch_mse", "intensity_smoothness", "intensity_loss",
-    })
+    @property
+    def context_adapter_enabled(self):
+        return getattr(getattr(self, "model", None), "context_adapter", None) is not None
 
-    def _component_weight(self, key, size):
-        if key in self._REGION_TOKEN_METRICS:
-            return getattr(self, "loss_metrics", {}).get("token_region_observation_count", size)
-        return size
+    @property
+    def response_loss_weight(self):
+        return float(self.distillation_config.get("response_loss_weight", 0.0))
 
-    def _selection_weight(self, size):
-        if self.condition_selection or (self.model.training and getattr(self, "training_stage", "joint") == "condition_warmup"):
-            return size
-        return self._component_weight("token_mse", size)
+    @property
+    def response_noise_floor(self):
+        return float(self.distillation_config.get("response_noise_floor", 1e-6))
+
+    @property
+    def logging_objective(self):
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return "adapter_warmup"
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return "condition_warmup"
+        return self.objective
 
     @property
     def evaluation_state_key(self):
@@ -726,44 +580,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     def _validate_distillation_config(self):
         if self.objective not in {"token_mse", "denoiser_mse"}:
             raise ValueError("distillation.objective must be token_mse or denoiser_mse")
-        phases = self.distillation_config.get("token_region_phases")
-        if phases is not None:
-            if (not isinstance(phases, (list, tuple)) and not OmegaConf.is_list(phases)
-                    or not phases or any(isinstance(phase, bool) or not isinstance(phase, int)
-                                         or phase not in (0, 1, 2) for phase in phases)):
-                raise ValueError("distillation.token_region_phases must be null or a nonempty list of 0, 1, 2")
-            if self.objective != "token_mse":
-                raise ValueError("distillation.token_region_phases currently requires objective=token_mse")
-        if self.skip_unselected_observations and (
-                self.objective != "token_mse" or phases is None
-                or not self.cfg.get("render_net", {}).get("phase_prediction", {}).get("enabled", False)):
-            raise ValueError("skip_unselected_observations requires token_mse, "
-                             "token_region_phases and phase prediction")
-        for name in ("token_loss_weight", "demo_loss_weight", "phase_ce_weight", "alpha_loss_weight"):
+        if (self.cfg.get("render_net", {}).get("context_adapter", {}).get("enabled", False)
+                and self.use_teacher_ffn):
+            raise ValueError("Student context adaptation requires distillation.use_teacher_ffn=false")
+        for name in ("token_loss_weight", "demo_loss_weight", "response_loss_weight",
+                     "response_noise_floor", "alpha_loss_weight"):
             value = float(self.distillation_config.get(name, 0.0))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"distillation.{name} must be finite and nonnegative")
-        if self.force_context_enabled:
-            render = self.cfg.get("render_net", {})
-            if (self.objective != "token_mse" or self.token_region_phases is not None
-                    or self.skip_unselected_observations or self.use_teacher_ffn
-                    or not render.get("cross_camera_attn_layers", 0)
-                    or render.get("high_attention_render", {}).get("enabled", False)
-                    or render.get("phase_prediction", {}).get("enabled", False)):
-                raise ValueError("force_context requires all-observation cross-camera RGB token distillation without condition heads")
-            for name in ("difference_weight", "region_weight"):
-                value = float(self.force_context_config.get(name, 1.0))
-                if not math.isfinite(value) or value < 0:
-                    raise ValueError(f"force_context.{name} must be finite and nonnegative")
-            for name in ("difference_scale", "region_scale"):
-                value = self.force_context_config.get(name)
-                if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
-                    raise ValueError(f"force_context.{name} must be positive and finite or null")
-            cache = self.cfg.get("teacher_cache", {})
-            if cache.get("enabled", False) and (
-                    cache.get("dtype", "float32") != "float32"
-                    or cache.get("precision", "model") != "float32"):
-                raise ValueError("force_context teacher pairs require float32 cache dtype and precision")
+        if self.response_loss_weight > 0:
+            attention = self.cfg.render_net.get("high_attention_render", {})
+            if (self.objective != "token_mse" or not attention.get("enabled", False)
+                    or normalize_region_source(attention.get("source", "noise_attention")) != "context"):
+                raise ValueError("Response-weighted token MSE requires objective=token_mse and context responses")
 
     @contextlib.contextmanager
     def _validation_probes(self):
@@ -846,19 +675,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if not self.distributed_context.enabled:
             return
         config = self.cfg.training.get("distributed", {})
-        # Register DDP reducer hooks for the joint graph before the condition
-        # warmup temporarily freezes RGB-only parameters. They are re-enabled
-        # after warmup and need reducer hooks already installed.
-        if hasattr(self.model, "set_training_stage"):
-            self.model.set_training_stage("joint")
         self._training_model = DistributedDataParallel(
             self.model,
             device_ids=[self.distributed_context.local_rank] if self.device.type == "cuda" else None,
             broadcast_buffers=False,
             find_unused_parameters=bool(config.get("find_unused_parameters", False)),
         )
-        if hasattr(self.model, "set_training_stage"):
-            self.model.set_training_stage(self.training_stage)
 
     def _autocast(self):
         if not self.amp_enabled:
@@ -875,26 +697,17 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         options = {"backend": str(config.get("backend", "inductor")),
                    "mode": str(config.get("mode", "default")),
                    "fullgraph": True, "dynamic": False}
-        render_dynamic = False
         if config.get("render_backbone", True):
             if not isinstance(self.model, RenderNet):
                 raise ValueError("Compiling requires the active RenderNet backbone")
-            # The independent RGB path receives only selected observations, so
-            # its batch dimension varies. The shared path encodes the full batch
-            # and already compiles its selected-observation decoder dynamically.
-            render_dynamic = (self.skip_unselected_observations
-                              and not self.model.shared_condition_backbone)
-            self.model.compile_backbone(**{**options, "dynamic": render_dynamic})
+            self.model.compile_backbone(**options)
         if config.get("student_dino", True):
-            image_options = {**options, "dynamic": self.skip_unselected_observations}
             self._student_image_encoder = torch.compile(
-                self.teacher_policy.obs_encoder.encode_image_context, **image_options,
+                self.teacher_policy.obs_encoder.encode_image_context, **options,
             )
         log.info("torch.compile enabled for training: render_backbone=%s, student_dino=%s, "
-                 "mode=%s, render_dynamic=%s; first training batch includes compilation; "
-                 "validation uses eager execution",
-                 config.get("render_backbone", True), config.get("student_dino", True),
-                 options["mode"], render_dynamic)
+                 "mode=%s; first training batch includes compilation; validation uses eager execution",
+                 config.get("render_backbone", True), config.get("student_dino", True), options["mode"])
 
     def _progress_enabled(self):
         config = getattr(self, "cfg", {}).get("logging", {})
@@ -993,53 +806,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return torch.stack(values).mean() if values else torch.zeros(())
 
     def _joint_training_active(self):
-        return (not self.model.training) or getattr(self, "training_stage", "joint") == "joint"
-
-    def _token_region_observation_mask(self, obs, tokens):
-        steps = getattr(self.teacher_policy, "n_obs_steps", None)
-        if steps is None:
-            # Legacy render-only teacher adapters expose temporal observations
-            # but do not carry the full policy's window configuration.
-            steps = next(iter(obs.values())).shape[1]
-        steps = int(steps)
-        shape = (tokens.shape[0], steps)
-        if self.token_region_phases is None:
-            return torch.ones(shape, dtype=torch.bool, device=tokens.device)
-        if "contact_phase" not in obs:
-            raise KeyError("token_region_phases requires dataset contact_phase labels")
-        labels = obs["contact_phase"]
-        if labels.ndim != 2 or labels.shape[0] != shape[0] or labels.shape[1] < steps:
-            raise ValueError("contact_phase labels must match the [B, To] observations")
-        labels = labels[:, :steps].to(tokens.device)
-        selected = torch.zeros(shape, dtype=torch.bool, device=tokens.device)
-        for phase in self.token_region_phases:
-            selected |= labels == phase
-        return selected
+        return (not self.model.training) or getattr(self, "training_stage", "joint") in {"rgb", "joint"}
 
     @staticmethod
-    def _selected_observation_mean(values, selected):
-        values = values[selected]
-        # Sum over an empty selection is a graph-connected zero, unlike an
-        # empty mean. Free-only batches can still train the phase/alpha head.
-        return values.sum() / max(values.numel(), 1)
-
-    @classmethod
-    def _selected_observation_mse(cls, prediction, target, selected):
-        difference = prediction.float() - target.float()
-        return cls._selected_observation_mean(difference.square(), selected)
-
-    @classmethod
-    def _selected_region_smoothness(cls, masks, selected):
-        values = []
-        for mask in masks.values():
-            values.append(cls._selected_observation_mean(
-                mask[..., 1:, :].sub(mask[..., :-1, :]).abs(), selected))
-            values.append(cls._selected_observation_mean(
-                mask[..., :, 1:].sub(mask[..., :, :-1]).abs(), selected))
-        return torch.stack(values).mean()
-
-    @staticmethod
-    def _contact_token_metrics(student_tokens, teacher_tokens, contact_mask, measured_observations=None):
+    def _contact_token_metrics(student_tokens, teacher_tokens, contact_mask):
         """Return contact ratio and token MSE split without changing gradients."""
         if contact_mask is None:
             contact_mask = torch.ones(
@@ -1059,15 +829,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             -1, -1, tokens_per_step,
         ).reshape(student_tokens.shape[0], -1)
         per_token = (student_tokens.float() - teacher_tokens.float()).square().mean(dim=-1)
-        token_measured = torch.ones_like(token_open)
-        if measured_observations is not None:
-            if measured_observations.shape != contact_mask.shape:
-                raise ValueError("measured observation mask must match contact mask")
-            token_measured = measured_observations.to(torch.bool).unsqueeze(-1).expand(
-                -1, -1, tokens_per_step,
-            ).reshape_as(token_open)
-        open_values = per_token[token_open & token_measured]
-        closed_values = per_token[~token_open & token_measured]
+        open_values = per_token[token_open]
+        closed_values = per_token[~token_open]
         zero = per_token.new_zeros(())
         open_mse = open_values.mean() if open_values.numel() else zero
         closed_mse = closed_values.mean() if closed_values.numel() else zero
@@ -1079,54 +842,27 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "closed_token_count": float(closed_values.numel()),
         }
 
-    def _remember_best_condition(self):
-        """Embed the chosen evaluation snapshot so a resumed run is self-contained."""
-        if not self.condition_selection:
-            return
-        selected = self.ema_model if getattr(self, "ema_model", None) is not None else self.model
-        self.condition_best_state = {key: value.detach().cpu().clone()
-                                     for key, value in selected.state_dict().items()}
-        self.condition_best_metric = self.best_val_loss
-        self.condition_best_epoch = self.epoch
-
-    def _condition_validation_loss(self, metrics):
-        return (float(self.distillation_config.get("phase_ce_weight", 1.0)) * metrics["phase_ce"]
-                + float(self.distillation_config.get("alpha_loss_weight", 1.0)) * metrics["alpha_mse"]
-                + metrics["intensity_loss"])
-
-    def _reset_stage_optimization(self):
-        # The renderer has a different objective and new trainable parameters.
-        # Do not carry condition plateaus, LR reductions or Adam moments over.
-        self.optimizer.state.clear()
-        for group in self.optimizer.param_groups:
-            group["lr"] = float(self.cfg.optimizer.lr)
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.best = float("inf")
-            self.lr_scheduler.num_bad_epochs = self.lr_scheduler.cooldown_counter = 0
-            self.lr_scheduler.last_epoch = 0
-            self.lr_scheduler._last_lr = [group["lr"] for group in self.optimizer.param_groups]
-        self.best_val_loss = self.early_stopping_best_loss = float("inf")
-        self.best_epoch = self.best_step = self.epochs_without_improvement = 0
-        self.latest_val_loss = None
-        if getattr(self, "ema", None) is not None:
-            self.ema.optimization_step = 0
-            self.ema.decay = 0.0
-
     def _maybe_transition_stage(self, completed_epochs=None):
-        """Advance strict condition -> RGB, or the legacy condition -> RGB -> joint."""
-        if not getattr(self, "render_stages_enabled", False):
+        """Apply the configured boundary before the next optimizer epoch."""
+        if self.training_stage == "adapter":
+            desired = self.training_stage
+            if self.stage_epoch >= self.adapter_epochs:
+                desired = ("intensity" if self.render_stages_enabled and self.intensity_epochs > 0
+                           else "rgb" if self.render_stages_enabled else "joint")
+        elif not getattr(self, "render_stages_enabled", False):
             desired = "joint"
         else:
             completed = self.epoch if completed_epochs is None else int(completed_epochs)
-            condition_epochs = getattr(self, "condition_warmup_epochs", 0)
-            rgb_epochs = getattr(self, "rgb_warmup_epochs", 0)
-            if (self.training_stage == "condition_warmup"
-                    and (completed >= condition_epochs or getattr(self, "condition_transition_pending", False))):
-                desired = "rgb" if self.strict_two_stage or rgb_epochs > 0 else "joint"
-            elif self.training_stage == "rgb" and completed >= condition_epochs + rgb_epochs:
-                desired = "joint" if self.joint_after_rgb else "rgb"
-            else:
-                desired = self.training_stage
+            if self.context_adapter_enabled:
+                completed = self.stage_epoch
+            # A saved RGB stage is authoritative on resume.  An intensity
+            # checkpoint saved exactly at the boundary transitions before the
+            # next optimizer epoch.
+            desired = (
+                "rgb" if self.training_stage == "intensity"
+                and completed >= getattr(self, "intensity_epochs", 0)
+                else self.training_stage
+            )
         if desired == self.training_stage:
             if hasattr(self.model, "set_training_stage"):
                 self.model.set_training_stage(self.training_stage)
@@ -1134,29 +870,48 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 self.ema.sync_frozen_parameters(self.model)
             return False
         previous = self.training_stage
-        condition_plateau = getattr(self, "condition_transition_pending", False)
-        if self.strict_two_stage and previous == "condition_warmup":
-            state = getattr(self, "condition_best_state", None)
-            if state is not None:
-                # Validation selects EMA when enabled. Freeze that exact state,
-                # rather than replacing it with the last online condition net.
-                self.model.load_state_dict(state)
-                if getattr(self, "ema_model", None) is not None:
-                    self.ema_model.load_state_dict(state)
-            self._reset_stage_optimization()
+        if previous == "adapter" or (
+                self.condition_prediction_enabled and previous == "intensity" and desired == "rgb"):
+            if self.distributed_context.enabled:
+                dist.barrier()
+            checkpoint = self.get_checkpoint_path("best_adapter" if previous == "adapter" else "best_condition")
+            if checkpoint.is_file():
+                payload = torch.load(checkpoint, map_location="cpu", pickle_module=dill,
+                                     weights_only=False)
+                state_key = "ema_model" if self.ema_model is not None else "model"
+                self.model.load_state_dict(payload["state_dicts"][state_key], strict=True)
+                log.info("Freeze best %s snapshot: %s (%s)", previous, checkpoint, state_key)
+            # Each stage optimizes a different objective and disjoint parameters.
+            self.best_val_loss = self.early_stopping_best_loss = float("inf")
+            self.latest_val_loss = None
+            self.best_epoch = self.best_step = self.epochs_without_improvement = 0
+            self.optimizer.state.clear()
+            for group in self.optimizer.param_groups:
+                group["lr"] = float(self.cfg.optimizer.lr)
+            scheduler = self.cfg.training.get("lr_scheduler", {})
+            if self.lr_scheduler is not None:
+                self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer, mode="min", factor=float(scheduler.get("factor", .5)),
+                    patience=int(scheduler.get("patience", 2)),
+                    threshold=float(scheduler.get("threshold", 1e-4)), threshold_mode="abs",
+                    min_lr=float(scheduler.get("min_lr", 1e-5)),
+                )
+            if self.ema is not None:
+                self.ema.sync_parameters(self.model)
+                self.ema.optimization_step = 0
+                self.ema.decay = 0.0
         self.training_stage = desired
         self.stage_step = 0
         self.stage_epoch = 0
-        reason = "condition_plateau" if condition_plateau else "epoch_boundary"
-        self.stage_transition_reason = f"{reason}:{previous}->{desired}"
-        self.condition_transition_pending = False
-        initialized_rgb = False
-        if (previous == "condition_warmup" and desired in {"rgb", "joint"}
+        self.stage_transition_reason = f"epoch_boundary:{previous}->{desired}"
+        reset_rgb = False
+        if (not self.condition_prediction_enabled and previous == "intensity" and desired == "rgb"
                 and hasattr(self.model, "initialize_rgb_from_gate")):
-            # Warm-start a separate RGB branch when the architecture provides
-            # one; shared-backbone RenderNet correctly treats this as a no-op.
+            # Transfer the completed gate representation once.  The gate
+            # branch remains independent and frozen after this snapshot;
+            # RGB then owns and updates its full encoder/decoder path.
             self.model.initialize_rgb_from_gate()
-            initialized_rgb = True
+            reset_rgb = True
         if hasattr(self.model, "set_training_stage"):
             self.model.set_training_stage(desired)
             gate_count = sum(p.numel() for p in self.model.gate_parameters())
@@ -1164,80 +919,111 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         else:
             gate_count = rgb_count = 0
         if getattr(self, "ema", None) is not None:
-            # A copied RGB initialization must also start from the same
-            # state in EMA; conditions remain trainable after this boundary.
-            if initialized_rgb:
+            # The newly frozen gate must use one exact snapshot in both
+            # online and EMA models.  If RGB was copied from the gate, also
+            # reset its EMA branch to that same boundary state.
+            if reset_rgb:
                 self.ema.sync_parameters(self.model)
             else:
                 self.ema.sync_frozen_parameters(self.model)
+        if self.distributed_context.enabled:
+            # DDP registers only parameters trainable at construction. Rebuild
+            # when stage ownership changes, including adapter -> condition/RGB.
+            self._training_model = None
+            self._setup_distributed_model()
         log.info("RenderNet training stage transition: %s -> %s at completed_epoch=%d; "
-                 "condition_parameters=%d, rgb_parameters=%d",
+                 "gate_parameters=%d, rgb_parameters=%d",
                  previous, desired, self.epoch, gate_count, rgb_count)
         return True
 
-    def _force_context_loss(self, obs, cached_targets=None):
-        if self.force_difference_scale is None or self.force_region_scale is None:
-            raise RuntimeError("Prepare training teacher-pair statistics before force-context training")
-        targets = teacher_context_pair(self.teacher_policy, obs) if cached_targets is None else cached_targets
-        teacher_tokens = targets["tokens"].to(self.device, non_blocking=True).detach()
-        teacher_zero = targets["zero_tokens"].to(self.device, non_blocking=True).detach()
-        zero_obs = raw_zero_wrench_observations(self.teacher_policy, obs)
-        # One DDP forward includes both branches, so gradients from the
-        # difference share one reducer graph. Zero is applied before the
-        # teacher's normalizer and the student's frozen force encoder.
-        paired_obs = {key: torch.cat((obs[key], value), dim=0) for key, value in zero_obs.items()}
-        batch_size = teacher_tokens.shape[0]
+    def _adapter_loss(self, obs, cached_targets=None):
+        """Calibrate original visual tokens; never execute the RGB/condition nets."""
+        if cached_targets is not None and "zero_tokens" not in cached_targets:
+            raise ValueError("Adapter calibration requires paired teacher zero_tokens; rebuild this cache")
+        with torch.no_grad():
+            target = (cached_targets["zero_tokens"].to(self.device, non_blocking=True)
+                      if cached_targets is not None else teacher_zero_context_target(self.teacher_policy, obs))
+            prepare = getattr(self.teacher_policy, "prepare_context_inputs_with_future_contact",
+                              self.teacher_policy.prepare_context_inputs)
+            images, _, _, _ = prepare(obs)
         training = self.model.training and torch.is_grad_enabled()
-        renderer = getattr(self, "_training_model", None) if training else getattr(self, "ema_model", None)
+        renderer = getattr(self, "_training_model", None) if training else None
         if renderer is None:
-            renderer = self.model
-        compiled_encoder = getattr(self, "_student_image_encoder", None) if training else None
+            renderer = self.model if training else (getattr(self, "ema_model", None) or self.model)
         with self._autocast():
-            tokens, paired_rgb = student_context_tokens(
-                self.teacher_policy, renderer, paired_obs,
-                image_context_encoder=compiled_encoder, return_rendered=True,
+            tokens = self.teacher_policy.obs_encoder.encode_image_context(
+                images, context_adapter=lambda context: renderer(image_context=context),
             )
-        student_tokens, student_zero = tokens.split(batch_size)
-        encoder = self.teacher_policy.obs_encoder
-        steps = self.teacher_policy.n_obs_steps
-        images = {key: obs[key][:, :steps] for key in encoder.image_keys}
-        rendered = {key: value[:batch_size] for key, value in paired_rgb.items()}
-        components = compute_force_context_losses(
-            student_tokens, student_zero, teacher_tokens, teacher_zero,
-            rendered, images, encoder, steps,
-            difference_scale=self.force_difference_scale, region_scale=self.force_region_scale,
-        )
-        loss = (components["token_mse"]
-                + float(self.force_context_config.get("difference_weight", 1.0)) * components["force_delta_loss"]
-                + float(self.force_context_config.get("region_weight", 1.0)) * components["context_region_loss"])
-        self.loss_metrics = {name: float(value.detach()) for name, value in components.items()}
-        self.loss_metrics.update(
-            loss=float(loss.detach()), token_mse_measured=True,
-            token_region_observation_count=batch_size * steps,
-            training_stage=self.training_stage, joint_training=True,
-            mask_supervised=False, mask_measured=False,
-        )
-        if self.shape_info is None:
-            self.shape_info = {
-                "teacher_token_shape": list(teacher_tokens.shape),
-                "student_token_shape": list(student_tokens.shape),
-                "camera_keys": list(encoder.image_keys), "camera_count": len(encoder.image_keys),
-                "observation_steps": steps,
-                "patch_tokens_per_camera": dict(encoder.context_patch_counts),
-                "patch_tokens_per_observation": teacher_tokens.shape[1] // steps,
-                "wrench_key": self.teacher_policy.wrench_key,
-                "wrench_shape": list(obs[self.teacher_policy.wrench_key].shape),
-            }
-            log.info("Token layout: " + json.dumps(self.shape_info))
+            loss = F.mse_loss(tokens.float(), target.float())
+        self.loss_metrics = {
+            "adapter_mse": float(loss.detach()), "token_mse": float(loss.detach()),
+            "loss": float(loss.detach()), "training_stage": "adapter",
+        }
+        return loss
+
+    def _condition_loss(self, obs, cached_targets=None):
+        """Pretrain shared region/alpha features without executing RGB or DINO."""
+        if "contact_alpha" not in obs:
+            raise ValueError("Region/alpha pretraining requires offline dataset contact_alpha labels")
+        teacher = self.teacher_policy
+        with self._autocast():
+            with torch.no_grad():
+                if cached_targets is not None:
+                    patches = {key: value.to(self.device, non_blocking=True)
+                               for key, value in cached_targets["patch_attention"].items()}
+                else:
+                    _, patches = self._region_targets(obs, return_patch_attention=True)
+                targets = self._region_patch_targets(patches)
+                prepare = getattr(teacher, "prepare_context_inputs_with_future_contact",
+                                  teacher.prepare_context_inputs)
+                images, wrench, _, _ = prepare(obs)
+            training = self.model.training and torch.is_grad_enabled()
+            renderer = getattr(self, "_training_model", None) if training else None
+            if renderer is None:
+                renderer = self.model if training else (getattr(self, "ema_model", None) or self.model)
+            _, masks, prediction = renderer(images, wrench, condition_only=True, return_condition=True)
+            predicted = self._patch_pool(masks)
+            numerator = prediction["contact_alpha"].new_zeros(())
+            denominator = numerator.clone()
+            for key in predicted:
+                # Alpha controls activation. Region learns spatial shape only
+                # where the teacher provides a reliable response distribution.
+                valid = (patches[key].amax(dim=-1) > self.response_noise_floor).float()
+                errors = F.smooth_l1_loss(predicted[key].float(), targets[key].float(),
+                                          reduction="none").mean(dim=-1)
+                numerator = numerator + (valid * errors).sum()
+                denominator = denominator + valid.sum()
+            region_loss = numerator / denominator.clamp_min(1)
+            alpha_mse = F.mse_loss(prediction["contact_alpha"].float(),
+                                   obs["contact_alpha"][:, :teacher.n_obs_steps].float())
+            smoothness = self._intensity_smoothness(masks)
+            loss = (self.context_patch_loss_weight * region_loss
+                    + float(self.distillation_config.get("alpha_loss_weight", 1.0)) * alpha_mse
+                    + self.smoothness_loss_weight * smoothness)
+        self.loss_metrics = {
+            "token_mse": 0.0, "response_mse": 0.0,
+            "response_numerator": 0.0, "response_weight_sum": 0.0,
+            "mask_mse": 0.0, "context_patch_mse": float(region_loss.detach()),
+            "alpha_mse": float(alpha_mse.detach()), "condition_loss": float(loss.detach()),
+            "intensity_smoothness": float(smoothness.detach()),
+            "intensity_loss": float(loss.detach()), "loss": float(loss.detach()),
+            "training_stage": self.training_stage,
+        }
         return loss
 
     def _loss(self, obs, cached_targets=None, *, action=None):
-        if self.force_context_enabled:
-            return self._force_context_loss(obs, cached_targets)
-        training = self.model.training and torch.is_grad_enabled()
-        condition_warmup = (self.condition_selection or
-                            training and getattr(self, "training_stage", "joint") == "condition_warmup")
-        supervise_regions = self.attention_enabled and training
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return self._adapter_loss(obs, cached_targets)
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return self._condition_loss(obs, cached_targets)
+        # Region targets are used for the warm-up loss and retained as
+        # diagnostics during RGB training and validation.  Model selection
+        # still uses only the primary objective.
+        supervise_regions = (
+            self.attention_enabled and self.model.training and torch.is_grad_enabled()
+            and (not getattr(self, "render_stages_enabled", False)
+                 or getattr(self, "training_stage", "joint") == "intensity")
+        )
         measure_regions = bool(self.attention_enabled)
         with self._autocast():
             with torch.no_grad():
@@ -1260,21 +1046,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     teacher_tokens = self.teacher_policy._encode_context(
                         obs, apply_curriculum_mask=False,
                     ).detach()
-            observation_mask = self._token_region_observation_mask(obs, teacher_tokens)
-            observation_count = int(observation_mask.sum())
-            sparse_images = training and self.skip_unselected_observations
-            condition_only = condition_warmup or (sparse_images and observation_count == 0)
-            # Build indices outside the compiled DINO graph. Conditions always
-            # see all observations; RGB decoding/DINO need only supervised rows.
-            selected_indices = (observation_mask.flatten().nonzero(as_tuple=True)[0]
-                                if sparse_images and not condition_only else None)
-            token_region_gradient_scale = 1.0
-            if training and self.token_region_phases is not None and self.distributed_context.enabled:
-                # DDP averages rank gradients. Weight the local mean so ranks
-                # with few contact observations cannot outweigh other ranks.
-                global_count = self._sum([observation_count])[0]
-                token_region_gradient_scale = (observation_count * self.distributed_context.world_size
-                                               / max(global_count, 1))
             compiled_encoder = (getattr(self, "_student_image_encoder", None)
                                 if self.model.training and torch.is_grad_enabled() else None)
             renderer = (getattr(self, "_training_model", None)
@@ -1285,43 +1056,35 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     renderer = getattr(self, "ema_model", None)
                     if renderer is None:
                         renderer = self.model
-            phase_enabled = bool(getattr(self.model, "phase_prediction_enabled", False))
             student_result = student_context_tokens(
                 self.teacher_policy, renderer, obs,
                 return_aux=True, return_contact=True, image_context_encoder=compiled_encoder,
                 use_teacher_ffn=self.use_teacher_ffn,
-                return_phase=phase_enabled,
-                condition_only=condition_only,
-                observation_mask=observation_mask if sparse_images else None,
-                selected_observation_indices=selected_indices,
+                return_condition=self.condition_prediction_enabled,
             )
-            phase_predictions = None
-            if phase_enabled:
-                student_tokens, masks, contact_mask, phase_predictions = student_result
+            predicted_condition = None
+            if self.condition_prediction_enabled:
+                student_tokens, masks, contact_mask, predicted_condition = student_result
             else:
                 student_tokens, masks, contact_mask = student_result
-            if condition_only:
-                token_mse = teacher_tokens.new_zeros(())
-            else:
-                if student_tokens.shape != teacher_tokens.shape:
-                    raise RuntimeError(
-                        f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}"
-                    )
-                steps = observation_mask.shape[1]
-                if student_tokens.shape[1] % steps:
-                    raise ValueError("Context token layout must divide evenly into observation steps")
-                token_mse = self._selected_observation_mse(
-                    student_tokens.reshape(student_tokens.shape[0], steps, -1, student_tokens.shape[-1]),
-                    teacher_tokens.reshape(teacher_tokens.shape[0], steps, -1, teacher_tokens.shape[-1]),
-                    observation_mask,
+            if student_tokens.shape != teacher_tokens.shape:
+                raise RuntimeError(f"Token shapes differ: teacher={teacher_tokens.shape}, student={student_tokens.shape}")
+            token_mse = F.mse_loss(student_tokens.float(), teacher_tokens.float())
+            response_mse = response_numerator = response_weight_sum = token_mse.new_zeros(())
+            if self.response_loss_weight > 0:
+                response = torch.cat([
+                    target_patches[key] for key in self.teacher_policy.obs_encoder.image_keys
+                ], dim=-1).flatten(1)
+                token_mse, response_mse, response_numerator, response_weight_sum = response_weighted_token_mse(
+                    student_tokens, teacher_tokens, response, noise_floor=self.response_noise_floor,
                 )
-            if phase_enabled and "contact_alpha" in obs:
-                contact_mask = obs["contact_alpha"][:, :self.teacher_policy.n_obs_steps] > 0
+            student_loss = token_mse + self.response_loss_weight * response_mse
+            alpha_mse = token_mse.new_zeros(())
+            if predicted_condition is not None and "contact_alpha" in obs:
+                alpha_mse = F.mse_loss(predicted_condition["contact_alpha"].float(),
+                                       obs["contact_alpha"][:, :self.teacher_policy.n_obs_steps].float())
             contact_metrics = self._contact_token_metrics(
-                teacher_tokens if condition_only else student_tokens,
-                teacher_tokens, contact_mask,
-                measured_observations=(torch.zeros_like(observation_mask) if condition_only
-                                       else observation_mask if sparse_images else None),
+                student_tokens, teacher_tokens, contact_mask,
             )
             mask_mse = token_mse.new_zeros(())
             patch_mse = token_mse.new_zeros(())
@@ -1330,10 +1093,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 region_context = contextlib.nullcontext() if supervise_regions else torch.no_grad()
                 with region_context:
                     mask_mse = torch.stack([
-                        self._selected_observation_mse(masks[key], target_masks[key], observation_mask)
+                        F.mse_loss(masks[key].float(), target_masks[key].float())
                         for key in masks
                     ]).mean()
-                    smoothness = self._selected_region_smoothness(masks, observation_mask)
+                    smoothness = self._intensity_smoothness(masks)
                     predicted_patches = self._patch_pool(masks)
                     target_patch_weights = self._region_patch_targets(target_patches)
                     patch_losses = []
@@ -1341,88 +1104,59 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         target = target_patch_weights[key].to(
                             predicted_patches[key].device, predicted_patches[key].dtype,
                         )
-                        patch_losses.append(self._selected_observation_mean(
-                            F.smooth_l1_loss(predicted_patches[key], target, reduction="none"),
-                            observation_mask,
-                        ))
+                        patch_losses.append(F.smooth_l1_loss(predicted_patches[key], target))
                     patch_mse = torch.stack(patch_losses).mean()
             denoiser_mse = demo_mse = token_mse.new_zeros(())
-            if self.objective == "denoiser_mse" and not condition_warmup:
+            if self.objective == "denoiser_mse" and not getattr(self, "render_stages_enabled", False):
                 denoiser_mse, demo_mse = self._denoiser_losses(
                     action, student_tokens, teacher_tokens.to(student_tokens.dtype),
                 )
-            region_loss = (
+                active_denoiser = (denoiser_mse if self._joint_training_active()
+                                   else denoiser_mse.detach() * 0)
+                loss = (active_denoiser
+                        + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
+                        + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse)
+            else:
+                loss = student_loss
+            intensity_loss = (
                 float(getattr(self, "context_patch_loss_weight", 1.0)) * patch_mse
                 + float(getattr(self, "intensity_loss_weight", 1.0)) * mask_mse * float(
                     self.attention_config.get("pixel_loss_weight", 0.0)
                 )
                 + float(getattr(self, "smoothness_loss_weight", 0.02)) * smoothness
             ) if measure_regions else token_mse.new_zeros(())
-            phase_ce = alpha_mse = alpha_mae = token_mse.new_zeros(())
-            phase_accuracy = token_mse.new_zeros(())
-            if phase_enabled:
-                if phase_predictions is None:
-                    raise RuntimeError("Phase-enabled RenderNet did not return condition predictions")
-                if "contact_phase" not in obs or "contact_alpha" not in obs:
-                    raise KeyError(
-                        "Phase prediction training requires offline contact_phase/contact_alpha targets"
-                    )
-                phase_logits = phase_predictions["phase_logits"].float()
-                alpha_prediction = phase_predictions["contact_alpha"].float()
-                phase_target = obs["contact_phase"][:, :phase_logits.shape[1]].long()
-                alpha_target = obs["contact_alpha"][:, :alpha_prediction.shape[1]].float()
-                if phase_target.shape != phase_logits.shape[:2] or alpha_target.shape != alpha_prediction.shape:
-                    raise ValueError("Phase and alpha labels must match [B, To] predictions")
-                phase_ce = F.cross_entropy(phase_logits.flatten(0, 1), phase_target.flatten())
-                alpha_mse = F.mse_loss(alpha_prediction, alpha_target)
-                alpha_mae = F.l1_loss(alpha_prediction, alpha_target)
-                phase_accuracy = (phase_logits.argmax(dim=-1) == phase_target).float().mean()
-            condition_loss = (
-                float(self.distillation_config.get("phase_ce_weight", 1.0)) * phase_ce
-                + float(self.distillation_config.get("alpha_loss_weight", 1.0)) * alpha_mse
-            )
-            if condition_warmup:
-                # Warmup trains the condition field; the renderer is bypassed.
-                loss = condition_loss + region_loss * token_region_gradient_scale
-            elif getattr(self, "training_stage", "joint") == "rgb":
-                # RGB warmup isolates the inverse-rendering path after the
-                # condition field has converged.  The stage setter freezes the
-                # condition modules, so auxiliary condition losses are omitted.
-                loss = token_mse * token_region_gradient_scale
-            elif self.objective == "denoiser_mse":
-                loss = (denoiser_mse
-                        + float(self.distillation_config.get("token_loss_weight", 0.0)) * token_mse
-                        + float(self.distillation_config.get("demo_loss_weight", 0.0)) * demo_mse
-                        + (condition_loss + region_loss if training else 0))
-            else:
-                # During joint optimization retain condition supervision so
-                # the shared feature trunk and all condition outputs adapt
-                # alongside the RGB residual network.
-                loss = token_mse * token_region_gradient_scale + (
-                    condition_loss + region_loss * token_region_gradient_scale if training else 0)
-            # A sparse RGB batch can contain no selected contact observations.
-            # In that case ``condition_only`` intentionally skips the renderer
-            # and ``token_mse`` is a detached scalar zero.  Keep the optimizer
-            # step valid by attaching a zero-valued anchor to the parameters
-            # that are trainable in the current stage.
-            if training and not loss.requires_grad:
-                trainable = [parameter for parameter in self.model.parameters()
-                             if parameter.requires_grad]
-                if trainable:
-                    loss = loss + sum(parameter.reshape(-1)[0] * 0 for parameter in trainable)
+            if not supervise_regions:
+                # Diagnostics must not create a second RGB-stage gradient path.
+                intensity_loss = intensity_loss.detach()
+                mask_mse = mask_mse.detach()
+                patch_mse = patch_mse.detach()
+                smoothness = smoothness.detach()
+            if supervise_regions:
+                loss = loss + intensity_loss
+            if getattr(self, "render_stages_enabled", False) and self.model.training and torch.is_grad_enabled():
+                if getattr(self, "training_stage", "joint") == "intensity":
+                    if not self.attention_enabled:
+                        raise RuntimeError(
+                            "RenderNet intensity stage requires high_attention_render.enabled=true "
+                            "so the teacher context-effect field can supervise the gate"
+                        )
+                    loss = intensity_loss
+                elif self.training_stage == "rgb":
+                    # RGB stage updates the complete RGB branch; the
+                    # independently trained gate path is frozen.
+                    loss = student_loss
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
-                                 "token_mse_measured": not condition_warmup and observation_count > 0,
-                                 "token_region_observation_count": observation_count,
+                                 "response_mse": float(response_mse.detach()),
+                                 "response_numerator": float(response_numerator.detach()),
+                                 "response_weight_sum": float(response_weight_sum.detach()),
+                                 "student_loss": float(student_loss.detach()),
+                                 "alpha_mse": float(alpha_mse.detach()),
                                  "denoiser_mse": float(denoiser_mse.detach()),
                                  "demo_mse": float(demo_mse.detach()),
                                  "mask_mse": float(mask_mse.detach()),
                                  "context_patch_mse": float(patch_mse.detach()),
                                  "intensity_smoothness": float(smoothness.detach()),
-                                 "intensity_loss": float(region_loss.detach()),
-                                 "phase_ce": float(phase_ce.detach()),
-                                 "alpha_mse": float(alpha_mse.detach()),
-                                 "alpha_mae": float(alpha_mae.detach()),
-                                 "phase_accuracy": float(phase_accuracy.detach()),
+                                 "intensity_loss": float(intensity_loss.detach()),
                                  "contact_open_ratio": float(contact_metrics["contact_open_ratio"].detach()),
                                  "open_token_mse": float(contact_metrics["open_token_mse"].detach()),
                                  "closed_token_mse": float(contact_metrics["closed_token_mse"].detach()),
@@ -1436,14 +1170,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
-                "student_token_shape": list(teacher_tokens.shape if condition_only else student_tokens.shape),
+                "student_token_shape": list(student_tokens.shape),
                 "camera_keys": list(self.teacher_policy.obs_encoder.image_keys),
                 "camera_count": len(self.teacher_policy.image_keys),
                 "observation_steps": self.teacher_policy.n_obs_steps,
-                "patch_tokens_per_camera": dict(getattr(
-                    self.teacher_policy.obs_encoder, "context_patch_counts",
-                    self.teacher_policy.obs_encoder.patch_counts,
-                )),
+                "patch_tokens_per_camera": dict(self.teacher_policy.obs_encoder.patch_counts),
                 "patch_tokens_per_observation": teacher_tokens.shape[1] // self.teacher_policy.n_obs_steps,
                 "wrench_key": self.teacher_policy.wrench_key,
                 "wrench_shape": list(obs[self.teacher_policy.wrench_key].shape),
@@ -1492,22 +1223,16 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
 
     def _token_mse(self, loss):
         # Fallback permits lightweight callers that replace _loss in loop tests.
-        metrics = getattr(self, "loss_metrics", {})
-        if not metrics.get("token_mse_measured", True):
-            return float(loss.detach())
-        return metrics.get("token_mse", float(loss.detach()))
+        return getattr(self, "loss_metrics", {}).get("token_mse", float(loss.detach()))
 
     def _selection_mse(self, loss):
-        if self.force_context_enabled:
-            return float(loss.detach())
-        metrics = getattr(self, "loss_metrics", {})
-        if self.condition_selection:
-            return self._condition_validation_loss(metrics) if "phase_ce" in metrics else float(loss.detach())
-        if (not metrics.get("token_mse_measured", True)
-                and self.model.training
-                and getattr(self, "training_stage", "joint") == "condition_warmup"):
-            return float(loss.detach())
-        return metrics.get(self.objective, float(loss.detach()))
+        if getattr(self, "training_stage", "joint") == "adapter":
+            return getattr(self, "loss_metrics", {}).get("adapter_mse", float(loss.detach()))
+        if self.condition_prediction_enabled and getattr(self, "training_stage", "joint") == "intensity":
+            return getattr(self, "loss_metrics", {}).get("condition_loss", float(loss.detach()))
+        if self.response_loss_weight > 0:
+            return getattr(self, "loss_metrics", {}).get("student_loss", float(loss.detach()))
+        return getattr(self, "loss_metrics", {}).get(self.objective, float(loss.detach()))
 
     def _obs(self, batch):
         return dict_apply(batch["obs"], lambda value: value.to(self.device, non_blocking=True))
@@ -1579,9 +1304,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "attention_seed": int(self.attention_config.get("teacher_seed", 42)),
             "cache_batch_size": int(config["batch_size"]),
         }
-        if self.force_context_enabled:
-            identity["target_contract"] = "visual_context_real_raw_zero_pair_v1"
-            identity["target_precision"] = "float32"
         # Storage precision is separate from the preprocessing/fusion contract.
         if token_dtype != "float32":
             identity["token_storage_dtype"] = token_dtype
@@ -1602,6 +1324,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         if self.attention_enabled and region_source == "context":
             identity["context_effect_baseline"] = self.attention_config.get("baseline", "raw_zero")
             identity["context_effect_precision"] = "float32"
+        if self.context_adapter_enabled:
+            identity["paired_zero_context"] = "raw_zero_v1"
         for name, source in (("train", dataset), ("validation", validation_dataset)):
             indices = np.ascontiguousarray(source.indices)
             identity[name] = {"samples": len(source), "indices_shape": list(indices.shape),
@@ -1665,18 +1389,19 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                    if config.get("precision", "model") == "float32" else self._autocast())
                             with amp:
                                 zero_tokens = None
-                                if self.force_context_enabled:
-                                    pair = teacher_context_pair(self.teacher_policy, obs)
-                                    tokens, zero_tokens, attention = pair["tokens"], pair["zero_tokens"], {}
+                                if self.context_adapter_enabled and self.attention_enabled and self.region_source == "context":
+                                    tokens, attention, zero_tokens = teacher_context_effect_targets(
+                                        self.teacher_policy, obs, return_zero=True,
+                                    )
                                 elif self.attention_enabled:
                                     tokens, attention = self._region_targets(obs, return_patch_attention=True)
                                 else:
                                     tokens = self.teacher_policy._encode_context(obs, apply_curriculum_mask=False).detach()
                                     attention = {}
-                            if self.force_context_enabled:
-                                cache.append(tokens, attention, zero_tokens=zero_tokens)
-                            else:
-                                cache.append(tokens, attention)
+                                if self.context_adapter_enabled and zero_tokens is None:
+                                    zero_tokens = teacher_zero_context_target(self.teacher_policy, obs)
+                            cache.append(tokens, attention, **({"zero_tokens": zero_tokens}
+                                                              if zero_tokens is not None else {}))
                             progress.update(len(tokens))
                             now = time.monotonic()
                             if (not self._progress_enabled()
@@ -1714,47 +1439,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         log.info("Complete teacher cache ready; training/validation will read cached targets")
         return tuple(prepared)
 
-    def _prepare_force_context_scales(self, train_dataset):
-        """Fix both scales from training targets; validation never fits them."""
-        if not self.force_context_enabled:
-            return
-        status = [None]
-        if self.is_main_process:
-            try:
-                difference = getattr(self, "force_difference_scale", None)
-                region = getattr(self, "force_region_scale", None)
-                statistics = getattr(self, "force_context_statistics", None)
-                if difference is None or region is None:
-                    if not isinstance(train_dataset, CachedTeacherDataset):
-                        raise ValueError("Automatic force-context scales require the completed training teacher cache")
-                    statistics = train_dataset.cache.force_difference_statistics()
-                    if difference is None:
-                        difference = max(statistics["mean_square"], 1e-8)
-                    if region is None:
-                        region = max(math.sqrt(statistics["mean_square"]), 1e-4)
-                statistics = {**(statistics or {}), "source": "train", "baseline": "raw_zero",
-                              "difference_scale": float(difference), "region_scale": float(region)}
-                path = pathlib.Path(self.output_dir, "force_context_statistics.json")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(statistics, indent=2, allow_nan=False) + "\n")
-                status[0] = {"ok": True, "statistics": statistics}
-            except Exception as exc:
-                if not self.distributed_context.enabled:
-                    raise
-                status[0] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        if self.distributed_context.enabled:
-            self._broadcast_status(status)
-        self.force_context_statistics = status[0]["statistics"]
-        self.force_difference_scale = self.force_context_statistics["difference_scale"]
-        self.force_region_scale = self.force_context_statistics["region_scale"]
-        with open_dict(self.cfg.distillation.force_context):
-            self.cfg.distillation.force_context.difference_scale = self.force_difference_scale
-            self.cfg.distillation.force_context.region_scale = self.force_region_scale
-        if self.is_main_process:
-            OmegaConf.save(self.cfg, pathlib.Path(self.output_dir, "config.yaml"), resolve=True)
-        log.info("Force-context scales fixed from training targets: difference=%.8g, region=%.8g",
-                 self.force_difference_scale, self.force_region_scale)
-
     def _loader(self, dataset, config, *, validation=False):
         kwargs = OmegaConf.to_container(config, resolve=True)
         context = self.distributed_context
@@ -1785,38 +1469,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             kwargs["multiprocessing_context"] = "fork"
         return DataLoader(dataset, **kwargs)
 
-    def _limit_debug_dataset(self, dataset, limit, *, name):
-        """Return a deterministic tiny view for smoke/ablation runs."""
-        if limit is None:
-            return dataset
-        limit = int(limit)
-        if limit < 1 or len(dataset) <= limit:
-            return dataset
-        labels = (dataset.get_phase_labels() if hasattr(dataset, "get_phase_labels")
-                  else np.zeros(len(dataset), dtype=np.int8))
-        phases = self.token_region_phases
-        if phases is not None:
-            candidates = np.flatnonzero(np.isin(labels, np.asarray(phases, dtype=np.int8)))
-        else:
-            candidates = np.arange(len(dataset), dtype=np.int64)
-        if len(candidates) == 0:
-            candidates = np.arange(len(dataset), dtype=np.int64)
-        positions = np.linspace(0, len(candidates) - 1,
-                                num=min(limit, len(candidates)), dtype=np.int64)
-        selected = np.unique(candidates[positions])
-        if len(selected) < limit:
-            remaining = np.setdiff1d(np.arange(len(dataset), dtype=np.int64), selected,
-                                     assume_unique=False)
-            selected = np.concatenate([selected, remaining[:limit - len(selected)]])
-        selected.sort()
-        subset = copy.copy(dataset)
-        subset.indices = np.ascontiguousarray(dataset.indices[selected])
-        subset.phase_labels = np.asarray(labels[selected], dtype=np.int8).copy()
-        phase_values, phase_counts = np.unique(subset.phase_labels, return_counts=True)
-        log.info("Debug %s subset: %d/%d samples; phase_counts=%s", name, len(subset),
-                 len(dataset), dict(zip(phase_values.tolist(), phase_counts.tolist())))
-        return subset
-
     def _iterate_loader(self, loader):
         iterator = iter(loader)
         lifetime = getattr(self, "_teacher_cache_lifetime", None)
@@ -1840,15 +1492,14 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.model.eval()
         if getattr(self, "ema_model", None) is not None:
             self.ema_model.eval()
-        total, count, selection_count = 0.0, 0, 0.0
-        region_count = 0.0
+        total, count = 0.0, 0
         component_keys = (
             "token_mse", "denoiser_mse", "demo_mse", "mask_mse",
             "context_patch_mse", "intensity_smoothness", "intensity_loss",
-            "phase_ce", "alpha_mse", "alpha_mae", "phase_accuracy", "contact_open_ratio",
-            "force_delta_mse", "force_delta_loss", "context_region_loss", "loss",
+            "contact_open_ratio", "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse",
         )
         component_totals = {key: 0.0 for key in component_keys}
+        response_numerator = response_weight_sum = 0.0
         open_token_sum = closed_token_sum = open_token_count = closed_token_count = 0.0
         started = last_status = time.monotonic()
         batches = len(loader)
@@ -1861,49 +1512,29 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite validation MSE at step {self.global_step}")
             size = next(iter(batch["obs"].values())).shape[0]
-            selected = self._selection_weight(size)
-            total += self._selection_mse(loss) * selected
-            selection_count += selected
-            region_count += self._component_weight("token_mse", size)
+            total += self._selection_mse(loss) * size
             for key in component_totals:
-                component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * self._component_weight(key, size)
+                component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * size
             metrics = getattr(self, "loss_metrics", {})
+            response_numerator += metrics.get("response_numerator", 0.0)
+            response_weight_sum += metrics.get("response_weight_sum", 0.0)
             open_token_sum += metrics.get("open_token_mse", 0.0) * metrics.get("open_token_count", 0.0)
             closed_token_sum += metrics.get("closed_token_mse", 0.0) * metrics.get("closed_token_count", 0.0)
             open_token_count += metrics.get("open_token_count", 0.0)
             closed_token_count += metrics.get("closed_token_count", 0.0)
             count += size
-            if self.force_context_enabled:
-                progress.set_postfix(
-                    loss=f"{total / max(selection_count, 1):.6f}",
-                    token=f"{component_totals['token_mse'] / max(region_count, 1):.5f}",
-                    delta=f"{component_totals['force_delta_loss'] / max(count, 1):.5f}",
-                    region=f"{component_totals['context_region_loss'] / max(count, 1):.5f}",
-                    refresh=False,
-                )
-            else:
-                progress.set_postfix(mse=f"{total / max(selection_count, 1):.6f}", refresh=False)
+            progress.set_postfix(mse=f"{total / count:.6f}", refresh=False)
             now = time.monotonic()
             if not self._progress_enabled() and self.is_main_process and now - last_status >= self._status_interval():
-                if self.force_context_enabled:
-                    log.info("Val %d | batch=%d/%d loss=%.6f token=%.6f delta=%.6f region=%.6f elapsed=%.1fs",
-                             self.epoch, index + 1, batches, total / max(selection_count, 1),
-                             component_totals["token_mse"] / max(region_count, 1),
-                             component_totals["force_delta_loss"] / max(count, 1),
-                             component_totals["context_region_loss"] / max(count, 1), now - started)
-                else:
-                    log.info("Val %d | batch=%d/%d mse=%.6f elapsed=%.1fs",
-                             self.epoch, index + 1, batches, total / max(selection_count, 1), now - started)
+                log.info("Val %d | batch=%d/%d mse=%.6f elapsed=%.1fs",
+                         self.epoch, index + 1, batches, total / count, now - started)
                 last_status = now
         progress.close()
-        total, count, selection_count, region_count = self._sum([total, count, selection_count, region_count])
+        total, count = self._sum([total, count])
         count = int(count)
         if count == 0:
             raise RuntimeError("Validation split is empty")
-        if selection_count == 0:
-            raise RuntimeError("Validation split has no observations in distillation.token_region_phases")
         self.validation_samples = count
-        self.validation_selected_observations = int(region_count)
         self.validation_seconds = self._max_seconds(time.monotonic() - started)
         self.validation_samples_per_second = count / max(self.validation_seconds, 1e-6)
         totals = self._sum(list(component_totals.values()) + [
@@ -1911,39 +1542,43 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         ])
         component_count = len(component_totals)
         self.validation_metrics = {
-            key: value / max(region_count if key in self._REGION_TOKEN_METRICS else count, 1)
-            for key, value in zip(component_totals, totals[:component_count])
+            key: value / count for key, value in zip(component_totals, totals[:component_count])
         }
         open_sum, closed_sum, open_count, closed_count = totals[component_count:]
         self.validation_metrics["open_token_mse"] = open_sum / open_count if open_count else 0.0
         self.validation_metrics["closed_token_mse"] = closed_sum / closed_count if closed_count else 0.0
         self.validation_metrics["open_token_count"] = open_count
         self.validation_metrics["closed_token_count"] = closed_count
-        self.validation_metrics["token_mse_measured"] = not self.condition_selection
-        # Region terms are averaged over selected contact observations, while
-        # phase/alpha use all windows. Combine their properly reduced means.
-        if self.condition_selection:
-            return self._condition_validation_loss(self.validation_metrics)
-        return total / selection_count
+        if self.response_loss_weight > 0 and self.training_stage != "adapter" and not (
+                self.condition_prediction_enabled and self.training_stage == "intensity"):
+            response_numerator, response_weight_sum = self._sum([response_numerator, response_weight_sum])
+            self.validation_metrics["response_mse"] = (
+                response_numerator / response_weight_sum if response_weight_sum > 0 else 0.0
+            )
+            self.validation_metrics["response_weight_sum"] = response_weight_sum
+            self.validation_metrics["student_loss"] = (
+                self.validation_metrics["token_mse"]
+                + self.response_loss_weight * self.validation_metrics["response_mse"]
+            )
+            return self.validation_metrics["student_loss"]
+        return total / count
 
     def _summary(self, status):
         if not self.is_main_process:
             return
         summary = {
             "status": status, "global_step": self.global_step,
-            "metric_scope": self.metric_scope,
             "epoch": self.epoch, "max_epochs": self.num_epochs,
+            "intensity_warmup_epochs": self.intensity_warmup_epochs,
             "render_stages": {
                 "enabled": self.render_stages_enabled,
-                "condition_warmup_epochs": self.condition_warmup_epochs,
-                "rgb_warmup_epochs": self.rgb_warmup_epochs,
-                "joint_after_rgb": self.joint_after_rgb,
+                "intensity_epochs": self.intensity_epochs,
+                "adapter_enabled": self.context_adapter_enabled,
+                "adapter_epochs": getattr(self, "adapter_epochs", 0),
                 "current_stage": self.training_stage,
                 "stage_step": self.stage_step,
                 "stage_epoch": self.stage_epoch,
                 "transition_reason": self.stage_transition_reason,
-                "condition_best_metric": getattr(self, "condition_best_metric", None),
-                "condition_best_epoch": getattr(self, "condition_best_epoch", None),
             },
             "max_steps": self.max_steps, "stop_reason": self.stop_reason,
             "best_epoch": self.best_epoch, "best_step": self.best_step,
@@ -1961,8 +1596,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "render_net": OmegaConf.to_container(self.cfg.render_net, resolve=True),
             "validation_enabled": self.validation_enabled,
             "distillation": OmegaConf.to_container(OmegaConf.create(self.distillation_config), resolve=True),
-            "objective": self.objective,
-            "validation_metric": self.metric_name if self.validation_enabled else None,
+            "objective": self.logging_objective,
+            "validation_metric": f"{self.metric_name} (excludes auxiliary losses)" if self.validation_enabled else None,
             "teacher_cache": getattr(self, "teacher_cache_paths", None),
             "world_size": self.distributed_context.world_size,
             "batching": {
@@ -1979,11 +1614,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "latest_validation_metrics": getattr(self, "validation_metrics", {}),
             "best_val_mse": self.best_val_loss if self.validation_enabled else None,
             "validation_samples": getattr(self, "validation_samples", 0),
-            "validation_selected_observations": getattr(self, "validation_selected_observations", 0),
             "best_checkpoint": str(self.get_checkpoint_path("best").resolve()) if self.validation_enabled else None,
             "latest_checkpoint": str(self.get_checkpoint_path("latest").resolve()),
-            "metrics_png": (str(pathlib.Path(self.output_dir, "training_metrics.png").resolve())
-                            if self.cfg.get("logging", {}).get("enable_plots", False) else None),
+            "metrics_png": str(pathlib.Path(self.output_dir, "training_metrics.png").resolve()),
             "elapsed_seconds": time.monotonic() - self.started_at,
             **(self.shape_info or {}), **self._gpu_metrics(),
         }
@@ -1995,9 +1628,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.latest_val_loss = self._validate(loader)
         self._step_lr_scheduler(self.latest_val_loss)
         improved = self.latest_val_loss < self.best_val_loss
-        condition_stop = getattr(self, "condition_early_stopping", {}) if self.condition_selection else {}
-        min_delta = float(condition_stop.get("min_delta", self.min_delta))
-        if self.latest_val_loss < self.early_stopping_best_loss - min_delta:
+        if self.latest_val_loss < self.early_stopping_best_loss - self.min_delta:
             self.early_stopping_best_loss = self.latest_val_loss
             self.epochs_without_improvement = 0
         else:
@@ -2006,17 +1637,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.best_val_loss = self.latest_val_loss
             self.best_epoch = self.epoch
             self.best_step = self.global_step
-            self._remember_best_condition()
             if self.is_main_process:
                 self.save_checkpoint(tag="best", use_thread=False)
-                if self.condition_selection:
-                    self.save_checkpoint(tag="condition_best", use_thread=False)
+                if self.training_stage == "adapter":
+                    self.save_checkpoint(tag="best_adapter", use_thread=False)
+                if self.condition_prediction_enabled and self.training_stage == "intensity":
+                    self.save_checkpoint(tag="best_condition", use_thread=False)
         metrics = {"global_step": self.global_step, "epoch": self.epoch,
-                   "objective": "condition_warmup" if self.condition_selection else self.objective,
-                   "training_stage": self.training_stage,
-                   "selection_metric": self.metric_name,
-                   "metric_scope": self.metric_scope,
-                   "val_token_region_observation_count": getattr(self, "validation_selected_observations", 0),
+                   "objective": self.logging_objective,
+                   "training_stage": getattr(self, "training_stage", "joint"),
                    "student_state_key": self.evaluation_state_key,
                    "val_per_rank_batch_size": getattr(self, "val_batch_size", None),
                    "val_global_batch_size": (
@@ -2033,12 +1662,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         logger.log(metrics)
         logger.save_plot()
         self._summary("running")
-        if self.condition_selection:
-            if (bool(condition_stop.get("enabled", True))
-                    and self.epochs_without_improvement >= int(condition_stop.get("patience", self.patience))):
-                self.condition_transition_pending = True
-            return False  # A condition plateau starts render training, not a run-wide stop.
-        return self.early_stopping_enabled and self.epochs_without_improvement >= self.patience
+        patience = self.patience
+        if self.training_stage == "adapter":
+            patience = int(self.cfg.training.get("render_stages", {}).get("adapter_patience", patience))
+        if self.condition_prediction_enabled and self.training_stage == "intensity":
+            patience = int(self.cfg.training.get("render_stages", {}).get("condition_patience", patience))
+        return self.early_stopping_enabled and self.epochs_without_improvement >= patience
 
     def run(self):
         cache_config = self.cfg.get("teacher_cache", {})
@@ -2057,12 +1686,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         config = OmegaConf.create(OmegaConf.to_container(source.task.dataset, resolve=True))
         with open_dict(config):
             config.update(OmegaConf.to_container(self.cfg.dataset, resolve=True))
-            if int(self.cfg.get("render_net", {}).get("cross_camera_attn_layers", 0)) > 0:
-                # The full-image renderer has no phase/alpha/region targets.
-                # Keep the teacher's wrench preprocessing, but do not build
-                # offline contact labels that neither model nor loss consumes.
-                config.contact_label_config = None
-            elif hasattr(self, "wrench_preprocessor"):
+            if hasattr(self, "wrench_preprocessor"):
                 config.contact_label_config = self.wrench_preprocessor.get_config()
                 with open_dict(self.cfg.dataset):
                     self.cfg.dataset.contact_label_config = config.contact_label_config
@@ -2079,19 +1703,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 OmegaConf.save(self.teacher_source_cfg, output / "teacher_source_config.yaml", resolve=True)
             # Continuing in a new directory preserves the previously best model.
             if self.resume_from:
-                previous_best = pathlib.Path(self.resume_from).parent / "best.ckpt"
-                destination = self.get_checkpoint_path("best")
-                if (previous_best.is_file() and not destination.exists()
-                        and not self.selection_metric_changed):
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(previous_best, destination)
-                if self.selection_metric_changed and destination.exists():
-                    # Preserve the former best for review; it was selected
-                    # using a different validation denominator.
-                    legacy = destination.with_name("best_previous_metric.ckpt")
-                    if legacy.exists():
-                        raise FileExistsError(legacy)
-                    destination.replace(legacy)
+                for tag in ("best", "best_condition", "best_adapter"):
+                    previous_best = pathlib.Path(self.resume_from).parent / f"{tag}.ckpt"
+                    destination = self.get_checkpoint_path(tag)
+                    if previous_best.is_file() and not destination.exists():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(previous_best, destination)
         # Keep the original dataset config as the cache identity. Rank-local
         # decoder devices do not change supervision, so all ranks reuse the
         # existing single-GPU teacher cache rather than creating new copies.
@@ -2100,12 +1717,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             runtime_dataset_cfg.video_decode_device = str(self.device) if self.device.type == "cuda" else "auto"
         dataset = self._instantiate_dataset(runtime_dataset_cfg)
         validation_dataset = dataset.get_validation_dataset()
-        dataset = self._limit_debug_dataset(
-            dataset, self.cfg.training.get("debug_train_samples"), name="train",
-        )
-        validation_dataset = self._limit_debug_dataset(
-            validation_dataset, self.cfg.training.get("debug_validation_samples"), name="validation",
-        )
         if not len(dataset):
             dataset.lerobot_dataset.close()
             raise RuntimeError("Distillation needs a nonempty training split")
@@ -2119,7 +1730,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
               "normalizer=teacher checkpoint (not refitted)")
         try:
             train_dataset, validation_dataset = self._prepare_cached_datasets(dataset, validation_dataset, dataset_cfg)
-            self._prepare_force_context_scales(train_dataset)
             cache_config = self.cfg.get("teacher_cache", {})
             if cache_config.get("enabled", False) and cache_config.get("only", False):
                 log.info("teacher_cache.only=true: cache prepared, exiting before training")
@@ -2152,20 +1762,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                      self.train_global_batch_size,
                      self.val_batch_size if self.val_batch_size is not None else "disabled")
             logging_config = self.cfg.get("logging", {})
-            logger_context = (RenderNetTrainingLogger(
-                output, logging_config.get("plot_every_steps", 100),
-                enable_plots=bool(logging_config.get("enable_plots", False)),
-                async_plots=bool(logging_config.get("async_plots", True)),
-                plot_interval_sec=float(logging_config.get("plot_interval_sec", 20.0)))
+            logger_context = (RenderNetTrainingLogger(output, logging_config.get("plot_every_steps", 100))
                               if self.is_main_process else contextlib.nullcontext(_NullTrainingLogger()))
             with logger_context as logger:
                 if self.is_main_process:
-                    log.info("Local metrics: %s; plotting=%s", logger.path,
-                             bool(logging_config.get("enable_plots", False)))
-                logger.log({"global_step": self.global_step, "epoch": self.epoch,
-                            "objective": "condition_warmup" if self.condition_selection else self.objective,
-                            "training_stage": self.training_stage, "selection_metric": self.metric_name,
-                            "metric_scope": self.metric_scope})
+                    log.info(f"Local metrics: {logger.path}; PNG: {output / 'training_metrics.png'}")
                 if self.resume_from is None:
                     self.model.eval()
                     log.info(f"Initial evaluation started: one training batch "
@@ -2176,15 +1777,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         initial_batch = next(self._iterate_loader(train_loader))
                         initial_loss = self._batch_loss(initial_batch)
                         size = next(iter(initial_batch["obs"].values())).shape[0]
-                        selected = self._selection_weight(size)
-                        total, count = self._sum([self._selection_mse(initial_loss) * selected, selected])
-                        self.initial_train_mse = total / count if count else float("nan")
+                        total, count = self._sum([self._selection_mse(initial_loss) * size, size])
+                        self.initial_train_mse = total / count
                     log.info(f"Initial training batch complete: {self.metric_name}={self.initial_train_mse:.8f}")
                     logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                "objective": "condition_warmup" if self.condition_selection else self.objective,
-                                "training_stage": self.training_stage, "selection_metric": self.metric_name,
-                                "train_token_mse_measured": not self.condition_selection,
-                                "metric_scope": self.metric_scope,
+                                "objective": self.logging_objective,
                                 "lr": self.optimizer.param_groups[0]["lr"],
                                 "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()})
                     logger.save_plot()
@@ -2194,19 +1791,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         self.best_val_loss = self.initial_val_mse
                         self.early_stopping_best_loss = self.initial_val_mse
                         self._step_lr_scheduler(self.initial_val_mse)
-                        self._remember_best_condition()
                         if self.is_main_process:
                             self.save_checkpoint(tag="best", use_thread=False)
-                            if self.condition_selection:
-                                self.save_checkpoint(tag="condition_best", use_thread=False)
+                            if self.training_stage == "adapter":
+                                self.save_checkpoint(tag="best_adapter", use_thread=False)
+                            if self.condition_prediction_enabled and self.training_stage == "intensity":
+                                self.save_checkpoint(tag="best_condition", use_thread=False)
                         log.info(f"Initial train_mse={self.initial_train_mse:.8f}, val_mse={self.initial_val_mse:.8f}")
                         logger.log({"global_step": 0, "epoch": 0, "initial_train_mse": self.initial_train_mse,
-                                    "objective": "condition_warmup" if self.condition_selection else self.objective,
-                                    "training_stage": self.training_stage, "selection_metric": self.metric_name,
-                                    "train_token_mse_measured": not self.condition_selection,
-                                    "val_token_mse_measured": not self.condition_selection,
-                                    "metric_scope": self.metric_scope,
-                                    "val_token_region_observation_count": getattr(self, "validation_selected_observations", 0),
+                                    "objective": self.logging_objective,
                                     "student_state_key": self.evaluation_state_key,
                                     "initial_val_mse": self.initial_val_mse,
                                     "val_seconds": getattr(self, "validation_seconds", 0.0),
@@ -2215,16 +1808,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         logger.save_plot()
                 else:
                     log.info("Skipping initial evaluation; restored checkpoint state will be continued")
-                    if self.selection_metric_changed and self.validation_enabled:
-                        log.info("Recomputing validation baseline for %s", self.metric_scope)
-                        self._validate_and_save(val_loader, logger)
                 self._summary("running")
                 for epoch_index in range(self.epoch, self.num_epochs):
                     self._maybe_transition_stage(completed_epochs=self.epoch)
-                    if (self.strict_two_stage and self.training_stage == "rgb"
-                            and self.rgb_warmup_epochs > 0 and self.stage_epoch >= self.rgb_warmup_epochs):
-                        self.stop_reason = "render_max_epochs"
-                        break
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                         break
@@ -2232,13 +1818,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         train_loader.sampler.set_epoch(epoch_index)
                     epoch_number = epoch_index + 1
                     epoch_total, epoch_samples = 0.0, 0
-                    epoch_selection_count = epoch_region_count = 0.0
                     epoch_loss_total = epoch_mask_total = 0.0
                     epoch_components = {key: 0.0 for key in (
                         "token_mse", "denoiser_mse", "demo_mse", "context_patch_mse",
-                        "intensity_smoothness", "intensity_loss", "phase_ce", "alpha_mse",
-                        "alpha_mae", "phase_accuracy", "contact_open_ratio",
-                        "force_delta_mse", "force_delta_loss", "context_region_loss",
+                        "intensity_smoothness", "intensity_loss", "contact_open_ratio",
+                        "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse",
                     )}
                     epoch_open_token_sum = epoch_closed_token_sum = 0.0
                     epoch_open_token_count = epoch_closed_token_count = 0.0
@@ -2281,15 +1865,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         metrics_for_batch = self.loss_metrics
                         open_count = metrics_for_batch.get("open_token_count", 0.0)
                         closed_count = metrics_for_batch.get("closed_token_count", 0.0)
-                        selection_size = self._selection_weight(size)
-                        region_size = self._component_weight("token_mse", size)
-                        (primary_total, loss_total, mask_total, global_size,
-                         selection_size, region_size, *component_totals) = self._sum([
-                            self._selection_mse(loss) * selection_size, float(loss.detach()) * size,
-                            self.loss_metrics.get("mask_mse", 0.0) * region_size, size,
-                            selection_size, region_size,
-                            *[self.loss_metrics.get(key, 0.0) * self._component_weight(key, size)
-                              for key in epoch_components],
+                        primary_total, loss_total, mask_total, global_size, *component_totals = self._sum([
+                            self._selection_mse(loss) * size, float(loss.detach()) * size,
+                            self.loss_metrics.get("mask_mse", 0.0) * size, size,
+                            *[self.loss_metrics.get(key, 0.0) * size for key in epoch_components],
                             metrics_for_batch.get("open_token_mse", 0.0) * open_count,
                             open_count,
                             metrics_for_batch.get("closed_token_mse", 0.0) * closed_count,
@@ -2300,8 +1879,6 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         open_total, open_count_total, closed_total, closed_count_total = component_totals[regular_count:]
                         epoch_total += primary_total
                         epoch_samples += global_size
-                        epoch_selection_count += selection_size
-                        epoch_region_count += region_size
                         epoch_loss_total += loss_total
                         epoch_mask_total += mask_total
                         for key, value in zip(epoch_components, regular_totals):
@@ -2310,16 +1887,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         epoch_open_token_count += open_count_total
                         epoch_closed_token_sum += closed_total
                         epoch_closed_token_count += closed_count_total
-                        condition_warmup = self.training_stage == "condition_warmup"
-                        token_measured = not condition_warmup and selection_size > 0
                         metrics = {"global_step": self.global_step, "epoch": epoch_number,
-                                   "objective": "condition_warmup" if condition_warmup else self.objective,
-                                   "selection_metric": self.metric_name,
-                                   "metric_scope": self.metric_scope,
-                                   "train_token_region_observation_count": region_size,
-                                   "train_mse": primary_total / max(selection_size, 1), "train_loss": loss_total / global_size,
-                                   "train_token_mse_measured": token_measured,
-                                   "train_mask_mse": mask_total / max(region_size, 1),
+                                   "objective": self.logging_objective,
+                                   "training_stage": self.training_stage,
+                                   "train_mse": primary_total / global_size, "train_loss": loss_total / global_size,
+                                   "train_mask_mse": mask_total / global_size,
                                    "train_per_rank_batch_size": size,
                                    "train_global_batch_size": global_size,
                                    "grad_norm": grad_norm_value, "lr": self.optimizer.param_groups[0]["lr"],
@@ -2327,41 +1899,24 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                    "data_seconds": data_seconds, "step_seconds": step_seconds,
                                    "samples_per_second": global_size / max(data_seconds + step_seconds, 1e-6),
                                    "elapsed_seconds": time.monotonic() - self.started_at, **self._gpu_metrics()}
-                        metrics.update({f"train_{key}": value / max(
-                                            region_size if key in self._REGION_TOKEN_METRICS else global_size, 1)
+                        metrics.update({f"train_{key}": value / global_size
                                         for key, value in zip(epoch_components, regular_totals)})
                         metrics.update({
                             "train_open_token_mse": metrics_for_batch.get("open_token_mse", 0.0),
                             "train_closed_token_mse": metrics_for_batch.get("closed_token_mse", 0.0),
-                            "train_open_token_count": metrics_for_batch.get("open_token_count", 0.0),
-                            "train_closed_token_count": metrics_for_batch.get("closed_token_count", 0.0),
                         })
                         logger.log(metrics)
-                        if self.force_context_enabled:
-                            progress.set_postfix(
-                                loss=f"{metrics['train_loss']:.4f}", token=f"{metrics['train_token_mse']:.4f}",
-                                delta=f"{metrics['train_force_delta_loss']:.4f}",
-                                region=f"{metrics['train_context_region_loss']:.4f}",
-                                lr=f"{metrics['lr']:.2g}", refresh=False,
-                            )
-                        else:
-                            progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
-                                                 mse=f"{epoch_total / max(epoch_selection_count, 1):.4f}",
-                                                 field=f"{metrics['train_intensity_loss']:.4f}", lr=f"{metrics['lr']:.2g}",
-                                                 refresh=False)
+                        progress.set_postfix(loss=f"{metrics['train_loss']:.4f}",
+                                             mse=f"{epoch_total / epoch_samples:.4f}",
+                                             field=f"{metrics['train_intensity_loss']:.4f}", lr=f"{metrics['lr']:.2g}",
+                                             refresh=False)
                         now = time.monotonic()
                         if (not self._progress_enabled() and self.is_main_process
                                 and now - last_status >= self._status_interval()):
-                            if self.force_context_enabled:
-                                log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f token=%.5f delta=%.5f region=%.5f lr=%.2g",
-                                         epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
-                                         metrics["train_loss"], metrics["train_token_mse"],
-                                         metrics["train_force_delta_loss"], metrics["train_context_region_loss"], metrics["lr"])
-                            else:
-                                log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f mse=%.5f field=%.5f lr=%.2g",
-                                         epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
-                                         metrics['train_loss'], epoch_total / max(epoch_selection_count, 1),
-                                         metrics['train_intensity_loss'], metrics['lr'])
+                            log.info("Train %d/%d | step=%d batch=%d/%d loss=%.5f mse=%.5f field=%.5f lr=%.2g",
+                                     epoch_number, self.num_epochs, self.global_step, batch_index + 1, batches,
+                                     metrics['train_loss'], epoch_total / epoch_samples,
+                                     metrics['train_intensity_loss'], metrics['lr'])
                             last_status = now
                         previous_end = time.monotonic()
                         if self.max_steps is not None and self.global_step >= int(self.max_steps):
@@ -2371,18 +1926,13 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     self.stage_epoch += 1
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
-                                "objective": "condition_warmup" if condition_warmup else self.objective,
-                                "selection_metric": self.metric_name,
-                                "metric_scope": self.metric_scope,
-                                "epoch_token_region_observation_count": epoch_region_count,
-                                "epoch_train_token_mse_measured": not condition_warmup and epoch_selection_count > 0,
-                                "epoch_train_mse": epoch_total / max(epoch_selection_count, 1),
+                                "objective": self.logging_objective,
+                                "epoch_train_mse": epoch_total / epoch_samples,
                                 "epoch_train_loss": epoch_loss_total / epoch_samples,
-                                "epoch_train_mask_mse": epoch_mask_total / max(epoch_region_count, 1),
+                                "epoch_train_mask_mse": epoch_mask_total / epoch_samples,
                                 "epoch_samples": epoch_samples, "epoch_seconds": epoch_seconds,
                                 "epoch_samples_per_second": epoch_samples / max(epoch_seconds, 1e-6),
-                                **{f"epoch_train_{key}": value / max(
-                                       epoch_region_count if key in self._REGION_TOKEN_METRICS else epoch_samples, 1)
+                                **{f"epoch_train_{key}": value / epoch_samples
                                    for key, value in epoch_components.items()},
                                 "epoch_train_open_token_mse": (
                                     epoch_open_token_sum / epoch_open_token_count
@@ -2395,32 +1945,31 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                                 "epoch_open_token_count": epoch_open_token_count,
                                 "epoch_closed_token_count": epoch_closed_token_count})
                     early_stop = self._validate_and_save(val_loader, logger)
+                    if early_stop and self.training_stage == "adapter":
+                        self.adapter_epochs = self.stage_epoch
+                        early_stop = False
+                        log.info("Visual baseline validation plateau: freeze best adapter and continue next epoch")
+                    if early_stop and self.condition_prediction_enabled and self.training_stage == "intensity":
+                        # Condition convergence starts distillation rather than
+                        # terminating the whole two-stage experiment.
+                        self.intensity_epochs = self.stage_epoch if self.context_adapter_enabled else self.epoch
+                        early_stop = False
+                        log.info("Region/alpha validation plateau: start RGB distillation next epoch")
                     if self.is_main_process:
                         validation = (
                             f" val={self.latest_val_loss:.6f} best={self.best_val_loss:.6f}"
                             f" stale={self.epochs_without_improvement}/{self.patience}"
                             f"{' [best saved]' if self.best_step == self.global_step else ''}"
                             if val_loader is not None else "")
-                        if self.force_context_enabled:
-                            log.info("Epoch %d/%d | step=%d loss=%.6f token=%.6f delta=%.6f region=%.6f%s elapsed=%.1fs",
-                                     self.epoch, self.num_epochs, self.global_step, epoch_loss_total / epoch_samples,
-                                     epoch_components["token_mse"] / max(epoch_region_count, 1),
-                                     epoch_components["force_delta_loss"] / epoch_samples,
-                                     epoch_components["context_region_loss"] / epoch_samples, validation,
-                                     time.monotonic() - epoch_started)
-                        else:
-                            log.info("Epoch %d/%d | step=%d loss=%.6f train=%.6f field=%.6f%s elapsed=%.1fs",
-                                     self.epoch, self.num_epochs, self.global_step,
-                                     epoch_loss_total / epoch_samples, epoch_total / max(epoch_selection_count, 1),
-                                     epoch_components["intensity_loss"] / max(epoch_region_count, 1), validation,
-                                     time.monotonic() - epoch_started)
+                        log.info("Epoch %d/%d | step=%d loss=%.6f train=%.6f field=%.6f%s elapsed=%.1fs",
+                                 self.epoch, self.num_epochs, self.global_step,
+                                 epoch_loss_total / epoch_samples, epoch_total / epoch_samples,
+                                 epoch_components["intensity_loss"] / epoch_samples, validation,
+                                 time.monotonic() - epoch_started)
                     if self.max_steps is not None and self.global_step >= int(self.max_steps):
                         self.stop_reason = "max_steps"
                     elif early_stop:
                         self.stop_reason = "early_stopping"
-                    elif (self.strict_two_stage and self.training_stage == "rgb"
-                          and self.rgb_warmup_epochs > 0 and self.stage_epoch >= self.rgb_warmup_epochs):
-                        self.stop_reason = "render_max_epochs"
                     elif self.epoch >= self.num_epochs:
                         self.stop_reason = "max_epochs"
                     if self.is_main_process:

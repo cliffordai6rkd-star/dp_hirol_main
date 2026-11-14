@@ -1,0 +1,49 @@
+# Shared region/alpha pretraining -> frozen conditions -> response-weighted RGB distillation.
+defaults:
+  - train_distill_render_net_student
+  - _self_
+
+name: train_distill_render_net_student_response
+teacher_config: null
+teacher_checkpoint: /home/lcy/code/dp_hirol_main/data/outputs/2026.11.12/20.05.59_876448_fdp_dis_board/teacher/checkpoints/optimizer_step=00180000-action_mse=0.00470914.ckpt
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_response_weighted/student
+
+distillation:
+  use_teacher_ffn: false
+  response_loss_weight: 1.0
+  response_noise_floor: 0.000001
+  alpha_loss_weight: 1.0
+
+render_net:
+  condition_prediction:
+    enabled: true
+    hidden_dim: 64
+  condition_backbone:
+    base_channels: 16
+    patch_size: 16
+    embed_dim: 128
+    num_heads: 4
+    image_self_attn_layers: 1
+    cross_attn_layers: 1
+    decoder_layers: 0
+    mlp_ratio: 2.0
+    dropout: 0.0
+    conv_block: bottleneck
+  high_attention_render:
+    threshold: 0.0
+    normalization: image_minmax # Spatial labels only; token weights use raw responses.
+
+teacher_cache:
+  batch_size: 64
+  num_workers: 8
+  cleanup_on_exit: false
+
+training:
+  render_stages:
+    intensity_epochs: 20
+    condition_patience: 5
+  distributed:
+    find_unused_parameters: true
+
+logging:
+  status_interval_sec: 30.0

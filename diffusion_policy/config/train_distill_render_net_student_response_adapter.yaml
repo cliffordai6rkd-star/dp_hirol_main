@@ -1,0 +1,20 @@
+# Frozen teacher -> visual baseline calibration -> condition pretraining -> RGB.
+defaults:
+  - train_distill_render_net_student_response
+  - _self_
+
+name: train_distill_render_net_student_response_adapter
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_response_adapter/student
+
+render_net:
+  high_attention_render:
+    prediction_threshold: 0.1 # Binary gate; soft rendering uses threshold.
+  context_adapter:
+    enabled: true
+    kind: linear # Optional ablation: mlp, 256 -> hidden_dim -> 256.
+    hidden_dim: 128
+
+training:
+  render_stages:
+    adapter_epochs: 20
+    adapter_patience: 5

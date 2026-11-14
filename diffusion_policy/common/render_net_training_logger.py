@@ -26,6 +26,7 @@ class MetricHistory:
                  "train_mask_mse", "train_context_patch_mse", "train_intensity_loss",
                  "train_intensity_smoothness",
                  "train_phase_ce", "train_alpha_mse",
+                 "train_response_mse", "train_student_loss", "train_condition_loss", "train_adapter_mse",
                  "train_contact_open_ratio", "train_open_token_mse", "train_closed_token_mse",
                  "train_loss", "grad_norm", "lr",
                  "samples_per_second", "gpu_allocated_mib", "gpu_reserved_mib", "gpu_peak_allocated_mib",
@@ -36,6 +37,7 @@ class MetricHistory:
                       "force_delta_mse", "force_delta_loss", "context_region_loss",
                       "context_patch_mse", "intensity_smoothness", "intensity_loss",
                       "phase_ce", "alpha_mse", "contact_open_ratio", "open_token_mse",
+                      "response_mse", "student_loss", "condition_loss", "adapter_mse",
                       "closed_token_mse", "loss")
     scope_dependent_keys = {
         "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
@@ -76,7 +78,9 @@ class MetricHistory:
                         and not key.endswith(("phase_ce", "alpha_mse", "contact_open_ratio"))):
                     self.series.pop(key)
             self.metric_scope = scope
-        warmup = metrics.get("objective") == "condition_warmup"
+        adapter_warmup = metrics.get("objective") == "adapter_warmup"
+        warmup = metrics.get("objective") == "condition_warmup" or adapter_warmup
+        warmup_component = "adapter_mse" if adapter_warmup else "condition_loss"
         if "objective" in metrics and not warmup:
             self.objective = metrics["objective"]
         if "selection_metric" in metrics:
@@ -87,14 +91,15 @@ class MetricHistory:
         region_count = metrics.get("train_token_region_observation_count",
                                    metrics.get("token_region_observation_count"))
         if warmup and "train_mse" in metrics:
-            self._append("train_condition_loss", step, metrics["train_mse"])
+            self._append("train_" + warmup_component, step, metrics["train_mse"])
         elif warmup and "initial_train_mse" in metrics and not token_measured:
-            self._append("train_condition_loss", step, metrics["initial_train_mse"])
+            self._append("train_" + warmup_component, step, metrics["initial_train_mse"])
         if warmup and "epoch_train_mse" in metrics:
-            self._append("epoch_train_condition_loss", step, metrics["epoch_train_mse"])
+            self._append("epoch_train_" + warmup_component, step, metrics["epoch_train_mse"])
         for key in self.step_keys:
             if (not token_measured and key in {
                     "train_mse", "train_token_mse", "train_denoiser_mse", "train_demo_mse",
+                    "train_response_mse", "train_student_loss",
                     "train_open_token_mse", "train_closed_token_mse", "initial_train_mse"}):
                 continue
             if region_count == 0 and key in self.region_keys:
@@ -114,7 +119,8 @@ class MetricHistory:
                 if key not in metrics:
                     continue
                 if not measured and component in {
-                        "token_mse", "denoiser_mse", "demo_mse", "open_token_mse", "closed_token_mse"}:
+                        "token_mse", "denoiser_mse", "demo_mse", "open_token_mse", "closed_token_mse",
+                        "response_mse", "student_loss"}:
                     continue
                 if count == 0 and "train_" + component in self.region_keys:
                     continue
@@ -129,7 +135,7 @@ class MetricHistory:
         val = metrics.get("val_mse", metrics.get("initial_val_mse"))
         val_token_measured = metrics.get("val_token_mse_measured", not warmup)
         if val is not None and warmup and not val_token_measured:
-            self._append("val_condition_loss", step, val)
+            self._append("val_" + warmup_component, step, val)
         if (val is not None and val_token_measured
                 and metrics.get("val_token_region_observation_count") != 0):
             self._append("val_mse", step, val)
@@ -163,7 +169,9 @@ def save_training_plot(history, destination):
     destination = Path(destination)
     force_context = history.selection_metric == "force context loss"
     metric_label = ("Combined force-context loss" if force_context else
-                    "Denoiser output MSE" if history.objective == "denoiser_mse" else "Context token MSE")
+                    "Denoiser output MSE" if history.objective == "denoiser_mse" else
+                    "Global + response-weighted token MSE" if "train_response_mse" in history.series
+                    else "Context token MSE")
     if history.metric_scope == "phases_1_2":
         metric_label += "\npre-contact / contact"
 
@@ -183,7 +191,10 @@ def save_training_plot(history, destination):
         ("Force difference MSE (raw)", "force_delta_mse", "MSE"),
         ("Force difference loss (normalized)", "force_delta_loss", "Loss"),
         ("Context region RGB loss", "context_region_loss", "Weighted L1"),
+        ("Global context token MSE", "token_mse", "MSE"),
+        ("Teacher response-weighted token MSE", "response_mse", "MSE"),
         ("Condition warmup loss", "condition_loss", "Loss"),
+        ("Visual baseline calibration", "adapter_mse", "MSE"),
         ("Contact phase CE", "phase_ce", "Cross entropy"),
         ("Alpha MSE", "alpha_mse", "MSE"),
         ("Region patch SmoothL1", "context_patch_mse", "Loss"),
@@ -196,6 +207,8 @@ def save_training_plot(history, destination):
         ("Closed-window token MSE", "closed_token_mse", "MSE"),
     ):
         if force_context and component == "loss":
+            continue
+        if component == "token_mse" and "train_response_mse" not in history.series:
             continue
         panels.append((title, ylabel, "train_" + component,
                        "epoch_train_" + component, "val_" + component, 1.))
@@ -306,7 +319,7 @@ class RenderNetTrainingLogger(JsonLogger):
         self.directory = Path(directory)
         super().__init__(str(self.directory / "logs.json.txt"), filter_fn=lambda key, value:
                          isinstance(value, numbers.Number) or key in {
-                             "objective", "metric_name", "metric_scope", "selection_metric"})
+                             "objective", "metric_name", "metric_scope", "selection_metric", "training_stage"})
         self.history = MetricHistory()
         self.enable_plots = bool(enable_plots)
         self.async_plots = bool(async_plots)
