@@ -1,0 +1,34 @@
+# Independent experiment on V/6482fe3; no production configuration is changed.
+name: civi_paired_response_full_data
+source_commit: 6482fe3
+variant: c_film_mlp
+seed: 42
+starting_checkpoint: review_1000/c_mlp_checkpoint_1000.ckpt
+adapter_checkpoint: calibration_mlp_cuda/adapter.pt
+steps: 2000
+maximum_steps: 5000
+batch_size: 16
+microbatch: 4
+validation_batch: 16
+workers: 8
+validate_every: 200
+log_every: 25
+gradient_every: 200
+rgb_lr_multiplier: 0.25
+max_gradient_norm: 1.0
+response_noise_floor: 1.0e-6
+# Estimate from TRAIN Free teacher responses; never inspect validation to tune it.
+response_threshold:
+  free_quantile: 0.99
+  minimum_rms: 0.001
+delta_gradient_fraction: 0.5
+lambda_zero: 1.0
+lambda_free: 1.0
+extension_relative_tolerance: 0.0
+teacher:
+  directory: data/outputs/2026.11.15/03.31.29_teacher_ca_curriculum_b64_150k/teacher
+  optimizer_steps: 150000
+  weights: ema_model
+groups:
+  a: {paired_response: false}
+  b: {paired_response: true}
