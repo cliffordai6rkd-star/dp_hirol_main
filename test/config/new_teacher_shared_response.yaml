@@ -1,0 +1,39 @@
+name: new_teacher_adapter_shared_response
+source_commit: f4f6a84
+seed: 42
+teacher_step: 70750
+teacher_sha256: e030fcec4f36efc71d0b069dcd862695cbae608bac04d3b31736bab8ada8c87a
+teacher_state_sha256: 1d3bb4682b2ed63ddb64549b2c6a6b5046b2e14720da73dbb6a23b24e1a74685
+condition_checkpoint: review_1000/c_mlp_checkpoint_1000.ckpt
+adapter_initial_checkpoint: calibration_mlp_cuda/adapter.pt
+external_episodes: [5, 26]
+selection_episodes: [38, 44, 53, 60]
+cache_batch_size: 32
+workers: 8
+adapter:
+  max_steps: 5000
+  batch_size: 64
+  lr: 0.0002
+  validate_every: 200
+  patience: 10
+  min_delta: 0.00001
+rgb:
+  steps: 1000
+  maximum_steps: 3000
+  batch_size: 8
+  microbatch: 4
+  validation_batch: 16
+  validate_every: 200
+  log_every: 25
+  lr: 0.0002
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  gradient_clip: 1.0
+  epsilon: 0.1
+  lambda_delta: 1.0
+  lambda_contact: 0.25
+  lambda_free: 1.0
+  response_minimum_rms: 0.001
+  response_free_quantile: 0.99
+  extension_min_relative_improvement: 0.0
+  preservation_relative_tolerance: 0.01
