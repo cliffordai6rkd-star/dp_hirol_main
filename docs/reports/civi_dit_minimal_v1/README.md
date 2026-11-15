@@ -128,3 +128,11 @@ check used zero additional optimizer calls; exact gradient numbers are in
 `ddp2_b64.json`. Focused suite after budget/epoch/chunking tests:33 passed.
 
 ![Full-data smoke curve](smoke80_learning_curves.png)
+
+The formal run was launched from immutable commit `469b9c9` on GPU2/3. It
+completed its full1893-window step0 FP32 validation and entered real updates;
+`formal_launch.json` records the first logged update and a later launch-time
+snapshot. This file is not a completed-training result. Runtime curves are
+`data/outputs/civi_dit_minimal_b64_s42_100epoch/learning_curves.png` on the server,
+updated after each278-update validation. Current batch losses alone do not
+establish internal-validation or sampled-action improvement.

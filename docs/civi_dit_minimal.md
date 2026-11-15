@@ -151,6 +151,20 @@ Resume uses the same formal config, same two ranks, and
 `training.resume_from=RUN/latest.pt output_dir=RUN`. Its full-data identity,
 optimizer and direct-torque architecture guards stay active.
 
+The launched formal run uses the immutable server source directory
+`/home/djhpc/code/dp_hirol_main/data/diagnostics/civi_dit_minimal_v1/formal_source`
+at commit `469b9c9`, rather than the earlier engineering `source` directory.
+Its launch snapshot (full step0 validation and confirmed real optimizer updates)
+is `docs/reports/civi_dit_minimal_v1/formal_launch.json`. This is a dated snapshot;
+live progress is in the run's `train.jsonl` and `validation_<step>.json` files.
+`learning_curves.png` is regenerated after each validation; before the first
+epoch completes it contains the step0 reference only.
+
+The Chinese repository-reading prompt for a research collaborator is
+[`civi_research_handoff_prompt_zh.md`](civi_research_handoff_prompt_zh.md).
+It asks for an evidence-based reconstruction of the research iterations before
+paper drafting and does not authorize further experiments.
+
 ## Validation and outputs
 
 Validation probes derive rho/epsilon from sample_id+probe_id+seed, not batch/rank
