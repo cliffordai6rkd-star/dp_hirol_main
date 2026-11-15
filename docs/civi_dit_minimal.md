@@ -124,9 +124,32 @@ CUDA_VISIBLE_DEVICES=2 "$PY" train_distill_render_net.py \
 
 The default task ledger limits **all** benchmark/replay/smoke optimizer calls
 combined to100 and checks the original exploration ledger (19622/20000 before
-this task). There is no automatic100k run. A longer authorized training command
-uses this same configuration plus an explicitly agreed cap and separately logged
-budget; it must not be implemented by removing the guard or editing old counts.
+this task). There is no automatic100k run. The user subsequently authorized100 epochs, early stopping patience5, and
+global batch64. The dedicated formal configuration is
+`train_civi_student_dit_minimal_100epoch.yaml`. This is a separate authorized
+budget and does not alter the historical20k exploration ceiling or counts.
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 "$PY" -m torch.distributed.run --standalone --nproc_per_node=2 \
+  train_distill_render_net.py --config-name train_civi_student_dit_minimal_100epoch \
+  output_dir=data/outputs/civi_dit_minimal_b64_s42_100epoch
+```
+
+Per-card Renderer microbatch8 × accumulation4 ×2 ranks = global64, with
+F16/P16/C32. Visual readout remains fixed B2 chunks with input gradients; no
+rendered features are cached. One nominal epoch is ceil17740/64=278 updates,
+not a promise of visiting each imbalanced window exactly once. Maximum100 epochs
+is27800 updates/1779200 sample exposures, including889600 Contact exposures
+(~248.42 nominal Contact dataset passes). Validation and complete native action
+sampling run each epoch; Contact KD episode macro chooses best, patience5 counts
+five completed epochs without a new best (step0 establishes the reference).
+A fresh Renderer is initialized for the formal run; it does not continue the80-step
+smoke or import response-conditioned weights. Learning rate is unchanged; batch
+exposure/update count differences are explicit.
+
+Resume uses the same formal config, same two ranks, and
+`training.resume_from=RUN/latest.pt output_dir=RUN`. Its full-data identity,
+optimizer and direct-torque architecture guards stay active.
 
 ## Validation and outputs
 

@@ -188,10 +188,12 @@ def summarize(rows, retained=(5, 26)):
                 item = dict(scope=scope, phase=PHASES[phase], episode=ep, samples=len(group))
                 for key in group[0]:
                     if key not in ('index', 'episode', 'phase'):
-                        item[key] = float(np.mean([r[key] for r in group]))
+                        item[key] = float(max(r[key] for r in group) if key=='rgb_linf' else np.mean([r[key] for r in group]))
+                item['rgb_rms'] = item['rgb_mse']**.5 if 'rgb_mse' in item else item.get('rgb_rms',0.)
+                item['actual_response_rms'] = item['actual_response_mse']**.5 if 'actual_response_mse' in item else item.get('actual_response_rms',0.)
                 episodes.append(item); values.append(item)
             if values:
-                scopes[scope][PHASES[phase]] = {k: float(np.mean([r[k] for r in values]))
+                scopes[scope][PHASES[phase]] = {k: float(max(r[k] for r in values) if k=='rgb_linf' else np.mean([r[k] for r in values]))
                     for k in values[0] if k not in ('scope', 'phase', 'episode', 'samples')}
     return scopes, episodes
 

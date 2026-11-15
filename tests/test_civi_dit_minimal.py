@@ -135,3 +135,45 @@ def test_foreach_ema_matches_existing_mul_add_and_skips_frozen():
         for a,b in zip(one.averaged_model.parameters(),two.averaged_model.parameters()):
             torch.testing.assert_close(a,b,rtol=0,atol=0)
     assert one.state_dict()==two.state_dict()
+
+
+def test_fixed_visual_shape_is_independent_of_renderer_microbatch():
+    import contextlib
+    from diffusion_policy.workspace.train_civi_student_dit_workspace import TrainCiviStudentDiTWorkspace
+    ws=object.__new__(TrainCiviStudentDiTWorkspace)
+    ws.cfg=OmegaConf.create({'validation':{'encode_batch':2}})
+    ws.adapter=torch.nn.Identity();ws.amp=lambda *args:contextlib.nullcontext()
+    shapes=[]
+    def visual(images, input_grad, context_adapter):
+        shapes.append(images['side'].shape[0])
+        return images['side'].flatten(1).unsqueeze(1)
+    ws.visual=visual
+    image=torch.randn(8,2,3,4,4,requires_grad=True)
+    out=ws.encode({'side':image},True)
+    assert shapes==[2,2,2,2]
+    out.sum().backward()
+    assert torch.equal(image.grad,torch.ones_like(image))
+
+
+def test_independent_formal_budget_does_not_change_exploration(tmp_path):
+    from diffusion_policy.distillation.budget import TrainingBudget
+    history=tmp_path/'old';history.mkdir()
+    (history/'state.json').write_text('{"exploration_rgb_updates":19712}')
+    original=(history/'state.json').read_bytes()
+    budget=TrainingBudget(tmp_path/'new','formal',2,tmp_path/'run','User:100epoch patience5 batch64')
+    budget.charge(1,[1,2]);budget.charge(2,[3,4])
+    with pytest.raises(RuntimeError):budget.charge(3,[5,6])
+    assert (history/'state.json').read_bytes()==original
+    with pytest.raises(ValueError):
+        TrainingBudget(tmp_path/'new','formal',3,tmp_path/'run','User:100epoch patience5 batch64')
+
+
+def test_formal100epoch_config_keeps_mixed_and_patience5():
+    from hydra import compose,initialize_config_dir
+    from pathlib import Path
+    with initialize_config_dir(version_base=None,config_dir=str(Path('diffusion_policy/config').resolve())):
+        cfg=compose(config_name='train_civi_student_dit_minimal_100epoch')
+    assert cfg.training.global_batch==64 and list(cfg.data.phase_counts)==[16,16,32]
+    assert cfg.training.num_epochs==100 and cfg.training.early_stopping.patience==5
+    assert cfg.budget.maximum_new_updates==27800 and cfg.budget.scope=='formal'
+    assert cfg.validation.encode_batch==2

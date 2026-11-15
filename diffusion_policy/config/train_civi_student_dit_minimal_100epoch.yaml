@@ -1,0 +1,27 @@
+# Explicitly authorized: new-objective formal run,100 epochs, patience5, batch64.
+defaults:
+  - train_civi_student_dit_minimal
+  - _self_
+name: train_civi_student_dit_minimal_100epoch
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_civi_dit_minimal_b64_100epoch
+data:
+  phase_counts: [16, 16, 32]
+training:
+  num_epochs: 100
+  max_steps: 27800 # recomputed/asserted from ceil17740/64 *100 by workspace
+  global_batch: 64
+  microbatch: 8 # final choice follows measured24GB single-card footprint
+  save_every: 278
+  log_every: 10
+  early_stopping: {patience: 5, min_delta: 0.0}
+validation:
+  every: 278
+  full_action_every: 278
+  shuffled_every: 278
+  max_samples: null
+budget:
+  scope: formal
+  ledger_root: data/diagnostics/civi_dit_minimal_v1/formal_ledger
+  maximum_new_updates: 27800
+  task_id: direct_tau_dit_b64_100epoch_s42
+  authorization: 'User requested100 epochs, early stopping patience5 and global batch64 on2026-11-15; new objective budget independent of old20k exploration'

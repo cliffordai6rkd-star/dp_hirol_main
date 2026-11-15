@@ -25,7 +25,7 @@ from diffusion_policy.distillation.dit_rgb import (
     fp32_reference, move, restore_rng, rng_state, seed_for, slice_batch,
     state_sha, summarize, write_json, foreach_ema_step,
 )
-from diffusion_policy.distillation.budget import UpdateBudget
+from diffusion_policy.distillation.budget import create_budget
 from diffusion_policy.dataset.civi_dit_dataset import historical_datasets
 from diffusion_policy.dataset.render_net_teacher_cache import TeacherTargetCache, cache_key
 from diffusion_policy.model.diffusion.ema_model import EMAModel
@@ -117,7 +117,9 @@ class TrainCiviStudentDiTWorkspace:
         self.scaler = torch.amp.GradScaler('cuda', enabled=False) # BF16, FP32 master weights
         self.scheduler = None # no hidden schedule in this new, fixed-LR objective
         self.step, self.best, self.stale, self.selection = 0, float('inf'), 0, {}
+        self.steps_per_epoch = None
         self.plan = None
+        self.stop_reason = None
         self.dependency = dict(teacher_file=t.file_sha256, teacher_state=t.state_sha256,
                                adapter=t.adapter_sha256, condition=t.condition_sha256,
                                normalizer=state_sha(self.teacher.normalizer.state_dict()),
@@ -170,8 +172,19 @@ class TrainCiviStudentDiTWorkspace:
                 self.preprocessor(batch['obs'])[0])
 
     def encode(self, images, grad, reference=False):
-        with self.amp('visual', reference):
-            return self.visual(images, input_grad=grad, context_adapter=self.adapter).float()
+        # Keep the visual kernel shape fixed when Renderer microbatch grows.
+        # No rendered feature is cached/detached; every chunk retains RGB grads.
+        size = len(next(iter(images.values())))
+        shape = int(self.cfg.validation.encode_batch)
+        contexts = []
+        for start in range(0,size,shape):
+            chunk = {k:v[start:start+shape] for k,v in images.items()}
+            actual = len(next(iter(chunk.values())))
+            if actual < shape:
+                chunk = self.pad(chunk,shape-actual)
+            with self.amp('visual', reference):
+                contexts.append(self.visual(chunk,input_grad=grad,context_adapter=self.adapter).float()[:actual])
+        return torch.cat(contexts)
 
     def check_frozen(self):
         for name, module in [('teacher',self.teacher),('adapter',self.adapter),('condition',self.model.condition_network)]:
@@ -200,8 +213,8 @@ class TrainCiviStudentDiTWorkspace:
         if self.d.is_main:
             write_json(self.out/'data_manifest.json', identity)
         b = int(self.cfg.validation.encode_batch)
-        if b != int(self.cfg.training.microbatch):
-            raise ValueError('Training/evaluation visual encode batch must match')
+        if int(self.cfg.training.microbatch)%b:
+            raise ValueError('Renderer microbatch must be a multiple of the fixed visual encode batch')
         for split, dataset in self.datasets.items():
             spec = dict(version=1, architecture=ARCHITECTURE, split=split, dependency=self.dependency,
                         indices=identity[split], rgb=identity['rgb'], images='clear uint8/255, no augmentation',
@@ -253,6 +266,23 @@ class TrainCiviStudentDiTWorkspace:
                 write_json(self.out/f'cache_{split}.json', dict(identity=spec, audits=errors, seconds=time.monotonic()-started))
         if self.d.enabled and self.d.is_main:
             dist.barrier()
+        import math
+        self.steps_per_epoch = math.ceil(len(self.datasets['train'])/self.cfg.training.global_batch)
+        epochs = self.cfg.training.get('num_epochs')
+        if epochs is not None:
+            maximum = int(epochs)*self.steps_per_epoch
+            self.cfg.training.max_steps = maximum
+            self.cfg.validation.every = self.steps_per_epoch
+            self.cfg.validation.full_action_every = self.steps_per_epoch
+            self.cfg.validation.shuffled_every = self.steps_per_epoch
+            if maximum > self.cfg.budget.maximum_new_updates:
+                raise ValueError('Epoch exposure exceeds explicitly authorized update budget')
+            if self.d.is_main:
+                write_json(self.out/'epoch_semantics.json',dict(num_epochs=int(epochs),steps_per_epoch=self.steps_per_epoch,
+                    max_optimizer_steps=maximum,global_batch=int(self.cfg.training.global_batch),
+                    meaning='ceil(train_windows/global_batch) updates; Mixed phase/episode queues, not one uniform permutation',
+                    early_stopping_patience_epochs=int(self.cfg.training.early_stopping.patience)))
+                OmegaConf.save(self.cfg,self.out/'config.yaml',resolve=True)
         self.plan = MixedPlan(self.datasets['train'].phases, self.datasets['train'].episodes,
                               self.cfg.data.phase_counts, self.cfg.training.seed)
         if self.cfg.training.resume_from:
@@ -324,7 +354,11 @@ class TrainCiviStudentDiTWorkspace:
         donor_plan = np.empty(len(dataset),dtype=np.int64)
         donor_plan[order] = np.roll(order,1) # fixed derangement, independent of rank/batch
         with fp32_reference():
-            for raw in self.loader(Subset(dataset,ids),batch_size=b):
+            validation_started = time.monotonic()
+            for batch_index,raw in enumerate(self.loader(Subset(dataset,ids),batch_size=b)):
+                if batch_index and batch_index%100==0:
+                    log.info('FP32 validation step=%d rank=%d windows=%d/%d elapsed=%.1fs',
+                             self.step,self.d.rank,min(batch_index*b,len(ids)),len(ids),time.monotonic()-validation_started)
                 size = len(raw['index']); batch = move(raw,self.device)
                 if size < b:
                     batch = self.pad(batch,b-size)
@@ -339,7 +373,6 @@ class TrainCiviStudentDiTWorkspace:
                 result = results[0]
                 images,rendered = result['images'],result['rendered']
                 z0 = self.teacher.obs_encoder.encode_image_context(images,input_grad=False,context_adapter=self.adapter)
-                identity = self.teacher.model(result['noisy'],result['rho'],z0)
                 zero_response = torch.stack([element_mse(self.teacher.model(r['noisy'],r['rho'],z0),r['expected']) for r in results]).mean(0)
                 metrics = dict(kd=torch.stack([r['kd'] for r in results]).mean(0),
                                demo=torch.stack([r['demo'] for r in results]).mean(0),
@@ -387,6 +420,7 @@ class TrainCiviStudentDiTWorkspace:
                         predictions = {k:normalize_pose_quaternions(v) for k,v in predictions.items()}
                     if self.teacher.relative_pose_actions:
                         ref = batch['obs'][self.teacher.action_reference_key]
+                        if ref.ndim==3:ref=ref[:,-1]
                         predictions = {k:relative_pose_to_absolute_pose(v,ref) for k,v in predictions.items()}
                         truth = relative_pose_to_absolute_pose(truth,ref)
                     start,end = self.teacher.action_start_index,self.teacher.action_start_index+self.teacher.n_action_steps
@@ -410,19 +444,24 @@ class TrainCiviStudentDiTWorkspace:
         rows.sort(key=lambda r:r['index'])
         if len(rows) != count or len({r['index'] for r in rows}) != count:
             raise RuntimeError('Validation windows duplicated or missing')
+        initial_path = self.out/'validation_0_samples.json'
+        if initial_path.exists():
+            initial = {r['index']:r for r in json.loads(initial_path.read_text())}
+            for row in rows:
+                row['improvement_vs_run_step0'] = initial[row['index']]['kd']-row['kd']
+        else:
+            for row in rows:
+                row['improvement_vs_run_step0'] = 0.0
         summary,episodes = summarize(rows,self.cfg.validation.retained_episodes)
         if self.d.is_main:
-            initial_path = self.out/'validation_0_samples.json'
-            if initial_path.exists():
-                initial = {r['index']:r for r in json.loads(initial_path.read_text())}
-                for row in rows:
-                    row['improvement_vs_run_step0'] = initial[row['index']]['kd']-row['kd']
             write_json(self.out/f'validation_{self.step}_samples.json',rows)
             write_json(self.out/f'validation_{self.step}_episodes.json',episodes)
-            write_json(self.out/f'validation_{self.step}.json',dict(step=self.step,precision='FP32',weight_type='renderer EMA',
+            write_json(self.out/f'validation_{self.step}.json',dict(step=self.step,epoch=self.step/self.steps_per_epoch if self.steps_per_epoch else None,seconds=time.monotonic()-validation_started,precision='FP32',weight_type='renderer EMA',
                 full_validation=count==len(dataset),sampled_action=full_action,summary=summary))
             torch.save(visuals,self.out/f'visuals_{self.step}.pt')
             self.save_visuals(visuals)
+            from diffusion_policy.distillation.report import learning_curves
+            learning_curves(self.out)
         score = summary.get('internal',{}).get('contact',{}).get('kd')
         if score is None:
             # A truncated smoke has no right to choose a "best" model.
@@ -453,10 +492,11 @@ class TrainCiviStudentDiTWorkspace:
             return
         payload = dict(architecture=ARCHITECTURE,options=self.options,dependency=self.dependency,data_identity=self.data_identity,
                        cfg=OmegaConf.to_container(self.cfg,resolve=True),stage='rgb',step=self.step,
+                       steps_per_epoch=self.steps_per_epoch,epoch=self.step/self.steps_per_epoch if self.steps_per_epoch else None,
                        model=self.model.state_dict(),ema_model=self.ema_model.state_dict(),ema=self.ema.state_dict(),
                        optimizer=self.optimizer.state_dict(),scaler=self.scaler.state_dict(),scheduler=None,
                        rng=states,world_size=self.d.world_size,sampler=self.plan.state_dict(),
-                       best=self.best,stale=self.stale,selection=self.selection)
+                       best=self.best,stale=self.stale,selection=self.selection,stop_reason=self.stop_reason)
         temporary = self.out/(name+'.tmp')
         torch.save(payload,temporary);temporary.replace(self.out/name)
 
@@ -505,7 +545,7 @@ class TrainCiviStudentDiTWorkspace:
         if self.d.is_main:
             write_json(self.out/'batch_semantics.json',dict(microbatch=micro,gradient_accumulation=accumulation,
                 global_batch=global_batch,world_size=self.d.world_size,phase_counts=list(self.cfg.data.phase_counts)))
-        budget = UpdateBudget(self.cfg.budget.ledger_root,self.cfg.budget.task_id,self.cfg.budget.maximum_new_updates,self.out) if self.d.is_main else None
+        budget = create_budget(self.cfg.budget,self.out) if self.d.is_main else None
         self.setup_acceleration()
         if not self.cfg.training.resume_from:
             random.seed(self.cfg.training.seed+self.d.rank)
@@ -559,7 +599,7 @@ class TrainCiviStudentDiTWorkspace:
             if self.step%self.cfg.training.log_every == 0 or self.step == 1:
                 if self.d.enabled:
                     dist.all_reduce(total);total /= self.d.world_size
-                entry = dict(step=self.step,denoiser_kd=float(total),gradient_norm=float(norm),
+                entry = dict(step=self.step,epoch=self.step/self.steps_per_epoch,denoiser_kd=float(total),gradient_norm=float(norm),
                     step_seconds=time.monotonic()-started,data_wait_seconds=wait,
                     samples_seen=self.plan.position*global_batch,contact_exposures=self.plan.position*self.cfg.data.phase_counts[2],
                     peak_memory_bytes=torch.cuda.max_memory_allocated(self.device))
@@ -575,10 +615,13 @@ class TrainCiviStudentDiTWorkspace:
                                      shuffled=self.step%self.cfg.validation.shuffled_every==0 or self.step==self.cfg.training.max_steps)
                 self.check_frozen();self.save()
                 if stop:
+                    self.stop_reason = 'early_stopping_patience'
                     break
             previous = time.monotonic()
+        self.stop_reason = self.stop_reason or 'max_optimizer_steps'
         self.check_frozen();self.save()
         if self.d.is_main:
+            write_json(self.out/'run_status.json',dict(status='completed',step=self.step,epoch=self.step/self.steps_per_epoch,stop_reason=self.stop_reason,best=self.selection))
             write_json(self.out/'profile.json',dict(profiles=profiles,units='CUDA components: ms; data wait: seconds',
                 history=history,precision=OmegaConf.to_container(self.cfg.training.amp),
                 note='Full KD: renderer + input-gradient frozen DINO/Adapter + target/student DiT + backward + optimizer/EMA. Static cache preparation/validation recorded separately.'))

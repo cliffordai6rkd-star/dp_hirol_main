@@ -1,0 +1,139 @@
+{
+  "profiles": [
+    {
+      "step": 1,
+      "data_wait_seconds": 0.018172359908930957,
+      "h2d": 0.837664008140564,
+      "renderer": 388.5036087036133,
+      "student_visual": 14943.268228530884,
+      "teacher_dit": 29.052128791809082,
+      "student_dit": 32.24291229248047,
+      "backward": 7686.251747131348,
+      "optimizer_ema": 215.85023498535156
+    },
+    {
+      "step": 2,
+      "data_wait_seconds": 0.3064530820120126,
+      "h2d": 1.449120044708252,
+      "renderer": 124.78992080688477,
+      "student_visual": 27.3438720703125,
+      "teacher_dit": 34.67852973937988,
+      "student_dit": 38.19007873535156,
+      "backward": 206.94329833984375,
+      "optimizer_ema": 8.294624328613281
+    },
+    {
+      "step": 3,
+      "data_wait_seconds": 0.01843442698009312,
+      "h2d": 1.022976040840149,
+      "renderer": 107.89888000488281,
+      "student_visual": 24.83683204650879,
+      "teacher_dit": 58.86863899230957,
+      "student_dit": 37.562368392944336,
+      "backward": 202.56073760986328,
+      "optimizer_ema": 11.925503730773926
+    }
+  ],
+  "units": "CUDA components: ms; data wait: seconds",
+  "history": [
+    {
+      "step": 1,
+      "denoiser_kd": 0.3111783564090729,
+      "gradient_norm": 4.9559526443481445,
+      "step_seconds": 23.410553673980758,
+      "data_wait_seconds": 0.018172359908930957,
+      "samples_seen": 8,
+      "contact_exposures": 4,
+      "peak_memory_bytes": 2538954752
+    },
+    {
+      "step": 10,
+      "denoiser_kd": 0.2835314869880676,
+      "gradient_norm": 19.391002655029297,
+      "step_seconds": 0.5479357350850478,
+      "data_wait_seconds": 0.017757112975232303,
+      "samples_seen": 80,
+      "contact_exposures": 40,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 20,
+      "denoiser_kd": 0.41230037808418274,
+      "gradient_norm": 22.43991470336914,
+      "step_seconds": 0.6998856329591945,
+      "data_wait_seconds": 0.023100686026737094,
+      "samples_seen": 160,
+      "contact_exposures": 80,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 30,
+      "denoiser_kd": 0.25098562240600586,
+      "gradient_norm": 3.279982805252075,
+      "step_seconds": 0.5999706799630076,
+      "data_wait_seconds": 0.06603059498593211,
+      "samples_seen": 240,
+      "contact_exposures": 120,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 40,
+      "denoiser_kd": 0.2884558439254761,
+      "gradient_norm": 11.152715682983398,
+      "step_seconds": 0.5811781929805875,
+      "data_wait_seconds": 0.031961782020516694,
+      "samples_seen": 320,
+      "contact_exposures": 160,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 50,
+      "denoiser_kd": 0.17208610475063324,
+      "gradient_norm": 13.668091773986816,
+      "step_seconds": 0.5751859579468146,
+      "data_wait_seconds": 0.02602577197831124,
+      "samples_seen": 400,
+      "contact_exposures": 200,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 60,
+      "denoiser_kd": 0.13177303969860077,
+      "gradient_norm": 6.840320587158203,
+      "step_seconds": 0.5683698940556496,
+      "data_wait_seconds": 0.03181174898054451,
+      "samples_seen": 480,
+      "contact_exposures": 240,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 70,
+      "denoiser_kd": 0.016508612781763077,
+      "gradient_norm": 0.5914134979248047,
+      "step_seconds": 0.5574576531071216,
+      "data_wait_seconds": 0.0317455519689247,
+      "samples_seen": 560,
+      "contact_exposures": 280,
+      "peak_memory_bytes": 2568755200
+    },
+    {
+      "step": 80,
+      "denoiser_kd": 0.12545141577720642,
+      "gradient_norm": 11.338549613952637,
+      "step_seconds": 0.5766994109144434,
+      "data_wait_seconds": 0.02603781595826149,
+      "samples_seen": 640,
+      "contact_exposures": 320,
+      "peak_memory_bytes": 2568755200
+    }
+  ],
+  "precision": {
+    "enabled": true,
+    "renderer": true,
+    "visual": false,
+    "dit": false,
+    "dtype": "bfloat16",
+    "allow_tf32": false
+  },
+  "note": "Full KD: renderer + input-gradient frozen DINO/Adapter + target/student DiT + backward + optimizer/EMA. Static cache preparation/validation recorded separately."
+}

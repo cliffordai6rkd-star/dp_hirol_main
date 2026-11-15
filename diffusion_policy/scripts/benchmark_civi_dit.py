@@ -40,7 +40,7 @@ def prepared(ws):
     raw = next(iter(ws.loader(Subset(ds,indices),batch_size=len(indices))))
     batch = move(raw,ws.device)
     tokens, masks, alphas = [], {k:[] for k in ws.options['image_keys']}, []
-    b = ws.cfg.training.microbatch
+    b = ws.cfg.validation.encode_batch
     with torch.no_grad(),fp32_reference():
         for start in range(0,len(indices),b):
             part = slice_batch(batch,start,start+b)

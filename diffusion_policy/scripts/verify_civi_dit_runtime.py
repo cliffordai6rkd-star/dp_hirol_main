@@ -29,8 +29,12 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',required=True);parser.add_argument('--ddp',action='store_true')
     parser.add_argument('--weights',required=True)
+    parser.add_argument('--global-batch',type=int,default=8);parser.add_argument('--microbatch',type=int,default=2)
     args=parser.parse_args()
     cfg=OmegaConf.load('diffusion_policy/config/train_civi_student_dit_minimal.yaml');cfg.output_dir=args.output
+    cfg.training.global_batch=args.global_batch;cfg.training.microbatch=args.microbatch
+    if args.global_batch%8:raise ValueError('Mixed batch must be a multiple of8')
+    cfg.data.phase_counts=[args.global_batch//4,args.global_batch//4,args.global_batch//2]
     distributed=initialize_distributed(cfg.training)
     ws=TrainCiviStudentDiTWorkspace(cfg,args.output,distributed)
     batch,indices,datasets=prepared(ws)

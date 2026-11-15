@@ -1,0 +1,60 @@
+{
+  "profiles": [
+    {
+      "step": 1,
+      "data_wait_seconds": 0.21894083404913545,
+      "h2d": 5.448991775512695,
+      "renderer": 548.295524597168,
+      "student_visual": 3687.8253288269043,
+      "teacher_dit": 63.58659267425537,
+      "student_dit": 71.85062217712402,
+      "backward": 1052.7557830810547,
+      "optimizer_ema": 74.68720245361328
+    },
+    {
+      "step": 2,
+      "data_wait_seconds": 1.132087102974765,
+      "h2d": 5.420479774475098,
+      "renderer": 229.6294708251953,
+      "student_visual": 171.0849609375,
+      "teacher_dit": 49.696767807006836,
+      "student_dit": 66.92047882080078,
+      "backward": 676.7410888671875,
+      "optimizer_ema": 12.55247974395752
+    },
+    {
+      "step": 3,
+      "data_wait_seconds": 0.5646470480132848,
+      "h2d": 5.963935852050781,
+      "renderer": 241.03392028808594,
+      "student_visual": 172.30239868164062,
+      "teacher_dit": 55.33228874206543,
+      "student_dit": 64.98918437957764,
+      "backward": 680.5210876464844,
+      "optimizer_ema": 12.950400352478027
+    }
+  ],
+  "units": "CUDA components: ms; data wait: seconds",
+  "history": [
+    {
+      "step": 1,
+      "epoch": 0.0035971223021582736,
+      "denoiser_kd": 0.1803157925605774,
+      "gradient_norm": 6.731258392333984,
+      "step_seconds": 5.623917956952937,
+      "data_wait_seconds": 0.21894083404913545,
+      "samples_seen": 64,
+      "contact_exposures": 32,
+      "peak_memory_bytes": 8573812736
+    }
+  ],
+  "precision": {
+    "enabled": true,
+    "renderer": true,
+    "visual": false,
+    "dit": false,
+    "dtype": "bfloat16",
+    "allow_tf32": false
+  },
+  "note": "Full KD: renderer + input-gradient frozen DINO/Adapter + target/student DiT + backward + optimizer/EMA. Static cache preparation/validation recorded separately."
+}

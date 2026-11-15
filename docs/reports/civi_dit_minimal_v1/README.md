@@ -67,3 +67,64 @@ implementation guide.
 Before the full-data smoke:10 actual GPU optimizer calls charged:2 benchmark,
 4 first replay,4 deterministic replay. The smoke and any further benchmark
 updates share the total task cap100 and original exploration cap20000.
+
+## Completed full-data80-step implementation smoke
+
+Two idle GPUs on the four-card server completed80 updates with full1893-window
+FP32 validation and native8-step action sampling at0 and80. All56 training
+episodes remain available to the Mixed phase/episode queue;80 updates are only
+640 sampled training exposures, not an entire training pass. No frozen parameter
+changed. `latest.pt` (58MB), `initial.pt`, `best.pt` and `civi_rgb.pt` (18MB) are
+preserved remotely under `data/diagnostics/civi_dit_minimal_v1/smoke80`.
+
+Internal episode macro Contact denoiser KD:0.107724→0.112807 (worse4.72%).
+Contact complete sampled action MSE:0.00143092→0.00132827 (better7.17%).
+Precontact KD:0.198463→0.193181. Free KD:0.171078→0.171020, with nonzero actual
+visual response after rendering. These measures disagree, so the smoke is
+**not evidence that distillation is effective**. The selection criterion stays
+internal Contact KD; no loss/architecture change was made to chase the result.
+Retained episodes5/26 are reported separately and never select the model.
+
+The early smoke summary's `rgb_rms` was a mean of sample RMS values. Per-sample
+energy/MSE is preserved; formal reporting now computes sqrt(mean RGB energy)
+within each episode, followed by an explicitly episode-macro RMS. `rgb_linf`
+now reports the maximum rather than a mean of sample maxima. These reporting
+corrections do not change gradients or model selection.
+
+Real full-step DDP profile after compilation warmup: Renderer~108–125ms,
+student FP32 visual~25–27ms, teacher DiT~29–59ms, student DiT~32–38ms,
+backward~203–207ms, optimizer/EMA~8–12ms. Typical end-to-end global8 step
+~0.55–0.70s, including~0.02–0.07s data wait (~11–15 global samples/s).
+First step included~23.4s cold compilation; never average that into steady
+throughput without disclosure. Per-rank allocated peak~2.57GB.
+
+## User-authorized batch64/100-epoch formal run
+
+After the bounded engineering smoke, the user explicitly requested100 epochs,
+early stopping patience5, then global batch64 on dual24GB devices. A separate
+formal budget (max27800 updates) is used; old exploration counts are not reset
+or extended. Nominal epoch=ceil17740/64=278 updates. Mixed F16/P16/C32,
+per-rank Renderer microbatch8, accumulation4. FP32 visual encode batch remains2
+across all Renderer microbatch alternatives and reference evaluation.
+
+Zero-update same64-example benchmark, visual encodeB2:
+
+| Renderer microbatch | median full64 backward seconds (single GPU) | peak GB |
+|---|---:|---:|
+|2|7.923|2.77|
+|4|4.583|4.76|
+|8|2.953|8.69|
+
+FP32-reduced KD losses agree to~3e-8 in this initial-state trial. No optimizer
+updates were spent on batch sizing. These timings include a full64-example
+backward on one card; they are not a claim of dual-card end-to-end speed.
+The chosen microbatch8 leaves margin within24GB. No LR scaling is applied.
+
+Batch64/micro8 two-GPU4-update smoke also completed. Its validation was explicitly
+truncated to16 windows for integration checks and did not select a best model;
+it is not substituted for the full1893-window0/80 evaluations. Engineering total
+is94 real optimizer calls (2+4+4+80+4), below100. The batch64 DDP-versus-single
+check used zero additional optimizer calls; exact gradient numbers are in
+`ddp2_b64.json`. Focused suite after budget/epoch/chunking tests:33 passed.
+
+![Full-data smoke curve](smoke80_learning_curves.png)

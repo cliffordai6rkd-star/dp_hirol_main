@@ -1,0 +1,44 @@
+[
+  {
+    "microbatch": 2,
+    "global_batch": 64,
+    "fixed_visual_encode_batch": 2,
+    "seconds": [
+      7.922615914023481,
+      7.370821463991888,
+      7.936926049995236
+    ],
+    "median_seconds": 7.922616004943848,
+    "loss": 0.24360667169094086,
+    "peak_memory_bytes": 2772410880,
+    "optimizer_updates": 0
+  },
+  {
+    "microbatch": 4,
+    "global_batch": 64,
+    "fixed_visual_encode_batch": 2,
+    "seconds": [
+      4.583440266083926,
+      4.598266714019701,
+      4.557086181943305
+    ],
+    "median_seconds": 4.58344030380249,
+    "loss": 0.24360664188861847,
+    "peak_memory_bytes": 4755404800,
+    "optimizer_updates": 0
+  },
+  {
+    "microbatch": 8,
+    "global_batch": 64,
+    "fixed_visual_encode_batch": 2,
+    "seconds": [
+      2.950727555085905,
+      2.953403173945844,
+      2.9565626579569653
+    ],
+    "median_seconds": 2.9534032344818115,
+    "loss": 0.24360665678977966,
+    "peak_memory_bytes": 8692785664,
+    "optimizer_updates": 0
+  }
+]

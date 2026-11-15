@@ -73,3 +73,53 @@ class UpdateBudget:
             write_json(state_path, state); write_json(self.path, ledger)
             with (self.run_dir/'updates.jsonl').open('a') as stream:
                 stream.write(json.dumps(dict(step=step, task_update=ledger['used'], sample_indices=samples))+'\n')
+
+
+class TrainingBudget:
+    """Explicitly authorized new objective, separate from old exploration.
+
+    Does not change historical20k limits/counts. The recorded authorization and
+    maximum are immutable across resume; every optimizer call is journalled.
+    """
+    def __init__(self, root, task_id, limit, run_dir, authorization):
+        self.root,self.task,self.limit = Path(root),task_id,int(limit)
+        self.run_dir = Path(run_dir)
+        if not authorization or self.limit <= 0:
+            raise ValueError('Formal training requires an explicit authorization and positive cap')
+        self.root.mkdir(parents=True,exist_ok=True)
+        self.run_dir.mkdir(parents=True,exist_ok=True)
+        self.path = self.root/(task_id+'_budget.json')
+        self.lock = (self.root/(task_id+'.lock')).open('a+')
+        with self:
+            if self.path.exists():
+                state = json.loads(self.path.read_text())
+                if state['limit'] != self.limit or state['authorization'] != authorization:
+                    raise ValueError('Formal training budget/authorization changed on resume')
+            else:
+                write_json(self.path,dict(task=task_id,scope='formal_new_objective',limit=self.limit,
+                    authorization=authorization,used=0,runs={},historical_exploration_included=False))
+
+    def __enter__(self):
+        fcntl.flock(self.lock,fcntl.LOCK_EX);return self
+
+    def __exit__(self,*args):
+        fcntl.flock(self.lock,fcntl.LOCK_UN)
+
+    def charge(self, step, samples):
+        with self:
+            state=json.loads(self.path.read_text())
+            if state['used'] >= self.limit:
+                raise RuntimeError('Authorized formal training budget reached')
+            state['used'] += 1
+            state['runs'][str(self.run_dir)] = state['runs'].get(str(self.run_dir),0)+1
+            write_json(self.path,state)
+            with (self.run_dir/'updates.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(step=step,budget_update=state['used'],sample_indices=samples))+'\n')
+
+
+def create_budget(cfg, run_dir):
+    if cfg.get('scope','exploration') == 'formal':
+        return TrainingBudget(cfg.ledger_root,cfg.task_id,cfg.maximum_new_updates,run_dir,cfg.authorization)
+    if cfg.get('scope','exploration') != 'exploration':
+        raise ValueError('Unknown budget scope')
+    return UpdateBudget(cfg.ledger_root,cfg.task_id,cfg.maximum_new_updates,run_dir)

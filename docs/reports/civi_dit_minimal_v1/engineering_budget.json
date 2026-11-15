@@ -1,0 +1,12 @@
+{
+  "task": "civi_dit_minimal_v1",
+  "limit": 100,
+  "used": 94,
+  "runs": {
+    "data/diagnostics/civi_dit_minimal_v1/benchmark": 2,
+    "data/diagnostics/civi_dit_minimal_v1/correctness": 4,
+    "data/diagnostics/civi_dit_minimal_v1/correctness_deterministic": 4,
+    "/home/djhpc/code/dp_hirol_main/data/diagnostics/civi_dit_minimal_v1/source/data/diagnostics/civi_dit_minimal_v1/smoke80": 80,
+    "/home/djhpc/code/dp_hirol_main/data/diagnostics/civi_dit_minimal_v1/source_batch64/data/diagnostics/civi_dit_minimal_v1/smoke_b64_4": 4
+  }
+}

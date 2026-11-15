@@ -1,0 +1,7 @@
+{
+  "status": "completed",
+  "step": 4,
+  "epoch": 0.014388489208633094,
+  "stop_reason": "max_optimizer_steps",
+  "best": {}
+}
