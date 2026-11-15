@@ -1,0 +1,27 @@
+name: response_conditioned_rgb
+source_commit: dc0c362
+seed: 42
+teacher_step: 70750
+teacher_sha256: e030fcec4f36efc71d0b069dcd862695cbae608bac04d3b31736bab8ada8c87a
+predictor_sha256: e6c5b5ed1488af77ee03567b041d8d907a260fe2d614ebcbe7e46eee4cf31417
+decoder_initial_sha256: d5fba6c1494c3b853e83882fa259a4dba737d3c08209b180c7ab82eca0cbe244
+selection_episodes: [38, 44, 53, 60]
+external_episodes: [5, 26]
+epsilon: 0.1
+workers: 8
+oracle:
+  steps: 300
+  batch_size: 2
+  lr: 0.003
+  samples_per_episode: 2
+decoder:
+  steps: 1000
+  batch_size: 8
+  phase_mix: [2, 2, 4]
+  microbatch: 4
+  validation_batch: 16
+  validate_every: 200
+  lr: 0.0002
+  weight_decay: 0.0001
+  free_weight: 1.0
+  gradient_clip: 1.0
