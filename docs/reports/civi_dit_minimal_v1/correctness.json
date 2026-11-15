@@ -1,0 +1,13 @@
+{
+  "physical_zero": {
+    "alpha_mean": 0.039410099387168884,
+    "rgb_rms": 0.0003238074423279613
+  },
+  "alpha0_exact_identity": true,
+  "rgb_gradient_norm": 1.3941081762313843,
+  "resume_parameter_differences": {},
+  "strict_resume_same_next_update": true,
+  "actual_optimizer_calls": 4,
+  "export_exact": true,
+  "deployment_parameter_count": 4495375
+}

@@ -1,0 +1,98 @@
+{
+  "train": {
+    "samples": 17740,
+    "episodes": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      39,
+      40,
+      41,
+      42,
+      43,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      61
+    ],
+    "phase_counts": [
+      13419,
+      740,
+      3581
+    ],
+    "indices_sha256": "b356a003c32b7e5b9d3d36d7c68cac54d28ee1180f742b375e2c34c18aecaadb"
+  },
+  "validation": {
+    "samples": 1893,
+    "episodes": [
+      5,
+      26,
+      38,
+      44,
+      53,
+      60
+    ],
+    "phase_counts": [
+      1317,
+      108,
+      468
+    ],
+    "indices_sha256": "886365d6f3ff729003eb7cdae274c9b0391bfe5ada524e93e17feff6c7072ff3"
+  },
+  "rgb": {
+    "dtype": "uint8",
+    "decoder": "TorchCodec CUDA",
+    "cameras": [
+      "side",
+      "wrist"
+    ],
+    "hashes": {
+      "side": "10cac3885ad339f44ece5c4305a58f37d4bf5ebc3db2c7c4c3c1432f704dcf1f",
+      "wrist": "f98e05373676742cc027528e2e01915a7994de93bc1f75247bccc514565e5ef2"
+    }
+  }
+}

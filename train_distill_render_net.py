@@ -34,7 +34,9 @@ def main(cfg):
                     if isinstance(handler, logging.FileHandler):
                         logging.getLogger().removeHandler(handler)
                         handler.close()
-        TrainDistillRenderNetWorkspace(
+        workspace_cls = hydra.utils.get_class(cfg.get(
+            "_target_", "diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace"))
+        workspace_cls(
             cfg, output_dir=shared_output_dir(distributed), distributed=distributed,
         ).run()
     finally:

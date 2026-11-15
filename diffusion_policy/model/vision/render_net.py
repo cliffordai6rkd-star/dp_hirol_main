@@ -520,7 +520,7 @@ class RenderNet(nn.Module):
                  spatial_modulation=None, backbone=None, architecture_version=None,
                  separate_gate_path=False, transformer=None,
                  condition_prediction=None, condition_backbone=None, context_adapter=None,
-                 dual_path=None):
+                 dual_path=None, rgb_epsilon=None):
         super().__init__()
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints.  The active implementation is the CNN
@@ -569,6 +569,9 @@ class RenderNet(nn.Module):
         if not self.image_keys or len(set(self.image_keys)) != len(self.image_keys):
             raise ValueError("image_keys must be nonempty and unique")
         self.residual_scale = float(residual_scale)
+        self.rgb_epsilon = None if rgb_epsilon is None else float(rgb_epsilon)
+        if self.rgb_epsilon is not None and not 0 < self.rgb_epsilon <= 1:
+            raise ValueError("rgb_epsilon must be in (0, 1]")
         self.image_encoder_name = str(image_encoder)
         self.wrench_encoder_name = str(wrench_encoder)
         self.conv_block = conv_block
@@ -928,7 +931,8 @@ class RenderNet(nn.Module):
 
     def forward(self, images=None, wrench_history=None, *, return_aux=False, use_attention_mask=None,
                 future_contact=None, contact_alpha=None, condition_only=False,
-                return_condition=False, image_context=None):
+                return_condition=False, image_context=None, cached_condition=None,
+                return_rgb_stats=False):
         """Render RGB, or train the student-owned visual adapter through DDP."""
         if image_context is not None:
             if self.context_adapter is None:
@@ -943,8 +947,13 @@ class RenderNet(nn.Module):
         predicted_masks = None
         if self.condition_prediction_enabled:
             frozen = self.training_stage == "rgb" or not torch.is_grad_enabled()
-            with torch.no_grad() if frozen else torch.enable_grad():
-                predicted_masks, condition = self.condition_network(images, wrench_history)
+            if cached_condition is not None:
+                if not frozen:
+                    raise ValueError("Condition caches are only valid for frozen RGB training")
+                predicted_masks, condition = cached_condition
+            else:
+                with torch.no_grad() if frozen else torch.enable_grad():
+                    predicted_masks, condition = self.condition_network(images, wrench_history)
             # Offline labels supervise this network; they never drive rendering.
             contact_alpha = condition["contact_alpha"]
             if condition_only:
@@ -962,7 +971,7 @@ class RenderNet(nn.Module):
             alpha = compute_contact_alpha(future_contact)
         if alpha is not None and alpha.shape != (batch, steps):
             raise ValueError("contact_alpha must have shape [B, To]")
-        rendered, masks = {}, {}
+        rendered, masks, rgb_stats = {}, {}, {}
         for key, image in images.items():
             if key not in self.image_keys:
                 raise KeyError(f"Camera {key!r} is absent from configured image_keys {self.image_keys}")
@@ -1020,6 +1029,28 @@ class RenderNet(nn.Module):
             )
             residual = (raw_residual if self.rendering_mode == "gaussian_glow"
                         else raw_residual.tanh()).reshape_as(image)
+            if self.rgb_epsilon is not None and self.rendering_mode == "residual":
+                # Historical hard parameterization: tanh in the backbone dtype,
+                # then FP32 support, alpha, epsilon bound and RGB range clamp.
+                support = flat_gate.float().reshape(batch, steps, 1, *image.shape[-2:])
+                if alpha is not None:
+                    support = support * alpha.float().reshape(batch, steps, 1, 1, 1)
+                delta = self.residual_scale * residual.float() * support
+                bound = self.rgb_epsilon * support
+                before_bound = delta
+                delta = torch.maximum(-bound, torch.minimum(bound, delta))
+                before_range = image.float() + delta
+                rendered[key] = torch.where(support > 0, before_range.clamp(0, 1), image.float())
+                if return_rgb_stats:
+                    active = (support > 0).expand_as(delta)
+                    rgb_stats[key] = {
+                        'allowed': active.flatten(1).sum(1),
+                        'hard_clipped': ((before_bound.abs() > bound) & active).flatten(1).sum(1),
+                        'range_clipped': (((before_range < 0) | (before_range > 1)) & active).flatten(1).sum(1),
+                    }
+                if use_mask:
+                    masks[key] = mask.reshape(batch, steps, 1, *image.shape[-2:])
+                continue
             if use_mask:
                 mask = mask.reshape(batch, steps, 1, *image.shape[-2:])
                 masks[key] = mask
@@ -1043,6 +1074,8 @@ class RenderNet(nn.Module):
                 rendered[key] = (image + self.residual_scale * image_alpha * residual).clamp(0, 1)
             if alpha is not None:
                 rendered[key] = torch.where(image_alpha > 0, rendered[key], image)
+        if return_rgb_stats:
+            return rendered, rgb_stats
         if return_condition:
             return rendered, masks, condition
         return (rendered, masks) if return_aux else rendered

@@ -1,0 +1,96 @@
+{
+  "identity": {
+    "version": 1,
+    "architecture": "civi_direct_tau_rgb_dit_v1",
+    "split": "validation",
+    "dependency": {
+      "teacher_file": "33d59938df0092a010a37d20076b1512c6a284f0dd0197460b6f94a8b9d266fa",
+      "teacher_state": "2ea7da45c0fe179994c610e8742fbf9582a6e6247dab8c5469b71b00714e76bd",
+      "adapter": "118fefc3905af5ca50fb11abb2ef3b8e92e223b258f7640ee4c68c162e8b558a",
+      "condition": "246214c6671b58c652be5f8a9042f7f7cca66b13fcc0660a3893404d1e07603b",
+      "normalizer": "f8101fe8f1d8a946eef3d7ff874eb681e58da1f1f43467c77ed8017ac6aefa9f",
+      "preprocessing": {
+        "version": 5,
+        "precontact_seconds": 0.5,
+        "future_contact_mode": "legacy_rollout",
+        "n_obs_steps": 2,
+        "wrench_key": "tau_ext",
+        "phase_wrench_key": "tau_ext",
+        "future_phase_wrench_key": null,
+        "contact_detector_type": "hysteresis",
+        "contact_detector": {
+          "force_dims": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "history_reducer": "max",
+          "norm": "l1",
+          "free_threshold": 12.5,
+          "contact_threshold": 12.5,
+          "enter_frames": 5,
+          "exit_frames": 5
+        },
+        "input_gate": {
+          "threshold": 0.0,
+          "enabled": false,
+          "norm": "l1"
+        }
+      }
+    },
+    "indices": {
+      "samples": 1893,
+      "episodes": [
+        5,
+        26,
+        38,
+        44,
+        53,
+        60
+      ],
+      "phase_counts": [
+        1317,
+        108,
+        468
+      ],
+      "indices_sha256": "886365d6f3ff729003eb7cdae274c9b0391bfe5ada524e93e17feff6c7072ff3"
+    },
+    "rgb": {
+      "dtype": "uint8",
+      "decoder": "TorchCodec CUDA",
+      "cameras": [
+        "side",
+        "wrist"
+      ],
+      "hashes": {
+        "side": "10cac3885ad339f44ece5c4305a58f37d4bf5ebc3db2c7c4c3c1432f704dcf1f",
+        "wrist": "f98e05373676742cc027528e2e01915a7994de93bc1f75247bccc514565e5ef2"
+      }
+    },
+    "images": "clear uint8/255, no augmentation",
+    "camera_time_layout": "B,To=2,camera=[side,wrist],patch",
+    "encode_batch": 2,
+    "dtype": "float32",
+    "precision": "FP32 (TF32 disabled)",
+    "condition": "FP32 frozen online prediction"
+  },
+  "audits": [
+    {
+      "index": 1892,
+      "context_max_abs": 0.0
+    },
+    {
+      "index": 0,
+      "context_max_abs": 0.0
+    },
+    {
+      "index": 946,
+      "context_max_abs": 0.0
+    }
+  ],
+  "seconds": 75.819137669052
+}
