@@ -22,7 +22,7 @@ services:
       MPLCONFIGDIR: /tmp/matplotlib
       WANDB_MODE: offline
       WANDB_DIR: /workspace/data/wandb
-      DINOV3_MODEL_PATH: /workspace/model/model/dinov3-vitb16-pretrain-lvd1689m
+      CIVI_DATASET_PATH: ${CIVI_DATASET_PATH:-/workspace/data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5}
       NPROC_PER_NODE: ${NPROC_PER_NODE:-}
       TRAIN_GPUS: ${TRAIN_GPUS:-}
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}

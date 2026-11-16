@@ -84,8 +84,9 @@ def test_console_progress_is_throttled_without_losing_step_or_epoch_metrics(monk
         # not four lines. Three validation batches likewise produce one report.
         assert len(train_status) == 2
         assert all("batch=3/4" in message for message in train_status)
-        assert len(val_status) == 3  # Initial evaluation and both epochs.
-        assert all("batch=3/3" in message for message in val_status)
+        assert len(val_status) == 4  # Initial full train/validation evaluation and both epochs.
+        assert "batch=3/4" in val_status[0]
+        assert all("batch=3/3" in message for message in val_status[1:])
         assert output.getvalue() == ""
 
     rows = [json.loads(line) for line in (tmp_path / "run/logs.json.txt").read_text().splitlines()]
@@ -100,7 +101,7 @@ def test_console_progress_is_throttled_without_losing_step_or_epoch_metrics(monk
     assert len([row for row in rows if "val_mse" in row]) == 2
     assert (tmp_path / "run/checkpoints/latest.ckpt").is_file()
     assert (tmp_path / "run/checkpoints/best.ckpt").is_file()
-    assert not (tmp_path / "run/training_metrics.png").exists()
+    assert (tmp_path / "run/training_metrics.png").is_file()
 
 
 @pytest.mark.parametrize("tty", [False, True])

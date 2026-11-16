@@ -30,8 +30,8 @@ from diffusion_policy.common.config_cli import load_config_reference
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DP_CONFIG = "diffusion_policy/config/train_civi_teacher.yaml"
-DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_student.yaml"
+DEFAULT_DP_CONFIG = "diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml"
+DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_board_legacy.yaml"
 
 
 def make_parser():
@@ -47,8 +47,8 @@ def make_parser():
     teacher.add_argument("--teacher-run", help="Teacher run directory containing checkpoints/ (distill mode)")
     parser.add_argument("--wait-for-teacher-pid", type=int,
                         help="Wait for this running teacher before selecting its checkpoint (distill + --teacher-run)")
-    parser.add_argument("--teacher-selection", choices=("auto", "best", "latest"), default="auto",
-                        help="auto selects best.ckpt if present, otherwise latest.ckpt")
+    parser.add_argument("--teacher-selection", choices=("auto", "best", "latest"), default="latest",
+                        help="latest uses the final teacher (default); auto prefers best.ckpt")
     parser.add_argument("--output-dir", help="New pipeline directory; stages write teacher/ and student/ beneath it")
     parser.add_argument("--gpus", help="CUDA_VISIBLE_DEVICES, e.g. 0 or 0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=1, help="Number of local GPU workers per stage")

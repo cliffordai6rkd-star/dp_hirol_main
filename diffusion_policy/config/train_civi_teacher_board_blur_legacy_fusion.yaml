@@ -1,0 +1,22 @@
+# November 7 full-fusion bypass, with the confirmed board inputs and blur curriculum.
+defaults:
+  - train_civi_teacher_curriculum_b64_150k
+  - _self_
+
+name: train_civi_teacher_board_blur_legacy_fusion
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_board_blur_legacy_fusion/teacher
+
+policy:
+  # Both CA layers and their FFNs run at full strength on precontact/contact.
+  # Free observations bypass the entire branch before the final context_norm.
+  fusion_gate_mode: phase_binary
+  cross_attn_layers: 2
+
+dataloader:
+  batch_size: 32
+
+val_dataloader:
+  batch_size: 32
+
+logging:
+  tags: [board, 25hz, tau-ext-history, phase-binary, full-fusion-gate, pixel-blur, 150k]

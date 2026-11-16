@@ -1,7 +1,0 @@
-defaults:
-  - teacher_fusion_ablation_base
-  - _self_
-name: teacher_fusion_ablation_hybrid
-policy:
-  obs_encoder:
-    fusion_mode: hybrid

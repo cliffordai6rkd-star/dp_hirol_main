@@ -35,28 +35,3 @@ def test():
         'obs': (100,10),
         'action': (100,2)
     })
-
-
-def test_real():
-    import os
-    dist_group = zarr.open(
-        os.path.expanduser('~/dev/diffusion_policy/data/pusht/pusht_cchi_v2.zarr'), 'r')
-
-    buff = ReplayBuffer.create_empty_numpy()
-    key, group = next(iter(dist_group.items()))
-    for key, group in dist_group.items():
-        buff.add_episode(group)
-
-    # out_path = os.path.expanduser('~/dev/diffusion_policy/data/pusht_cchi2_v2_replay.zarr')
-    out_path = os.path.expanduser('~/dev/diffusion_policy/data/test.zarr')
-    out_store = zarr.DirectoryStore(out_path)
-    buff.save_to_store(out_store)
-
-    buff = ReplayBuffer.copy_from_path(out_path, store=zarr.MemoryStore())
-    buff.pop_episode()
-
-
-def test_pop():
-    buff = ReplayBuffer.create_from_path(
-        '/home/chengchi/dev/diffusion_policy/data/pusht_cchi_v3_replay.zarr',
-        mode='rw')

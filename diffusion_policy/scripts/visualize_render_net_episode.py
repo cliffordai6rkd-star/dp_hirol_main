@@ -30,8 +30,9 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
 
+from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.vision.render_net import build_render_net
-from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor
+from diffusion_policy.model.vision.wrench_preprocessing import WrenchPreprocessor, fusion_gate_from_phase
 from diffusion_policy.scripts import visualize_cross_attention_episode as common
 from diffusion_policy.scripts import visualize_image_query_cross_attention_episode as rendering
 from diffusion_policy.workspace.train_force_aware_diffusion_workspace import resolve_amp_dtype
@@ -130,11 +131,20 @@ def render_observations(model, preprocessor, obs, image_keys, n_obs_steps, *, us
                          if predict_phase else obs)
     wrench, contact, future_contact = preprocessor(preprocessing_obs, return_future_contact=True)
     contact_gate = future_contact if future_contact is not None else contact
+    causal_phase = getattr(model, "phase_predictor", None) is not None
+    if causal_phase:
+        contact_gate = render_alpha = None
+    elif getattr(preprocessor, "fusion_gate_mode", "attention_alpha") == "phase_binary":
+        contact_gate = fusion_gate_from_phase(obs, n_obs_steps)
+        render_alpha = contact_gate.float()
+    else:
+        render_alpha = (obs["contact_alpha"][:, :n_obs_steps]
+                        if not predict_phase and "contact_alpha" in obs else None)
     return images, model(
         images, wrench, future_contact=contact_gate,
-        contact_alpha=(obs["contact_alpha"][:, :n_obs_steps]
-                       if not predict_phase and "contact_alpha" in obs else None),
+        contact_alpha=render_alpha,
         use_attention_mask=use_attention_mask,
+        **({"phase_inputs": obs.get("phase_inputs")} if causal_phase else {}),
     )
 
 
@@ -254,8 +264,10 @@ def run(args):
         stats = {key: {"mae": [], "max_abs_delta": []} for key in camera_keys}
         for index, (anchor, sample_index) in enumerate(selected):
             sample = dataset[sample_index]
-            obs = {key: value.unsqueeze(0).to(device) for key, value in sample["obs"].items()
-                   if key in image_keys or key in preprocessor.required_keys}
+            obs = dict_apply({key: value for key, value in sample["obs"].items()
+                              if key in image_keys or key in preprocessor.required_keys
+                              or key in {"phase_inputs", "contact_phase", "contact_alpha"}},
+                             lambda value: value.unsqueeze(0).to(device))
             autocast = torch.autocast("cuda", dtype=amp_dtype) if amp_enabled else contextlib.nullcontext()
             with torch.inference_mode(), autocast:
                 images, rendered = render_observations(model, preprocessor, obs, image_keys, steps,

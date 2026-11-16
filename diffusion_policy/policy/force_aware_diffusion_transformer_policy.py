@@ -25,7 +25,7 @@ from diffusion_policy.model.vision.contact_curriculum import (
 from diffusion_policy.model.vision.force_aware_obs_encoder import ForceAwareObsEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    fill_future_wrench_prefix, preprocess_wrench, validate_future_contact_mode,
+    fill_future_wrench_prefix, fusion_gate_from_phase, preprocess_wrench, validate_future_contact_mode,
     validate_precontact_seconds,
 )
 
@@ -91,12 +91,16 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         cross_attn_query_residual: bool = True,
         future_contact_mode: str = "legacy_rollout",
         precontact_seconds: Optional[float] = None,
+        fusion_gate_mode: str = "attention_alpha",
         action_representation: str = "ee_pose",
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
         self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
+        if fusion_gate_mode not in {"attention_alpha", "phase_binary"}:
+            raise ValueError("fusion_gate_mode must be 'attention_alpha' or 'phase_binary'")
+        self.fusion_gate_mode = str(fusion_gate_mode)
         if self.precontact_seconds is not None and future_phase_wrench_key is not None:
             raise ValueError("Pre-contact gating requires causal wrench history")
         obs_shape_meta = shape_meta.get("obs", {})
@@ -224,6 +228,11 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
+        if self.fusion_gate_mode == "phase_binary" and (
+            getattr(obs_encoder, "cross_attn_query", None) != "image"
+            or getattr(obs_encoder, "cross_attn_layers", 0) <= 0
+        ):
+            raise ValueError("phase_binary fusion requires image-query cross-attention")
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
             raise ValueError(
                 f"obs_encoder cameras={list(encoder_image_keys)} do not match "
@@ -541,7 +550,9 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
         fusion_kwargs = {}
-        if (
+        if self.fusion_gate_mode == "phase_binary":
+            fusion_kwargs["fusion_gate"] = fusion_gate_from_phase(obs_dict, self.n_obs_steps)
+        elif (
             getattr(self.obs_encoder, "cross_attn_query", None) == "image"
             and getattr(self.obs_encoder, "cross_attn_layers", 0) > 0
         ):

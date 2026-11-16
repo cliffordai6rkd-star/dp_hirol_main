@@ -1,5 +1,0 @@
-defaults:
-  - student_dual_path_base
-  - _self_
-name: student_dual_path_a_baseline
-

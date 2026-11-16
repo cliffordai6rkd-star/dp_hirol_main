@@ -185,6 +185,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         wrench_filter: Optional[Mapping] = None,
         contact_label_config: Optional[Mapping] = None,
         phase_label_mode: str = "current_wrench",
+        phase_predictor: Optional[Mapping] = None,
     ):
         super().__init__()
         if window_sampling_strategy not in {"idx", "timestamp"}:
@@ -671,6 +672,48 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         self.indices = self._filter_indices_for_windowed_features(self.indices)
         self.phase_labels = self._build_phase_labels(self.indices)
         self.set_contact_label_config(contact_label_config)
+        self.phase_predictor_config = dict(phase_predictor or {})
+        self.phase_state_data = None
+        if self.phase_predictor_config.get("enabled", False):
+            keys = self.phase_predictor_config.get("state_source_keys", [
+                "observation.joint", "observation.velocity", "observation.tau_ext_unthresholded",
+            ])
+            self.phase_state_data = self._concat_columns(keys, dtype=np.float32)
+            if self.phase_state_data.shape != (self.dataset_length, 21) or not np.isfinite(self.phase_state_data).all():
+                raise ValueError("Phase predictor requires finite joint/velocity/torque columns [N,21]")
+
+    def phase_training_states(self):
+        """Fit only measured states from training episodes, never validation."""
+        if self.phase_state_data is None:
+            raise ValueError("Phase prediction is not configured")
+        rows = np.concatenate([np.arange(r.start, r.stop) for i, r in enumerate(self.episode_ranges)
+                               if self.train_mask[i]])
+        return self.phase_state_data[rows]
+
+    def _phase_history_indices(self, obs_indices):
+        history = int(self.phase_predictor_config.get("history_steps", 16))
+        offsets = np.asarray(self.phase_predictor_config.get("image_offsets", [-12, -8, -4, 0]))
+        if history < 1 or np.any(offsets > 0) or np.any(offsets < 1 - history):
+            raise ValueError("Phase histories must use current/past observations only")
+        episodes = np.searchsorted(self.episode_ends, obs_indices, side="right")
+        starts = np.asarray([self.episode_ranges[i].start for i in episodes])[:, None]
+        state_rows = np.maximum(obs_indices[:, None] + np.arange(1 - history, 1), starts)
+        image_rows = np.maximum(obs_indices[:, None] + offsets[None, :], starts)
+        return state_rows, image_rows
+
+    def _phase_inputs(self, obs_indices, frame_cache):
+        state_rows, image_rows = self._phase_history_indices(obs_indices)
+        images = {}
+        for key in self.rgb_keys:
+            if key in self.image_data:
+                pixels = read_image_result(self.image_data, key, image_rows.reshape(-1))
+            else:
+                pixels = np.stack([self._load_frame_feature(
+                    frame_idx=int(row), feature_name=self.image_feature_map[key],
+                    expected_shape=tuple(self.shape_meta["obs"][key]["shape"]), frame_cache=frame_cache,
+                ) for row in image_rows.reshape(-1)])
+            images[key] = np.asarray(pixels).reshape(*image_rows.shape, *pixels.shape[1:])
+        return {"state": self.phase_state_data[state_rows].copy(), "images": images}
 
     def set_contact_label_config(self, config):
         """Use the teacher's exact contact configuration for CPU alpha labels."""
@@ -1432,6 +1475,9 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         for key in self.lowdim_keys:
             values = self.windowed_lowdim_data.get(key, self.lowdim_data.get(key))
             obs_dict[key] = values[obs_indices, ...].astype(np.float32, copy=False)
+
+        if getattr(self, "phase_state_data", None) is not None:
+            obs_dict["phase_inputs"] = self._phase_inputs(obs_indices, frame_cache)
 
         if getattr(self, "contact_label_preprocessor", None) is not None:
             obs_dict["contact_alpha"] = self._sample_contact_alpha(obs_indices, obs_dict)

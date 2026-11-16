@@ -257,7 +257,7 @@ def test_invalid_fusion_options_fail_explicitly(kwargs, message):
 def test_training_config_accepts_fusion_overrides():
     root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
     with initialize_config_dir(config_dir=str(root), version_base=None):
-        cfg = compose(config_name="baseline_train/train_dp_self_crossattn_insert_usb", overrides=[
+        cfg = compose(config_name="train_civi_teacher", overrides=[
             "policy.pre_cross_self_attn_layers=0", "policy.cross_attn_layers=0",
             "policy.cross_attn_query=image", "policy.force_temporal_encoder=lstm",
             "policy.force_encoder_layers=3", "policy.cross_attn_query_residual=false",
@@ -269,20 +269,10 @@ def test_training_config_accepts_fusion_overrides():
     assert cfg.policy.cross_attn_query_residual is False
 
 
-@pytest.mark.parametrize("name", [
-    "train_dp_image_query_lstm_insert_usb",
-    "train_dp_image_query_lstm_contact_blur_insert_usb",
-])
-def test_image_query_training_configs_omit_visual_query_residual(name):
-    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
-    with initialize_config_dir(config_dir=str(root), version_base=None):
-        cfg = compose(config_name="alation_study/" + name)
-    assert cfg.policy.cross_attn_query == "image"
-    assert cfg.policy.cross_attn_query_residual is False
 
 
 @pytest.mark.parametrize("sa_layers,ca_layers", [(0, 1), (1, 0)])
-@pytest.mark.parametrize("scope", ["all", "full_context", "current_observation"])
+@pytest.mark.parametrize("scope", ["full_context", "current_observation"])
 def test_rgb_blur_reaches_both_fusion_architectures_and_clears_for_inference(
     monkeypatch, sa_layers, ca_layers, scope,
 ):
@@ -352,33 +342,3 @@ def test_spatial_heatmap_rejects_incompatible_cross_attention(monkeypatch, query
     monkeypatch.setattr(visualization.hydra.utils, "instantiate", lambda cfg: policy)
     with pytest.raises(ValueError, match=message):
         visualization.instantiate_policy({}, SimpleNamespace(policy={}), torch.device("cpu"))
-
-
-def test_local_highres_wrist_branch_preserves_patch_grid_and_backpropagates():
-    torch.manual_seed(7)
-    encoder = make_encoder(
-        cross_attn_query="image",
-        local_highres={
-            "enabled": True,
-            "camera_key": "wrist",
-            "crop": [0.0, 0.0, 1.0, 1.0],
-            "resize": [32, 48],
-            "channels": [4, 8],
-            "gate_init": -1.0,
-        },
-    ).train()
-    obs = observations()
-    context = encoder(
-        images={key: obs[key] for key in IMAGE_SHAPES},
-        wrench_history=obs["wrench_ext"],
-    )
-    # DINO still contributes 2x2 side + 2x3 wrist patches per observation.
-    assert context.shape == (2, 2 * 10, 16)
-    assert encoder.context_tokens_per_observation == 10
-    (context.square().mean()).backward()
-    assert encoder.local_highres is not None
-    assert encoder.local_highres.projection.weight.grad is not None
-    assert encoder.local_highres.projection.weight.grad.abs().sum() > 0
-    assert encoder.local_highres.gate.grad is not None
-    assert encoder.local_highres.gate.grad.abs().sum() > 0
-    assert all(parameter.grad is None for parameter in encoder.backbone.parameters())

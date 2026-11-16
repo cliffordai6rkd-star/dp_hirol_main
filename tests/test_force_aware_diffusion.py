@@ -398,7 +398,7 @@ def test_factr_blur_scheduler_preserves_explicit_phase_boundaries():
 
 
 def test_factr_blur_scheduler_scales_with_total_steps():
-    scheduler = FactrBlurScheduler(total_steps=100_000)
+    scheduler = FactrBlurScheduler(total_steps=100_000, start_fraction=0.1, end_fraction=0.8)
     assert scheduler.sigma(0) == pytest.approx(5.0)
     assert scheduler.sigma(10_000) == pytest.approx(5.0)
     assert scheduler.sigma(45_000) == pytest.approx(2.5)
@@ -409,7 +409,7 @@ def test_factr_blur_scheduler_scales_with_total_steps():
 
 
 def test_factr_blur_scheduler_waits_for_runtime_training_budget():
-    scheduler = FactrBlurScheduler()
+    scheduler = FactrBlurScheduler(start_fraction=0.1, end_fraction=0.8)
     assert scheduler.auto_total_steps
     with pytest.raises(RuntimeError, match="optimizer-step budget"):
         scheduler.sigma(0)

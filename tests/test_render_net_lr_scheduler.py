@@ -41,7 +41,19 @@ def make_workspace(monkeypatch, tmp_path):
         config.training.resume_from = str(resume) if resume is not None else None
         workspace = distill.TrainDistillRenderNetWorkspace(config, str(tmp_path / name))
         validation_losses = iter(losses)
-        monkeypatch.setattr(workspace, "_validate", lambda loader: next(validation_losses))
+        initial_training_evaluated = resume is not None
+
+        def validate(loader):
+            nonlocal initial_training_evaluated
+            workspace.validation_metrics = {}
+            workspace.validation_samples = len(loader.dataset)
+            workspace.validation_seconds = 0.0
+            if not initial_training_evaluated:
+                initial_training_evaluated = True
+                return 1.0
+            return next(validation_losses)
+
+        monkeypatch.setattr(workspace, "_validate", validate)
         return workspace
 
     return make

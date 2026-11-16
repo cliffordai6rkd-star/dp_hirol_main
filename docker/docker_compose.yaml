@@ -1,4 +1,4 @@
-name: diffusion-policy
+name: civi
 
 services:
   trainer:
@@ -9,7 +9,7 @@ services:
         CUDA_VERSION: ${CUDA_VERSION:-12.8.1}
         APT_MIRROR: ${APT_MIRROR:-archive.ubuntu.com}
     image: diffusion-policy:train
-    container_name: ${CONTAINER_NAME:-diffusion-policy-trainer}
+    container_name: ${CONTAINER_NAME:-civi-trainer}
     working_dir: /workspace
     # The image contains the source tree and Python runtime.  Override
     # TRAIN_COMMAND in .env or on the command line for another experiment.
@@ -32,17 +32,10 @@ services:
       MPLCONFIGDIR: /tmp/matplotlib
       HF_HOME: /workspace/.cache/huggingface
       # Paths inside the container. Host paths are configured below in volumes.
-      DATASET_PATH: ${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
-      DP_DATASET_PATH: ${DP_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
-      DP_BASELINE_DATASET_PATH: ${DP_BASELINE_DATASET_PATH:-/workspace/data/insert_usb_50hz_lerobot_v3}
-      DINOV3_MODEL_PATH: ${DINOV3_MODEL_PATH:-/workspace/model/model/dinov3-vitb16-pretrain-lvd1689m}
-      # Train a current-wrench teacher, then distill its selected checkpoint.
+      CIVI_DATASET_PATH: ${CIVI_DATASET_PATH:-/workspace/data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5}
+      # Train the teacher, then distill its final checkpoint.
       # Use TRAIN_COMMAND for a different stage or custom Hydra job.
-      TRAIN_COMMAND: >-
-        python train_civi.py
-        --teacher-override task.dataset.dataset_path=${DATASET_PATH:-/workspace/data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3}
-        --teacher-override task.dataset.video_backend=pyav
-        --student-override dataset.video_backend=pyav
+      TRAIN_COMMAND: ${TRAIN_COMMAND:-python train.py}
       NPROC_PER_NODE: ${NPROC_PER_NODE:-}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes:

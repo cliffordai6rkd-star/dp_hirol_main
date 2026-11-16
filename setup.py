@@ -4,7 +4,7 @@ from setuptools import find_namespace_packages, setup
 
 
 ROOT = Path(__file__).resolve().parent
-DESCRIPTION = "Diffusion policies for Nero contact-rich robotic manipulation."
+DESCRIPTION = "CIVI: contact-informed DiT teacher and causal RGB student distillation."
 README_PATH = ROOT / "README.md"
 LONG_DESCRIPTION = (
     README_PATH.read_text(encoding="utf-8")
@@ -23,10 +23,7 @@ CORE_DEPENDENCIES = [
     "opencv-python-headless>=4.9,<4.12",
     "PyYAML>=6.0",
     "matplotlib>=3.7",
-    "mujoco>=3.3,<4",
-    "osqp>=1,<2",
     "pin>=3,<4; platform_system == 'Linux'",
-    "rerun-sdk>=0.26,<0.27",
     "cmeel-tinyxml2>=10,<11; platform_system == 'Linux'",
     "cmeel-urdfdom>=4,<5; platform_system == 'Linux'",
     "numba>=0.66,<0.67",
@@ -74,7 +71,7 @@ EXTRAS["all"] = sorted(
 
 
 setup(
-    name="diffusion-policy",
+    name="civi",
     version="0.2.0",
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,

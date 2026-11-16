@@ -11,8 +11,8 @@ destination="${1:-${HOME}/fdp_training}"
 if [[ "$destination" != /* ]]; then
   destination="$PWD/$destination"
 fi
-if [[ -e "$destination/dp_main" ]]; then
-  echo "目录已存在，请选择新的安装目录: $destination/dp_main" >&2
+if [[ -e "$destination/civi" ]]; then
+  echo "目录已存在，请选择新的安装目录: $destination/civi" >&2
   exit 2
 fi
 for tool in docker tar sha256sum; do
@@ -28,11 +28,12 @@ echo '2/3 导入训练环境镜像'
 cat diffusion-policy-train.tar.part-00 diffusion-policy-train.tar.part-01 \
     diffusion-policy-train.tar.part-02 diffusion-policy-train.tar.part-03 | docker load
 echo '3/3 解压当前源码、训练数据和 DINO 到服务器磁盘'
-tar --no-same-owner -xzf dp_main-current-source-data-model.tar.gz -C "$destination"
-mkdir -p -- "$destination/dp_main/data/cache" "$destination/dp_main/data/outputs" \
-    "$destination/dp_main/.cache/huggingface" "$destination/dp_main/.cache/torch"
+mkdir -p -- "$destination/civi"
+tar --no-same-owner --strip-components=1 -xzf dp_main-current-source-data-model.tar.gz -C "$destination/civi"
+mkdir -p -- "$destination/civi/data/cache" "$destination/civi/data/outputs" \
+    "$destination/civi/.cache/huggingface" "$destination/civi/.cache/torch"
 echo '安装完成，尚未启动正式训练。接下来执行：'
-printf 'cd %q\n' "$destination/dp_main"
+printf 'cd %q\n' "$destination/civi"
 echo 'bash docker/run_portable.sh check'
 echo 'bash docker/run_portable.sh dev'
 echo '然后用 VS Code Remote-SSH 连接服务器，Attach to Running Container，选择 fdp-dev，打开 /workspace。'

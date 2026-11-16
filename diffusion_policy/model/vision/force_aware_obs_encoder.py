@@ -450,6 +450,7 @@ class ForceAwareObsEncoder(nn.Module):
         images: Optional[Mapping[str, torch.Tensor]] = None,
         future_contact: Optional[torch.Tensor] = None,
         contact_alpha: Optional[torch.Tensor] = None,
+        fusion_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if images is not None and image is not None:
             raise ValueError("provide either images or the legacy image argument, not both")
@@ -522,6 +523,13 @@ class ForceAwareObsEncoder(nn.Module):
                 f"wrench history has {history_steps} steps, expected {self.wrench_history_steps}"
             )
 
+        if fusion_gate is not None:
+            if (self.cross_attn_query != "image" or not self.cross_attn_layers):
+                raise ValueError("fusion_gate requires image-query cross-attention")
+            if fusion_gate.dtype != torch.bool or fusion_gate.shape != (batch_size, obs_steps):
+                raise ValueError("fusion_gate must be a bool tensor [B, To]")
+            if contact_alpha is not None or future_contact is not None:
+                raise ValueError("Full fusion gating cannot be combined with attention alpha")
         alpha = contact_alpha
         if future_contact is not None:
             if self.cross_attn_query != "image" or self.cross_attn_layers <= 0:
@@ -575,6 +583,9 @@ class ForceAwareObsEncoder(nn.Module):
         flat_images = torch.cat(camera_patch_tokens, dim=2).reshape(
             batch_size * obs_steps, image_token_count, self.n_emb
         )
+        # Preserve the visual path before all fusion layers. A closed gate
+        # discards both attention and FFN updates, as in the November 7 teacher.
+        visual_context = flat_images
         if self.pre_cross_self_attn_layers:
             # Per observation: [all camera patches, all temporal wrench outputs].
             # Self-attention changes features, preserving token order/length.
@@ -618,5 +629,10 @@ class ForceAwareObsEncoder(nn.Module):
                 if self.camera_attention_mode == "per_camera":
                     self.last_cross_attention_weights_by_camera = self.last_cross_attention_weights
 
+        if fusion_gate is not None:
+            context = torch.where(
+                fusion_gate.to(device=context.device).reshape(-1, 1, 1),
+                context, visual_context,
+            )
         context = context.reshape(batch_size, -1, self.n_emb)
         return self.context_norm(context)

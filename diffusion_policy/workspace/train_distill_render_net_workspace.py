@@ -45,7 +45,7 @@ from diffusion_policy.model.vision.render_net_attention import (
     validate_percentiles, teacher_zero_context_target,
 )
 from diffusion_policy.model.vision.wrench_preprocessing import (
-    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor,
+    WRENCH_PREPROCESSING_VERSION, WrenchPreprocessor, fusion_gate_from_phase,
 )
 from diffusion_policy.scripts.visualize_cross_attention_episode import (
     instantiate_policy, load_checkpoint_payload, patch_grid,
@@ -104,17 +104,27 @@ def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
     # The Dataset alpha is shared with the teacher; the complete future mask
     # also lets render-only callers compute the same continuous blend weight.
     renderer_impl = getattr(render_net, "module", render_net)
+    phase_binary = getattr(teacher, "fusion_gate_mode", "attention_alpha") == "phase_binary"
+    predict_phase = bool(getattr(renderer_impl, "phase_prediction_enabled", False))
+    if phase_binary and not predict_phase:
+        # Binary support is shared with the teacher, including the first
+        # precontact frame whose continuous alpha label is still zero.
+        future_contact = fusion_gate_from_phase(obs, teacher.n_obs_steps).unsqueeze(-1)
     condition = None
     if isinstance(renderer_impl, RenderNet):
-        predict_condition = renderer_impl.condition_prediction_enabled
+        predict_condition = renderer_impl.condition_prediction_enabled or predict_phase
         result = render_net(
             images, wrench, future_contact=future_contact, return_aux=True,
-            contact_alpha=(obs["contact_alpha"][:, :teacher.n_obs_steps]
+            contact_alpha=(future_contact.squeeze(-1).float() if phase_binary and not predict_phase else
+                           obs["contact_alpha"][:, :teacher.n_obs_steps]
                            if not predict_condition and "contact_alpha" in obs else None),
             **({"return_condition": True} if predict_condition else {}),
+            **({"phase_inputs": obs.get("phase_inputs")} if predict_phase else {}),
         )
         if predict_condition:
             rendered, masks, condition = result
+            if predict_phase:
+                future_contact = condition["contact_alpha"].bool().unsqueeze(-1)
         else:
             rendered, masks = result
     else:
@@ -143,6 +153,9 @@ def student_context_tokens(teacher, render_net, obs, *, return_aux=False,
 
 
 class TrainDistillRenderNetWorkspace(BaseWorkspace):
+    phase_total_keys = tuple(f"phase_{name}_{suffix}"
+                             for name in ("free_false_open", "precontact_recall", "contact_recall")
+                             for suffix in ("sum", "count"))
     # Additive statistics, reduced across batches/ranks before normalization.
     contact_total_keys = ("contact_samples", "contact_token_sum", "contact_denoiser_sum",
                           "contact_response_numerator", "contact_response_weight_sum")
@@ -582,6 +595,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         return bool(getattr(getattr(self, "model", None), "condition_prediction_enabled", False))
 
     @property
+    def phase_prediction_enabled(self):
+        return bool(getattr(getattr(self, "model", None), "phase_prediction_enabled", False))
+
+    @property
     def context_adapter_enabled(self):
         return getattr(getattr(self, "model", None), "context_adapter", None) is not None
 
@@ -592,6 +609,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     @property
     def response_noise_floor(self):
         return float(self.distillation_config.get("response_noise_floor", 1e-6))
+
+    def _early_stopping_active(self):
+        start_at_rgb = self.cfg.training.early_stopping.get("start_at_rgb", False)
+        return not start_at_rgb or self.training_stage == "rgb"
 
     @property
     def logging_objective(self):
@@ -949,6 +970,9 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.stage_step = 0
         self.stage_epoch = 0
         self.stage_transition_reason = f"epoch_boundary:{previous}->{desired}"
+        if desired == "rgb" and self.cfg.training.early_stopping.get("start_at_rgb", False):
+            self.early_stopping_best_loss = float("inf")
+            self.epochs_without_improvement = 0
         reset_rgb = False
         if (not self.condition_prediction_enabled and previous == "intensity" and desired == "rgb"
                 and hasattr(self.model, "initialize_rgb_from_gate")):
@@ -1105,10 +1129,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 self.teacher_policy, renderer, obs,
                 return_aux=True, return_contact=True, image_context_encoder=compiled_encoder,
                 use_teacher_ffn=self.use_teacher_ffn,
-                return_condition=self.condition_prediction_enabled,
+                return_condition=self.condition_prediction_enabled or self.phase_prediction_enabled,
             )
             predicted_condition = None
-            if self.condition_prediction_enabled:
+            if self.condition_prediction_enabled or self.phase_prediction_enabled:
                 student_tokens, masks, contact_mask, predicted_condition = student_result
             else:
                 student_tokens, masks, contact_mask = student_result
@@ -1126,7 +1150,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 )
             student_loss = token_mse + self.response_loss_weight * response_mse
             alpha_mse = token_mse.new_zeros(())
-            if predicted_condition is not None and "contact_alpha" in obs:
+            if self.condition_prediction_enabled and predicted_condition is not None and "contact_alpha" in obs:
                 alpha_mse = F.mse_loss(predicted_condition["contact_alpha"].float(),
                                        obs["contact_alpha"][:, :self.teacher_policy.n_obs_steps].float())
             contact_metrics = self._contact_token_metrics(
@@ -1189,6 +1213,20 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     loss = intensity_loss
                 # RGB retains the selected token/DiT objective computed above;
                 # the independently trained condition network stays frozen.
+            phase_metrics = {}
+            if self.phase_prediction_enabled:
+                labels = fusion_gate_from_phase(obs, self.teacher_policy.n_obs_steps).float()
+                logits = predicted_condition["phase_logits"]
+                phase_bce = F.binary_cross_entropy_with_logits(logits, labels)
+                loss = loss + self.model.phase_predictor.loss_weight * phase_bce
+                predicted_open = predicted_condition["contact_alpha"].bool()
+                phase_metrics = {"phase_bce": float(phase_bce.detach()),
+                                 "phase_accuracy": float((predicted_open == labels.bool()).float().mean()),
+                                 "phase_predicted_open_ratio": float(predicted_open.float().mean())}
+                for phase_id, name in ((0, "free_false_open"), (1, "precontact_recall"), (2, "contact_recall")):
+                    selected = obs["contact_phase"][:, :self.teacher_policy.n_obs_steps] == phase_id
+                    phase_metrics[f"phase_{name}_count"] = int(selected.sum())
+                    phase_metrics[f"phase_{name}_sum"] = int((predicted_open & selected).sum())
             self.loss_metrics = {"token_mse": float(token_mse.detach()),
                                  "response_mse": float(response_mse.detach()),
                                  "response_numerator": float(response_numerator.detach()),
@@ -1214,6 +1252,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             self.loss_metrics.update(self._contact_loss_metrics(
                 obs, student_tokens, teacher_tokens, response=response,
             ))
+            self.loss_metrics.update(phase_metrics)
         if self.shape_info is None:
             self.shape_info = {
                 "teacher_token_shape": list(teacher_tokens.shape),
@@ -1310,6 +1349,15 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
     def _token_mse(self, loss):
         # Fallback permits lightweight callers that replace _loss in loop tests.
         return getattr(self, "loss_metrics", {}).get("token_mse", float(loss.detach()))
+
+    @staticmethod
+    def _phase_rates(totals):
+        result = {}
+        for index, name in enumerate(("free_false_open", "precontact_recall", "contact_recall")):
+            numerator, count = totals[index * 2:index * 2 + 2]
+            result[f"phase_{name}"] = numerator / count if count else 0.0
+            result[f"phase_{name}_count"] = int(count)
+        return result
 
     def _selection_mse(self, loss):
         if getattr(self, "training_stage", "joint") == "adapter":
@@ -1612,9 +1660,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "token_mse", "denoiser_mse", "demo_mse", "mask_mse",
             "context_patch_mse", "intensity_smoothness", "intensity_loss",
             "contact_open_ratio", "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse", "loss",
+            "phase_bce", "phase_accuracy", "phase_predicted_open_ratio",
         )
         component_totals = {key: 0.0 for key in component_keys}
         contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
+        phase_totals = np.zeros(len(self.phase_total_keys), dtype=np.float64)
         response_numerator = response_weight_sum = 0.0
         open_token_sum = closed_token_sum = open_token_count = closed_token_count = 0.0
         started = last_status = time.monotonic()
@@ -1633,6 +1683,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 component_totals[key] += getattr(self, "loss_metrics", {}).get(key, 0.0) * size
             metrics = getattr(self, "loss_metrics", {})
             contact_totals += [metrics.get(key, 0.0) for key in self.contact_total_keys]
+            phase_totals += [metrics.get(key, 0.0) for key in self.phase_total_keys]
             response_numerator += metrics.get("response_numerator", 0.0)
             response_weight_sum += metrics.get("response_weight_sum", 0.0)
             open_token_sum += metrics.get("open_token_mse", 0.0) * metrics.get("open_token_count", 0.0)
@@ -1663,6 +1714,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         }
         open_sum, closed_sum, open_count, closed_count = totals[component_count:component_count + 4]
         self.validation_metrics.update(self._contact_means(totals[component_count + 4:]))
+        if self.phase_prediction_enabled:
+            self.validation_metrics.update(self._phase_rates(self._sum(phase_totals.tolist())))
         self.validation_metrics["open_token_mse"] = open_sum / open_count if open_count else 0.0
         self.validation_metrics["closed_token_mse"] = closed_sum / closed_count if closed_count else 0.0
         self.validation_metrics["open_token_count"] = open_count
@@ -1702,6 +1755,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             "best_epoch": self.best_epoch, "best_step": self.best_step,
             "early_stopping": {"enabled": self.early_stopping_enabled,
                                "patience_epochs": self.patience, "min_delta": self.min_delta,
+                               "start_at_rgb": bool(self.cfg.training.early_stopping.get("start_at_rgb", False)),
+                               "counting_active": self._early_stopping_active(),
                                "epochs_without_improvement": self.epochs_without_improvement},
             "teacher_checkpoint": str(pathlib.Path(self.cfg.teacher_checkpoint).resolve()),
             "teacher_state_key": self.teacher_state_key, "cross_attn_query": "image",
@@ -1801,7 +1856,11 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
         self.latest_val_loss = self._validate(loader)
         self._step_lr_scheduler(self.latest_val_loss)
         improved = self.latest_val_loss < self.best_val_loss
-        if self.latest_val_loss < self.early_stopping_best_loss - self.min_delta:
+        if not self._early_stopping_active():
+            # Gate warm-up keeps the RGB output at its identity initialization,
+            # so token MSE cannot measure gate progress during these epochs.
+            self.epochs_without_improvement = 0
+        elif self.latest_val_loss < self.early_stopping_best_loss - self.min_delta:
             self.early_stopping_best_loss = self.latest_val_loss
             self.epochs_without_improvement = 0
         else:
@@ -1840,7 +1899,8 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             patience = int(self.cfg.training.get("render_stages", {}).get("adapter_patience", patience))
         if self.condition_prediction_enabled and self.training_stage == "intensity":
             patience = int(self.cfg.training.get("render_stages", {}).get("condition_patience", patience))
-        return self.early_stopping_enabled and self.epochs_without_improvement >= patience
+        return (self.early_stopping_enabled and self._early_stopping_active()
+                and self.epochs_without_improvement >= patience)
 
     def run(self):
         cache_config = self.cfg.get("teacher_cache", {})
@@ -1863,6 +1923,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                 config.contact_label_config = self.wrench_preprocessor.get_config()
                 with open_dict(self.cfg.dataset):
                     self.cfg.dataset.contact_label_config = config.contact_label_config
+            if self.phase_prediction_enabled:
+                config.phase_predictor = self.cfg.render_net.phase_predictor
+                with open_dict(self.cfg.dataset):
+                    self.cfg.dataset.phase_predictor = config.phase_predictor
         return canonical_dataset_config(config)
 
     def _run(self):
@@ -1890,6 +1954,10 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
             runtime_dataset_cfg.video_decode_device = str(self.device) if self.device.type == "cuda" else "auto"
         dataset = self._instantiate_dataset(runtime_dataset_cfg)
         validation_dataset = dataset.get_validation_dataset()
+        if self.phase_prediction_enabled and not bool(self.model.phase_predictor.normalizer_fitted):
+            self.model.phase_predictor.fit_normalizer(dataset.phase_training_states())
+            if self.ema_model is not None:
+                self.ema_model.phase_predictor.load_state_dict(self.model.phase_predictor.state_dict())
         if not len(dataset):
             dataset.lerobot_dataset.close()
             raise RuntimeError("Distillation needs a nonempty training split")
@@ -1966,10 +2034,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         "token_mse", "denoiser_mse", "demo_mse", "context_patch_mse",
                         "intensity_smoothness", "intensity_loss", "contact_open_ratio",
                         "response_mse", "student_loss", "alpha_mse", "condition_loss", "adapter_mse",
+                        "phase_bce", "phase_accuracy", "phase_predicted_open_ratio",
                     )}
                     epoch_open_token_sum = epoch_closed_token_sum = 0.0
                     epoch_open_token_count = epoch_closed_token_count = 0.0
                     epoch_contact_totals = np.zeros(len(self.contact_total_keys), dtype=np.float64)
+                    epoch_phase_totals = np.zeros(len(self.phase_total_keys), dtype=np.float64)
                     epoch_started = previous_end = last_status = time.monotonic()
                     batches = len(train_loader)
                     if self.max_steps is not None:
@@ -2007,6 +2077,7 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                         self.stage_step += 1
                         size = next(iter(batch["obs"].values())).shape[0]
                         metrics_for_batch = self.loss_metrics
+                        epoch_phase_totals += [metrics_for_batch.get(key, 0.0) for key in self.phase_total_keys]
                         open_count = metrics_for_batch.get("open_token_count", 0.0)
                         closed_count = metrics_for_batch.get("closed_token_count", 0.0)
                         primary_total, loss_total, mask_total, global_size, *component_totals = self._sum([
@@ -2074,9 +2145,12 @@ class TrainDistillRenderNetWorkspace(BaseWorkspace):
                     self.epoch = epoch_number
                     self.stage_epoch += 1
                     epoch_seconds = self._max_seconds(time.monotonic() - epoch_started)
+                    phase_rates = (self._phase_rates(self._sum(epoch_phase_totals.tolist()))
+                                   if self.phase_prediction_enabled else {})
                     logger.log({"global_step": self.global_step, "epoch": self.epoch,
                                 "objective": self.logging_objective,
                                 "training_stage": self.training_stage,
+                                **{f"epoch_train_{key}": value for key, value in phase_rates.items()},
                                 **{f"epoch_train_{key}": value for key, value in
                                    self._contact_means(epoch_contact_totals).items()},
                                 "epoch_train_mse": epoch_total / epoch_samples,

@@ -393,51 +393,8 @@ def test_duplicate_and_missing_validation_scores_do_not_evict_topk(tmp_path):
     assert load_payload(tmp_path / "checkpoints/best.ckpt")["pickles"]
 
 
-def test_self_cross_config_ranks_raw_inference_mse_on_full_validation_split():
-    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
-    with initialize_config_dir(config_dir=str(root), version_base=None):
-        cfg = compose(config_name="baseline_train/train_dp_self_crossattn_insert_usb")
-        original = compose(config_name="train_dp_insert_usb_force_aware")
-    assert cfg.checkpoint.topk.monitor_key == "val_action_mse_raw"
-    assert cfg.checkpoint.topk.mode == "min"
-    assert cfg.checkpoint.topk.k == 5
-    assert cfg.training.max_val_steps is None
-    assert cfg.training.checkpoint_every_optimizer_steps == 20000
-    assert original.checkpoint.topk.monitor_key == "train_loss"
 
 
-@pytest.mark.parametrize("name", [
-    "train_dp_image_query_lstm_contact_blur_insert_usb",
-    "train_dp_image_wrench_selfattn_contact_blur_insert_usb",
-])
-def test_contact_curriculum_validation_starts_in_final_clear_quarter(name):
-    from diffusion_policy.model.vision.contact_curriculum import FactrBlurScheduler
-
-    root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
-    with initialize_config_dir(config_dir=str(root), version_base=None):
-        cfg = compose(config_name="alation_study/" + name)
-        baseline = compose(config_name="alation_study/train_dp_image_query_lstm_insert_usb")
-    start = cfg.training.validation_start_optimizer_step
-    assert start == int(0.75 * cfg.training.num_optimizer_steps) == 150000
-    assert baseline.training.validation_start_optimizer_step == 0
-    scheduler = FactrBlurScheduler(**cfg.policy.image_blur_schedule)
-    assert scheduler.sigma(start - 1) > 0
-    assert scheduler.sigma(start) == 0
-    assert cfg.val_dataloader.num_workers == 0
-    assert cfg.val_dataloader.persistent_workers is False
-    assert cfg.val_dataloader.prefetch_factor is None
-    assert scheduler.sigma(50_000) == 5
-    assert scheduler.sigma(100_000) == 2.5
-    assert cfg.policy.image_blur_schedule.start_fraction == 0.25
-    assert cfg.policy.image_blur_schedule.end_fraction == 0.75
-    assert cfg.policy.force_temporal_encoder == "lstm"
-    if "image_query" in name:
-        assert cfg.policy.pre_cross_self_attn_layers == 0
-        assert cfg.policy.cross_attn_layers == 1
-        assert cfg.policy.cross_attn_query_residual is False
-    else:
-        assert cfg.policy.pre_cross_self_attn_layers == 1
-        assert cfg.policy.cross_attn_layers == 0
 
 
 def test_negative_validation_start_is_rejected(tmp_path):

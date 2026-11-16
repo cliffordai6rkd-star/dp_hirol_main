@@ -98,7 +98,7 @@ class TinyDataset:
 
 def _config(root):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]
     cfg.distillation.objective = "token_mse" # This fixture exercises the legacy obs-only teacher.
     cfg.distillation.use_teacher_ffn = False # TinyEncoder has no fusion FFN modules.

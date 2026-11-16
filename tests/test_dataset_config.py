@@ -18,8 +18,8 @@ LEGACY_TARGET = "diffusion_policy.dataset.legacy_lerobot_v3_dataset.LegacyLeRobo
 
 
 @pytest.mark.parametrize("name", [
-    "train_civi_teacher", "train_civi_teacher_joint", "sim_force_aware_dp_train",
-    "train_dp_insert_usb_force_aware", "train_dp_cucumber_nero_force_aware",
+    "train_civi_teacher", "train_civi_teacher_board_blur_legacy_fusion",
+    "train_civi_teacher_huanggua_blur_legacy_fusion_b32_150k",
 ])
 def test_force_aware_configs_share_causal_phase_labels_and_configurable_duration(name):
     config_dir = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
@@ -35,8 +35,6 @@ def test_force_aware_configs_share_causal_phase_labels_and_configurable_duration
 
 def test_current_target_resolves_and_other_dataset_types_are_preserved():
     assert hydra.utils.get_class(V3_IMAGE_DATASET_TARGET) is LeRobotV3ImageDataset
-    assert hydra.utils.get_class("diffusion_policy.dataset.zarr_image_dataset.ZarrImageDataset").__name__ == "ZarrImageDataset"
-    assert hydra.utils.get_class("diffusion_policy.env_runner.fr3_runner.Fr3Runner").__name__ == "Fr3Runner"
     for target in (V3_IMAGE_DATASET_TARGET, "diffusion_policy.dataset.pusht_image_dataset.PushTImageDataset"):
         config = OmegaConf.create({"_target_": target})
         assert canonical_dataset_config(config)._target_ == target

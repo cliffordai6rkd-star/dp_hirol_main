@@ -28,7 +28,7 @@ CONFIG_DIR = pathlib.Path(__file__).resolve().parent / "diffusion_policy" / "con
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
-@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="sim_force_aware_dp_train")
+@hydra.main(version_base=None, config_path=str(CONFIG_DIR), config_name="train_civi_teacher_board_blur_legacy_fusion")
 def main(cfg):
     OmegaConf.resolve(cfg)
     distributed = initialize_distributed(cfg.training)

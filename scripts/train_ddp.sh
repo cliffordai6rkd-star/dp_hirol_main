@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # One DDP job: every torchrun process owns one visible GPU and one data shard.
-CONFIG_NAME="${CONFIG_NAME:-train_dp_inert_usb}"
+CONFIG_NAME="${CONFIG_NAME:-train_civi_teacher_board_blur_legacy_fusion}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 # The baseline YAMLs default to single-GPU mode.  This override is required

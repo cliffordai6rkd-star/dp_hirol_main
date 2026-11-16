@@ -2,7 +2,7 @@
 name: train_distill_render_net_student
 _target_: diffusion_policy.workspace.train_distill_render_net_workspace.TrainDistillRenderNetWorkspace
 # 从教师 YAML 获取数据路径；未指定权重时从其 output_dir 按动作 MSE 选教师。
-# train_civi.py --teacher-config 会覆盖此处；单独启动学生也能直接使用本配置。
+# train_pipeline.py 会传入所选教师权重；也可通过 teacher_checkpoint 单独指定。
 teacher_config: diffusion_policy/config/train_civi_teacher.yaml
 teacher_config_overrides: []
 teacher_output_dir: null # 默认读取 teacher-config 的 output_dir。

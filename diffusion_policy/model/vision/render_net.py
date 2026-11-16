@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from diffusion_policy.model.vision.wrench_preprocessing import compute_contact_alpha
 from diffusion_policy.model.vision.student_context_adapter import StudentContextAdapter
+from diffusion_policy.model.vision.causal_phase_gate import CausalPhaseGate
 
 
 def top_percentile_mask(values, percentile, *, minimum=0.0):
@@ -520,7 +521,7 @@ class RenderNet(nn.Module):
                  spatial_modulation=None, backbone=None, architecture_version=None,
                  separate_gate_path=False, transformer=None,
                  condition_prediction=None, condition_backbone=None, context_adapter=None,
-                 dual_path=None, rgb_epsilon=None):
+                 dual_path=None, rgb_epsilon=None, phase_predictor=None):
         super().__init__()
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints.  The active implementation is the CNN
@@ -690,6 +691,12 @@ class RenderNet(nn.Module):
                 hidden_dim=int(condition_config.get("hidden_dim", 64)),
                 initial_strength=float(region_config.get("initial_strength", 0.1)),
             )
+        phase_config = dict(phase_predictor or {})
+        self.phase_prediction_enabled = bool(phase_config.pop("enabled", False))
+        if self.phase_prediction_enabled and self.condition_prediction_enabled:
+            raise ValueError("Use the causal binary phase predictor or the historical region/alpha network")
+        self.phase_predictor = (CausalPhaseGate(self.image_keys, **phase_config)
+                                if self.phase_prediction_enabled else None)
         self.spatial_modulations = nn.ModuleList()
         if self.spatial_modulation_enabled:
             decoder_channels = [module.body[-2].out_channels
@@ -794,6 +801,8 @@ class RenderNet(nn.Module):
         if stage in {"rgb", "joint"}:
             for module in self._rgb_modules():
                 self._set_requires_grad(module, True)
+        if self.phase_predictor is not None:
+            self.phase_predictor.requires_grad_(True)
 
     def set_stage_mode(self, training=True):
         """Set mode while keeping the frozen branch deterministic."""
@@ -932,7 +941,7 @@ class RenderNet(nn.Module):
     def forward(self, images=None, wrench_history=None, *, return_aux=False, use_attention_mask=None,
                 future_contact=None, contact_alpha=None, condition_only=False,
                 return_condition=False, image_context=None, cached_condition=None,
-                return_rgb_stats=False):
+                return_rgb_stats=False, phase_inputs=None):
         """Render RGB, or train the student-owned visual adapter through DDP."""
         if image_context is not None:
             if self.context_adapter is None:
@@ -960,6 +969,11 @@ class RenderNet(nn.Module):
                 return None, predicted_masks, condition
         elif condition_only:
             raise ValueError("condition_only requires condition_prediction.enabled=true")
+        if self.phase_predictor is not None:
+            if phase_inputs is None:
+                raise ValueError("Causal phase prediction requires phase_inputs with RGB and measured state histories")
+            condition = self.phase_predictor(phase_inputs)
+            contact_alpha = condition["contact_alpha"]
         wrench_tokens = self.encode_wrench_history(wrench_history)
         gate_wrench_tokens = (self.encode_gate_wrench_history(wrench_history)
                               if use_mask and not self.condition_prediction_enabled else None)

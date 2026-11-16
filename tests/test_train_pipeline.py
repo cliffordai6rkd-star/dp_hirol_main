@@ -96,7 +96,7 @@ def test_all_runs_stages_in_order_and_hands_off_checkpoint(repository, tmp_path,
         "--distill-override", "training.num_epochs=10",
     ])
     plan = pipeline.run_pipeline(args, repository)
-    teacher_name = "best" if best else "latest"
+    teacher_name = "latest"  # Final teacher is handed off even when best exists.
     assert plan["status"] == "completed"
     assert Path(plan["teacher_checkpoint"]) == output / f"teacher/checkpoints/{teacher_name}.ckpt"
     dp_args = json.loads((output / "teacher/argv.json").read_text())

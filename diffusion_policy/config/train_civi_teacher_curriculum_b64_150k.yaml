@@ -5,7 +5,7 @@ defaults:
 
 name: train_civi_teacher_curriculum_b64_150k
 output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_teacher_ca_curriculum_b64_150k/teacher
-dataset_path: data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+dataset_path: ${oc.env:CIVI_DATASET_PATH,data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5}
 
 policy:
   image_blur_scope: precontact_contact

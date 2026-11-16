@@ -34,7 +34,7 @@ def test_workspace_cleans_only_its_teacher_cache_on_completion_and_errors(monkey
     monkeypatch.setattr(distill.WrenchPreprocessor, "from_policy", lambda policy: TinyPreprocessor())
     monkeypatch.setattr(distill.hydra.utils, "instantiate", lambda _: TinyDataset(source))
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]
     cfg.distillation.objective = "token_mse" # Cache lifecycle uses the legacy obs-only test policy.
     assert cfg.teacher_cache.cleanup_on_exit is True

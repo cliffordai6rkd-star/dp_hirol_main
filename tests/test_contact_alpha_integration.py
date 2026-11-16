@@ -44,15 +44,3 @@ def test_student_context_uses_the_same_complete_future_contact_mask():
     assert tokens.shape[:2] == (2, 20)
     assert future_contact.shape == (2, 2, 8)
     assert future_contact[0, 0, -2:].all()
-
-
-def test_teacher_config_keeps_factr_blur_curriculum_and_has_no_hard_gate():
-    root = __import__("pathlib").Path(__file__).resolve().parents[1] / "diffusion_policy" / "config"
-    with initialize_config_dir(version_base=None, config_dir=str(root)):
-        cfg = compose(config_name="sim_force_aware_dp_train")
-    assert "contact_fusion_gate" not in cfg.policy
-    assert cfg.policy.image_blur_scope == "full_context"
-    assert cfg.policy.image_blur_schedule.start_sigma == 5.0
-    assert cfg.policy.image_blur_schedule.end_sigma == 0.0
-    assert cfg.policy.image_blur_schedule.start_fraction == 0.25
-    assert cfg.policy.image_blur_schedule.end_fraction == 0.75

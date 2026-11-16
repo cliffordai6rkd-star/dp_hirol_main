@@ -1,0 +1,43 @@
+# Match the resolved 2026-11-07/22.23.10_distill_gate_sft_v2 student.
+defaults:
+  - train_distill_render_net_student
+  - _self_
+
+name: train_distill_render_net_board_legacy
+teacher_config: diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml
+output_dir: data/outputs/civi/board_blur_legacy_fusion/student
+
+distillation:
+  objective: token_mse
+  use_teacher_ffn: false
+
+render_net:
+  phase_predictor:
+    enabled: true
+    history_steps: 16
+    image_offsets: [-12, -8, -4, 0]
+    hidden_dim: 64
+    image_size: 112
+    threshold: 0.5
+    loss_weight: 1.0
+    state_source_keys: [observation.joint, observation.velocity, observation.tau_ext_unthresholded]
+  backbone:
+    image_self_attn_layers: 4
+    cross_attn_layers: 2
+    decoder_layers: 4
+    patch_size: 16
+  separate_gate_path: true
+  spatial_modulation:
+    enabled: true
+  residual_scale: 1.0
+  high_attention_render:
+    threshold: 0.5
+
+training:
+  early_stopping:
+    enabled: true
+    patience: 5
+    start_at_rgb: true
+  render_stages:
+    enabled: true
+    intensity_epochs: 5

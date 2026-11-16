@@ -497,9 +497,10 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
     expected_epoch, reason, best_epoch,
 ):
     cfg = OmegaConf.load(Path(__file__).resolve().parents[1] /
-                         "diffusion_policy/config/train_distill_render_net.yaml")
+                         "diffusion_policy/config/train_distill_render_net_student.yaml")
     del cfg["hydra"]  # Hydra removes its own section before invoking the workspace.
     cfg.distillation.objective = "token_mse" # The loop fixture mocks an obs-only loss.
+    cfg.teacher_checkpoint = str(tmp_path / "teacher.ckpt")
     cfg.render_net.rendering_mode = "residual"
     cfg.render_net.high_attention_render.enabled = False
     cfg.training.device = "cpu"
@@ -549,10 +550,17 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
     monkeypatch.setattr(distill.TrainDistillRenderNetWorkspace, "_loss",
                         lambda self, obs: self.model.output.bias.square().mean() + 1.0)
     validation = iter(losses)
+    initial_training_evaluated = False
 
     def validate(self, loader):
+        nonlocal initial_training_evaluated
         self.model.eval()
         self.validation_samples = 5
+        self.validation_metrics = {}
+        self.validation_seconds = 0.0
+        if not initial_training_evaluated:
+            initial_training_evaluated = True
+            return 1.0
         return next(validation)
 
     monkeypatch.setattr(distill.TrainDistillRenderNetWorkspace, "_validate", validate)
@@ -585,8 +593,8 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
                and record["step_seconds"] >= 0 and record["samples_per_second"] > 0 for record in steps)
     epochs_logged = [record for record in records if "epoch_train_mse" in record]
     assert epochs_logged[-1]["epoch_samples"] == (4 if max_steps == 5 else 5)
-    assert summary["metrics_png"] is None
-    assert not (tmp_path / "training_metrics.png").exists()
+    assert summary["metrics_png"] == str((tmp_path / "training_metrics.png").resolve())
+    assert (tmp_path / "training_metrics.png").is_file()
 
 
 @pytest.mark.parametrize("max_batches,expected,samples", [(None, 2.6, 5), (2, 2.0, 4)])

@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 def check_assets(device):
     root = Path(__file__).resolve().parents[1]
-    dataset = root / "data/libero_open_top_drawer_put_bowl_20hz_lerobot_v3"
+    dataset = Path(os.environ.get("CIVI_DATASET_PATH", str(root / "data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5")))
     info = json.loads((dataset / "meta/info.json").read_text())
     for name in ("data", "videos"):
         if not any((dataset / name).rglob("*")):
@@ -24,7 +24,7 @@ def check_assets(device):
         root / "model/model/dinov3-vitb16-pretrain-lvd1689m", local_files_only=True,
     ).to(device).eval()
     with torch.inference_mode():
-        output = backbone(pixel_values=torch.zeros(1, 3, 192, 256, device=device),
+        output = backbone(pixel_values=torch.zeros(1, 3, 224, 224, device=device),
                           interpolate_pos_encoding=True).last_hidden_state
     if not torch.isfinite(output).all():
         raise RuntimeError("DINO produced non-finite output")

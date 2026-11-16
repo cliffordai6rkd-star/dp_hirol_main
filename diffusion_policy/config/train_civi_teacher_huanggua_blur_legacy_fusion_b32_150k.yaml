@@ -1,0 +1,9 @@
+defaults:
+  - train_civi_teacher_board_blur_legacy_fusion
+  - _self_
+
+name: train_civi_teacher_huanggua_blur_legacy_fusion_b32_150k
+dataset_path: data/huanggua1103_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+
+logging:
+  tags: [huanggua, 25hz, tau-ext-history, phase-binary, pixel-blur, batch32, 150k]

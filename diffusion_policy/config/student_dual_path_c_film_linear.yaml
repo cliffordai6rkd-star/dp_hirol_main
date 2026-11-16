@@ -1,8 +1,0 @@
-defaults:
-  - student_dual_path_b_interleaved
-  - _self_
-name: student_dual_path_c_film_linear
-render_net:
-  dual_path:
-    decoder_film: true
-

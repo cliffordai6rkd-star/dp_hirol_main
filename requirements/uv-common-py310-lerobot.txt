@@ -1,5 +1,4 @@
 # Python 3.10 training stack for the official LeRobot v3 dataset path.
-# Keep this separate from uv-common.txt, which preserves the older py39/cu116 stack.
 #
 # LeRobot itself is installed with --no-deps in the Dockerfile because its
 # torch metadata is resolved explicitly below for the CUDA 12.8 runtime.
@@ -27,9 +26,7 @@ tqdm==4.67.1
 dill==0.3.8
 scikit-video==1.1.11
 scikit-image==0.25.2
-pymunk==6.6.0
 threadpoolctl==3.5.0
-shapely==2.0.6
 cython==3.0.11
 termcolor==2.5.0
 tensorboard==2.15.2
@@ -67,12 +64,3 @@ draccus==0.10.0
 gymnasium==1.1.1
 rerun-sdk==0.26.2
 deepdiff==8.6.1
-
-# Legacy DP utilities still import gym.* rather than gymnasium.*.
-gym==0.23.1
-
-# Lightweight simulation/runtime extras used by local DP utilities.
-pygame==2.5.2
-ray[default,tune]==2.9.3
-mujoco>=3.3,<4
-pytorchvideo==0.1.5

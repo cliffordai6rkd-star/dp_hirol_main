@@ -1,41 +1,7 @@
-"""
-Usage:
-Training:
-export CIVI_DATASET_PATH=data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
-python train.py  # Train the configured teacher, then its RenderNet student.
-python train.py --config-name=train_diffusion_lowdim_workspace
-python train.py -c diffusion_policy/config/train_zarr/train_fr3_unet_abs_jp.yaml
-# Reset one selected output directory and train from scratch.
-python train.py --config-name=train_civi_teacher_board_selfattn --overwrite output_dir=model_output/board_current/teacher
+"""Train the CIVI teacher/student pipeline, or one explicit Hydra workspace.
 
-GPU Selection:
-# Single GPU training - specify device
-python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:0
-python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cuda:1
-
-# Multi-GPU data-parallel training (torchrun creates one process per GPU)
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 train.py \
-    --config-name=train_dp_inert_usb
-
-# CPU training (for debugging)
-python train.py --config-name=train_fr3_unet_abs_jp_ee_state.yaml training.device=cpu
-
-Examples:
-# Train on specific GPU with custom output directory
-python train.py --config-dir=. --config-name=train_fr3_unet_abs_jp_ee_state.yaml \
-    training.device=cuda:1 \
-    hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_gpu1'
-
-# Multi-GPU server deployment
-CUDA_VISIBLE_DEVICES=2,3 torchrun --standalone --nproc_per_node=2 train.py \
-    --config-dir=diffusion_policy/config --config-name=train_force_aware_diffusion_workspace \
-    hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_multi_gpu'
-
-Notes:
-- Use CUDA_VISIBLE_DEVICES to control which GPUs are visible to PyTorch
-- training.device=cuda:0 refers to the first visible GPU (after CUDA_VISIBLE_DEVICES filtering)
-- For multi-GPU training, use torchrun; each rank maps to its LOCAL_RANK device
-- Check GPU availability with: nvidia-smi
+python train.py
+python train.py --config diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml
 """
 
 import sys

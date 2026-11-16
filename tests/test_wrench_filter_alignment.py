@@ -115,9 +115,7 @@ def test_legacy_data_config_without_filter_keeps_original_values(aligned_dataset
 
 
 @pytest.mark.parametrize("name,teacher_name,source_key,filter_enabled", [
-    ("train_distill_render_net", "train_civi_teacher_libero", "observation.tau_ext", True),
     ("train_distill_render_net_student", "train_civi_teacher", "observation.tau_ext_unthresholded", False),
-    ("train_distill_render_net_student_test", "train_civi_teacher_libero", "observation.wrench", True),
 ])
 def test_student_configs_inherit_matching_teacher_torque_preprocessing(
         name, teacher_name, source_key, filter_enabled):

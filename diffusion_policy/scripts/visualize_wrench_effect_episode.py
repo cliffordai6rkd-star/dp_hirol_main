@@ -61,6 +61,8 @@ def make_zero_wrench_obs(policy, obs):
     """Keep image objects unchanged; zero every required raw wrench/phase key."""
     zero = dict(obs)
     zero.pop("contact_alpha", None)
+    if getattr(policy, "fusion_gate_mode", "attention_alpha") == "phase_binary":
+        zero["contact_phase"] = torch.zeros_like(obs["contact_phase"])
     keys = dict.fromkeys(getattr(policy, name, None) for name in
                          ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
     for key in keys:
