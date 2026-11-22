@@ -37,13 +37,12 @@ def select_action_mse_teacher(run_dir):
 
 
 def resolve_student_teacher(cfg):
-    """Read optional teacher data YAML; prefer an explicit checkpoint to MSE selection."""
+    """Read teacher data YAML and select weights using the preset's policy."""
     from omegaconf import OmegaConf, open_dict
     from diffusion_policy.common.config_cli import configured_output_dir, load_config_reference
 
     if OmegaConf.is_missing(cfg, "teacher_checkpoint"):
-        # New-teacher presets require an explicit checkpoint. Preserve null
-        # as the historical opt-in to automatic action-MSE selection.
+        # Presets with a mandatory checkpoint still require an explicit path.
         raise ValueError("Set teacher_checkpoint=/path/to/new_teacher/checkpoints/best.ckpt")
     source = None
     if cfg.get("teacher_config"):
@@ -55,9 +54,25 @@ def resolve_student_teacher(cfg):
         checkpoint = Path(str(cfg.teacher_checkpoint)).expanduser().resolve()
     elif source is not None:
         teacher_output = Path(cfg.get("teacher_output_dir") or configured_output_dir(source)).expanduser().resolve()
-        checkpoint, score = select_action_mse_teacher(teacher_output)
+        selection = str(cfg.get("teacher_checkpoint_selection", "action_mse"))
+        if selection == "latest":
+            checkpoint = teacher_output / "checkpoints" / "latest.ckpt"
+            if not checkpoint.is_file():
+                raise FileNotFoundError(
+                    f"No final teacher checkpoint at {checkpoint}. Set "
+                    "teacher_output_dir=/path/to/completed/teacher or "
+                    "teacher_checkpoint=/path/to/teacher/checkpoints/latest.ckpt. "
+                    "For pipeline training use 'train_pipeline.py distill --teacher-run "
+                    "/path/to/teacher' or '--teacher-checkpoint /path/to/latest.ckpt'; "
+                    "the teacher config's timestamped default output does not identify a previous run."
+                )
+            checkpoint = checkpoint.resolve()
+        elif selection == "action_mse":
+            checkpoint, score = select_action_mse_teacher(teacher_output)
+        else:
+            raise ValueError("teacher_checkpoint_selection must be 'latest' or 'action_mse'")
     else:
-        raise ValueError("Set teacher_config for MSE selection or specify teacher_checkpoint")
+        raise ValueError("Set teacher_config for automatic selection or specify teacher_checkpoint")
     if source is not None:
         with open_dict(source):
             del source["hydra"]

@@ -51,6 +51,8 @@ def test_workspace_cleans_only_its_teacher_cache_on_completion_and_errors(monkey
     cfg.training.num_epochs = 1
     cfg.render_net.architecture_version = 1
     cfg.render_net.high_attention_render.enabled = False
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.logging.progress_bar = False
     cfg.logging.plot_every_steps = 0
     for loader in (cfg.dataloader, cfg.val_dataloader):

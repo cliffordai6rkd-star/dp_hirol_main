@@ -1,0 +1,100 @@
+{
+  "name": "tiny_norm_seed43",
+  "config": {
+    "name": "tiny_norm_seed43",
+    "seed": 43,
+    "pool": 2,
+    "cnn_norm": true,
+    "center": true,
+    "lr": 0.001
+  },
+  "architecture": {
+    "image_keys": [
+      "side",
+      "wrist"
+    ],
+    "wrench_dim": 7,
+    "hidden_dim": 16,
+    "gru_layers": 1,
+    "image_size": 64,
+    "cnn_channels": [
+      4,
+      8,
+      12
+    ],
+    "pool_size": 2,
+    "dropout": 0.0,
+    "image_offsets": [
+      0
+    ],
+    "center_images": true,
+    "cnn_norm": true
+  },
+  "parameters": 5175,
+  "best_epoch": 4,
+  "stopped_epoch": 7,
+  "early_stopped": true,
+  "train": {
+    "accuracy": 0.9602394104003906,
+    "phase_recall": [
+      0.9964566826820374,
+      0.3971462547779083,
+      0.9950544238090515
+    ],
+    "free_false_open_rate": 0.003543307086614173,
+    "precontact_open_rate": 0.405469685792923,
+    "contact_open_rate": 0.9963732361793518,
+    "open_recall": 0.8680949922560661,
+    "observations": 28068,
+    "confusion": [
+      [
+        20248,
+        56,
+        16
+      ],
+      [
+        1000,
+        668,
+        14
+      ],
+      [
+        22,
+        8,
+        6036
+      ]
+    ],
+    "ce_loss": 0.10668819856487381
+  },
+  "validation": {
+    "accuracy": 0.9635854363441467,
+    "phase_recall": [
+      0.9829787015914917,
+      0.5873016119003296,
+      0.9966996908187866
+    ],
+    "free_false_open_rate": 0.01702127659574468,
+    "precontact_open_rate": 0.6190476417541504,
+    "contact_open_rate": 1.0,
+    "open_recall": 0.9344262295081968,
+    "observations": 2142,
+    "confusion": [
+      [
+        1386,
+        24,
+        0
+      ],
+      [
+        48,
+        74,
+        4
+      ],
+      [
+        0,
+        2,
+        604
+      ]
+    ],
+    "ce_loss": 0.11400968671178952
+  },
+  "elapsed_seconds": 14.404468929860741
+}

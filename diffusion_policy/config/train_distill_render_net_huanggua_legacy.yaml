@@ -1,6 +1,6 @@
+# The unified CIVI student with the huanggua task teacher config.
 defaults:
-  - train_distill_render_net_board_legacy
+  - train_distill_render_net_student
   - _self_
-
 name: train_distill_render_net_huanggua_legacy
 teacher_config: diffusion_policy/config/train_civi_teacher_huanggua_blur_legacy_fusion_b32_150k.yaml

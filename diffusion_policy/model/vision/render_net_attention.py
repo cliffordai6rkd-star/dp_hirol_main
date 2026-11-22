@@ -145,9 +145,10 @@ def zero_wrench_reference(teacher, obs):
     """Build a physical-zero reference and discard the original alpha label."""
     reference = dict(obs)
     reference.pop("contact_alpha", None)
-    if getattr(teacher, "fusion_gate_mode", "attention_alpha") == "phase_binary":
+    if getattr(teacher, "fusion_gate_mode", "attention_alpha") in {"phase_binary", "current_contact"}:
         # The raw-zero counterfactual also closes the whole fusion branch.
-        reference["contact_phase"] = torch.zeros_like(obs["contact_phase"])
+        if "contact_phase" in obs:
+            reference["contact_phase"] = torch.zeros_like(obs["contact_phase"])
     keys = dict.fromkeys(getattr(teacher, name, None) for name in
                          ("wrench_key", "phase_wrench_key", "future_phase_wrench_key"))
     for key in keys:

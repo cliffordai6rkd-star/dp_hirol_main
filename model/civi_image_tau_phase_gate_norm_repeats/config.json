@@ -1,0 +1,66 @@
+{
+  "architecture": {
+    "image_keys": [
+      "side",
+      "wrist"
+    ],
+    "wrench_dim": 7,
+    "hidden_dim": 16,
+    "gru_layers": 1,
+    "image_size": 64,
+    "cnn_channels": [
+      4,
+      8,
+      12
+    ],
+    "pool_size": 2,
+    "dropout": 0.0,
+    "image_offsets": [
+      0
+    ],
+    "center_images": true,
+    "cnn_norm": true
+  },
+  "history_steps": 50,
+  "best_validation_ce": 0.11400968671178952,
+  "best_epoch": 4,
+  "trial": "tiny_norm_seed43",
+  "source": "data/debug/20261120_phase_gate_ce_search_03/tiny_norm_seed43/best.pt",
+  "input_mode": "causal image history + thresholded normalized tau history",
+  "image_history_pad": "edge, independently within each episode",
+  "wrench_preprocessing": {
+    "version": 7,
+    "precontact_seconds": 0.5,
+    "fusion_gate_mode": "phase_binary",
+    "contact_fusion_gate": false,
+    "preserve_zero_wrench": true,
+    "future_contact_mode": "legacy_rollout",
+    "n_obs_steps": 2,
+    "wrench_key": "tau_ext",
+    "phase_wrench_key": "tau_ext",
+    "future_phase_wrench_key": null,
+    "contact_detector_type": "hysteresis",
+    "contact_detector": {
+      "force_dims": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "history_reducer": "max",
+      "norm": "l1",
+      "free_threshold": 12.5,
+      "contact_threshold": 12.5,
+      "enter_frames": 5,
+      "exit_frames": 5
+    },
+    "input_gate": {
+      "threshold": 12.5,
+      "enabled": true,
+      "norm": "l1"
+    }
+  }
+}

@@ -1,52 +1,9 @@
-# Full current CA teacher, with the latest phase-selective blur curriculum.
+# Compatibility name: unified CIVI with batch 64.
 defaults:
   - train_civi_teacher
   - _self_
-
 name: train_civi_teacher_curriculum_b64_150k
-output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_teacher_ca_curriculum_b64_150k/teacher
-dataset_path: ${oc.env:CIVI_DATASET_PATH,data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5}
-
-policy:
-  image_blur_scope: precontact_contact
-  image_blur_schedule:
-    total_steps: null # Bound to the actual 150,000 optimizer updates by the workspace.
-    start_sigma: 5.0
-    end_sigma: 0.0
-    start_fraction: 0.3333333333333333
-    end_fraction: 1.0
-
 dataloader:
   batch_size: 64
-  num_workers: 8
 val_dataloader:
   batch_size: 64
-  num_workers: 4
-  persistent_workers: true
-  prefetch_factor: 2
-
-training:
-  resume: false
-  distributed:
-    enabled: false
-  num_epochs: null
-  num_optimizer_steps: 150000
-  gradient_accumulate_every: 1
-  validation_start_optimizer_step: 0
-  val_epoch_every: 10
-  checkpoint_every_optimizer_steps: 10000
-
-task:
-  dataset:
-    # Keep the five fixed held-out episodes; use all 57 remaining episodes.
-    val_ratio: 0.08064516129032258
-
-checkpoint:
-  # Score the held-out validation split, avoiding full-data inference on 62 episodes.
-  action_mse:
-    enabled: false
-  topk:
-    monitor_key: val_action_mse_raw
-    mode: min
-    k: 3
-    format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse_raw:.8f}.ckpt

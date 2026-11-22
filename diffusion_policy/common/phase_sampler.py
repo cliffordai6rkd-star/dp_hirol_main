@@ -48,15 +48,18 @@ class PhaseWeightedDistributedSampler(Sampler[int]):
         }
         if set(normalized_weights) != {0, 1, 2}:
             raise ValueError("phase_weights must define phases 0, 1, and 2")
-        if any(weight <= 0 for weight in normalized_weights.values()):
-            raise ValueError("phase sampling weights must be positive")
+        if any(not math.isfinite(weight) or weight < 0 for weight in normalized_weights.values()) or not any(
+            weight > 0 for weight in normalized_weights.values()
+        ):
+            raise ValueError("phase sampling weights must be finite and non-negative, with at least one positive weight")
         phase_counts = {
             phase: int(np.count_nonzero(labels == phase)) for phase in (0, 1, 2)
         }
-        missing = [phase for phase, count in phase_counts.items() if count == 0]
+        missing = [phase for phase, count in phase_counts.items()
+                   if count == 0 and normalized_weights[phase] > 0]
         if missing:
             raise ValueError(
-                "phase resampling requires all phase pools to be non-empty; "
+                "phase resampling requires positive-weight phase pools to be non-empty; "
                 f"counts={phase_counts}, missing={missing}"
             )
 
@@ -73,7 +76,8 @@ class PhaseWeightedDistributedSampler(Sampler[int]):
         # phase ratio.  This makes the expected three-phase ratio exact.
         weights = np.zeros(labels.shape[0], dtype=np.float64)
         for phase, count in phase_counts.items():
-            weights[labels == phase] = normalized_weights[phase] / count
+            if count:
+                weights[labels == phase] = normalized_weights[phase] / count
         self.weights = torch.as_tensor(weights, dtype=torch.double)
 
         self.num_samples = int(math.ceil(len(dataset) / self.num_replicas))

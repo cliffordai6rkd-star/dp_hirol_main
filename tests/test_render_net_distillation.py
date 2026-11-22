@@ -324,6 +324,7 @@ def test_region_gate_scales_residual_and_can_be_disabled(backbone):
 
 def test_validation_metric_excludes_auxiliary_region_loss():
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.model = nn.Identity()
     workspace.device = torch.device("cpu")
     workspace.max_val_batches = None
@@ -421,6 +422,7 @@ def test_region_supervision_runs_only_on_frozen_teacher_branch(region_enabled, m
     config = {"enabled": region_enabled, "percentiles": [82.5, 97.3], "teacher_seed": 42,
               "pixel_loss_weight": 2.0}
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.teacher_policy = teacher
     workspace.device = torch.device("cpu")
     workspace.model = RenderNet(6, base_channels=4, conditioning_dim=8, wrench_history_steps=7,
@@ -503,6 +505,10 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
     cfg.teacher_checkpoint = str(tmp_path / "teacher.ckpt")
     cfg.render_net.rendering_mode = "residual"
     cfg.render_net.high_attention_render.enabled = False
+    # This fixture exercises the original single-objective loop with mocked
+    # observations, not the independently supervised phase/intensity stages.
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.training.device = "cpu"
     cfg.teacher_cache.enabled = False
     cfg.training.amp.enabled = False
@@ -600,6 +606,7 @@ def test_epoch_training_limits_early_stopping_and_best_checkpoint(
 @pytest.mark.parametrize("max_batches,expected,samples", [(None, 2.6, 5), (2, 2.0, 4)])
 def test_validation_covers_full_split_and_weights_partial_batch(max_batches, expected, samples):
     workspace = object.__new__(distill.TrainDistillRenderNetWorkspace)
+    workspace.cfg = OmegaConf.create({"training": {"render_stages": {"transition": "epoch"}}})
     workspace.model = nn.Identity()
     workspace.device = torch.device("cpu")
     workspace.max_val_batches = max_batches

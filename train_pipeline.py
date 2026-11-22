@@ -30,8 +30,8 @@ from diffusion_policy.common.config_cli import load_config_reference
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_DP_CONFIG = "diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml"
-DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_board_legacy.yaml"
+DEFAULT_DP_CONFIG = "diffusion_policy/config/train_civi_teacher.yaml"
+DEFAULT_DISTILL_CONFIG = "diffusion_policy/config/train_distill_render_net_student.yaml"
 
 
 def make_parser():
@@ -198,8 +198,9 @@ def stage_command(name, stage, plan, repo_root=REPO_ROOT):
             f"<auto-selected after teacher training: {Path(teacher_run) / 'checkpoints'}>"
         )
         # JSON quotes are interpreted by Hydra, preserving spaces and '=' in paths.
-        command += ["teacher_checkpoint=" + json.dumps(teacher)]
-    command += ["hydra.run.dir=" + json.dumps(stage["output_dir"]), "hydra.job.chdir=false"]
+        command += ["teacher_checkpoint=" + json.dumps(teacher, ensure_ascii=False)]
+    command += ["hydra.run.dir=" + json.dumps(stage["output_dir"], ensure_ascii=False),
+                "hydra.job.chdir=false"]
     return command
 
 

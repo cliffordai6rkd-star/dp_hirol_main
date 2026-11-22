@@ -1,0 +1,99 @@
+{
+  "name": "tiny_lr7e4_b32",
+  "config": {
+    "name": "tiny_lr7e4_b32",
+    "lr": 0.0007,
+    "batch": 32
+  },
+  "architecture": {
+    "image_keys": [
+      "side",
+      "wrist"
+    ],
+    "wrench_dim": 7,
+    "hidden_dim": 16,
+    "gru_layers": 1,
+    "image_size": 64,
+    "cnn_channels": [
+      4,
+      8,
+      12
+    ],
+    "pool_size": 1,
+    "dropout": 0.0,
+    "image_offsets": [
+      0
+    ],
+    "center_images": false,
+    "cnn_norm": false
+  },
+  "parameters": 4551,
+  "best_epoch": 11,
+  "stopped_epoch": 14,
+  "early_stopped": true,
+  "train": {
+    "accuracy": 0.9603819251060486,
+    "phase_recall": [
+      0.9981299042701721,
+      0.36623066663742065,
+      0.9986811876296997
+    ],
+    "free_false_open_rate": 0.0018700787401574803,
+    "precontact_open_rate": 0.3674197494983673,
+    "contact_open_rate": 0.9996702671051025,
+    "open_recall": 0.8624161073825504,
+    "observations": 28068,
+    "confusion": [
+      [
+        20282,
+        38,
+        0
+      ],
+      [
+        1064,
+        616,
+        2
+      ],
+      [
+        2,
+        6,
+        6058
+      ]
+    ],
+    "ce_loss": 0.11675816732746117
+  },
+  "validation": {
+    "accuracy": 0.9645191431045532,
+    "phase_recall": [
+      0.9914893507957458,
+      0.4920634925365448,
+      1.0
+    ],
+    "free_false_open_rate": 0.00851063829787234,
+    "precontact_open_rate": 0.4920634925365448,
+    "contact_open_rate": 1.0,
+    "open_recall": 0.912568306010929,
+    "observations": 2142,
+    "confusion": [
+      [
+        1398,
+        8,
+        4
+      ],
+      [
+        64,
+        62,
+        0
+      ],
+      [
+        0,
+        0,
+        606
+      ]
+    ],
+    "ce_loss": 0.10764101946275997
+  },
+  "elapsed_seconds": 60.66213254304603,
+  "round": "20261120_phase_gate_ce_search_02",
+  "checkpoint": "/home/lcy/code/civi/data/debug/20261120_phase_gate_ce_search_02/tiny_lr7e4_b32/best.pt"
+}

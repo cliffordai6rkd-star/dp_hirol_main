@@ -1,0 +1,47 @@
+# Two-state teacher. Keep contact=2 internally for existing dataset tools;
+# class 1 (precontact) has no samples and no sampling mass.
+defaults:
+  - train_civi_teacher
+  - _self_
+
+name: train_civi_teacher_contact_only
+dataset_path: data/huanggua1103_25hz_3cam_lerobotv3_clean_ma5_l1_12p5
+tau_ext_history_steps: 25
+
+phase_resampling:
+  enabled: true
+  precontact_seconds: 0.0
+  weights: {free: 1.0, precontact: 0.0, contact: 1.0}
+
+policy:
+  cross_attn_layers: 2
+  fusion_gate_mode: current_contact
+  image_mask_scope: current_contact
+  contact_enter_frames: 5
+  contact_exit_frames: 5
+  contact_history_reducer: last
+
+dataloader:
+  batch_size: 128
+  num_workers: 12
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+
+training:
+  num_epochs: 600
+  num_optimizer_steps: null
+
+task:
+  contact_enter_frames: 5
+  contact_exit_frames: 5
+  contact_history_reducer: last
+  dataset:
+    contact_enter_frames: 5
+    contact_exit_frames: 5
+
+logging:
+  tags: [civi, huanggua, contact-only, history25, threshold12p5, debounce5, token-mask, ca2]

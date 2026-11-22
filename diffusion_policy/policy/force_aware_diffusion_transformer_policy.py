@@ -16,8 +16,10 @@ from diffusion_policy.model.diffusion.context_transformer_for_diffusion import (
 )
 from diffusion_policy.model.vision.contact_curriculum import (
     ContactDetector,
+    ContactAwareImageMasker,
     FactrBlurScheduler,
     HysteresisContactDetector,
+    MaskProbabilityScheduler,
     VectorThresholdGate,
     gaussian_2d_smoothing,
     select_contact_blur_mask,
@@ -93,14 +95,22 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         precontact_seconds: Optional[float] = None,
         fusion_gate_mode: str = "attention_alpha",
         action_representation: str = "ee_pose",
+        image_mask_scope: str = "full_context",
+        mask_schedule: Optional[dict] = None,
+        contact_fusion_gate: bool = False,
+        preserve_zero_wrench: bool = False,
         **scheduler_step_kwargs,
     ) -> None:
         super().__init__()
         self.future_contact_mode = validate_future_contact_mode(future_contact_mode)
         self.precontact_seconds = validate_precontact_seconds(precontact_seconds)
-        if fusion_gate_mode not in {"attention_alpha", "phase_binary"}:
-            raise ValueError("fusion_gate_mode must be 'attention_alpha' or 'phase_binary'")
+        if fusion_gate_mode not in {"attention_alpha", "phase_binary", "current_contact"}:
+            raise ValueError("fusion_gate_mode must be 'attention_alpha', 'phase_binary', or 'current_contact'")
         self.fusion_gate_mode = str(fusion_gate_mode)
+        self.contact_fusion_gate = bool(contact_fusion_gate)
+        self.preserve_zero_wrench = bool(preserve_zero_wrench)
+        if self.contact_fusion_gate and future_phase_wrench_key is None:
+            raise ValueError("contact_fusion_gate requires future_phase_wrench_key")
         if self.precontact_seconds is not None and future_phase_wrench_key is not None:
             raise ValueError("Pre-contact gating requires causal wrench history")
         obs_shape_meta = shape_meta.get("obs", {})
@@ -226,13 +236,14 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 cross_attn_query=cross_attn_query,
                 cross_attn_query_residual=cross_attn_query_residual,
                 image_shapes={key: obs_shape_meta[key]["shape"] for key in configured_image_keys},
+                image_token_masking=mask_schedule is not None,
             )
         encoder_image_keys = tuple(getattr(obs_encoder, "image_keys", ()))
-        if self.fusion_gate_mode == "phase_binary" and (
+        if (self.fusion_gate_mode in {"phase_binary", "current_contact"} or self.contact_fusion_gate) and (
             getattr(obs_encoder, "cross_attn_query", None) != "image"
             or getattr(obs_encoder, "cross_attn_layers", 0) <= 0
         ):
-            raise ValueError("phase_binary fusion requires image-query cross-attention")
+            raise ValueError("Full fusion gating requires image-query cross-attention")
         if encoder_image_keys and encoder_image_keys != configured_image_keys:
             raise ValueError(
                 f"obs_encoder cameras={list(encoder_image_keys)} do not match "
@@ -286,6 +297,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             FactrBlurScheduler(**image_blur_schedule)
             if image_blur_schedule is not None else None
         )
+        self.mask_scheduler = MaskProbabilityScheduler(**mask_schedule) if mask_schedule is not None else None
+        self.image_masker = ContactAwareImageMasker(scope=image_mask_scope) if self.mask_scheduler is not None else None
         if image_blur_scope not in {"current_observation", "full_context", "precontact_contact"}:
             raise ValueError(
                 "image_blur_scope must be 'current_observation', 'full_context', or 'precontact_contact'"
@@ -476,6 +489,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             return_processed_wrench=True,
             return_future_contact=return_future_contact,
             precontact_seconds=getattr(self, "precontact_seconds", None),
+            preserve_zero_wrench=getattr(self, "preserve_zero_wrench", False),
         )
         self._latest_processed_wrench = processed_wrench.detach()
         self._latest_normalized_wrench = normalized_wrench.detach()
@@ -502,6 +516,15 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         images, normalized_wrench, contact, future_contact = (
             self.prepare_context_inputs_with_future_contact(obs_dict)
         )
+        if self.fusion_gate_mode == "current_contact" and "contact_phase" in obs_dict:
+            # Training labels scan measured frames once per episode. Use that
+            # exact causal debounce state rather than rescanning overlapping
+            # histories, which can count the same measurement more than once.
+            phase = obs_dict["contact_phase"][:, :self.n_obs_steps]
+            if phase.shape != contact.shape or not ((phase == 0) | (phase == 2)).all():
+                raise ValueError("current_contact expects only free=0 and contact=2 episode labels")
+            contact = phase == 2
+            future_contact = contact.unsqueeze(-1)
         future_has_contact = future_contact.any(dim=-1)
         # The curriculum degrades image evidence only for windows whose
         # *future* reaches contact.  The current observation is often still
@@ -550,7 +573,30 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             "curriculum/optimizer_step": float(self.optimizer_step),
         }
         fusion_kwargs = {}
-        if self.fusion_gate_mode == "phase_binary":
+        if self.mask_scheduler is not None:
+            probability = (self.mask_scheduler.probability(self.optimizer_step)
+                           if apply_curriculum_mask else 0.0)
+            if self.image_masker.scope == "current_contact":
+                mask_contact = contact
+            else:
+                mask_contact = (fusion_gate_from_phase(obs_dict, self.n_obs_steps)
+                                if self.image_masker.scope == "precontact_contact" else future_has_contact)
+            image_mask = self.image_masker(
+                mask_contact, probability=probability,
+                enabled=apply_curriculum_mask, generator=generator,
+            )
+            if self.contact_fusion_gate:
+                image_mask = image_mask & future_has_contact
+            fusion_kwargs["image_token_mask"] = image_mask
+            self.last_curriculum_metrics.update({
+                "curriculum/mask_probability": probability,
+                "curriculum/masked_image_fraction": image_mask.float().mean().item(),
+            })
+        if self.contact_fusion_gate:
+            fusion_kwargs["fusion_gate"] = future_has_contact
+        elif self.fusion_gate_mode == "current_contact":
+            fusion_kwargs["fusion_gate"] = contact
+        elif self.fusion_gate_mode == "phase_binary":
             fusion_kwargs["fusion_gate"] = fusion_gate_from_phase(obs_dict, self.n_obs_steps)
         elif (
             getattr(self.obs_encoder, "cross_attn_query", None) == "image"

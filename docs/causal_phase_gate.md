@@ -1,55 +1,45 @@
-# 因果阶段子网络
+# CIVI 阶段预测与三阶段训练
 
-本实现按用户确认的结构，将一个独立的小型 CNN + GRU 与原空间 gate / RGB 学生一同训练。教师不变，学生对“何时打开”的判断由历史观测预测。
+当前 CIVI 使用同一条因果输入链：教师和学生读取阈值后 `observation.tau_ext`，顶层 `tau_ext_history_steps=25` 默认使每观测以 `t-24…t` 的 25 个七轴外力矩向量为输入，原始 25 Hz 下约 1 秒。修改这一项会同步改变教师输入形状、LSTM 历史和数据窗口，学生自动继承教师 checkpoint 的设置。episode 开始前缺失的力矩补零。L1 小于 12.5 N·m 时整向量置零，等于阈值保留。物理零在归一化后仍为零。
 
-## 输入与结构
+## phase 输入与输出
 
-对每个待预测观测时刻 t 独立构造输入，学生的后一个观测不会成为前一个观测的输入。
+对每个待预测观测时刻独立构造历史；后一个观测不会泄露给前一个观测。
 
 | 输入 | 时间范围 | 张量形状 |
 | --- | --- | --- |
-| front / right_wrist RGB，模型键 side / wrist | t-12、t-8、t-4、t | 每个相机 `[B,To,4,3,H,W]` |
-| 七轴关节位置 | t-15 到 t | 状态前 7 维 |
-| 七轴关节速度 | t-15 到 t | 状态中 7 维 |
-| 连续七轴关节外力矩 | t-15 到 t | 状态后 7 维 |
-| 合并状态 | 当前及历史共 16 帧 | `[B,To,16,21]` |
+| 双相机 RGB：side / wrist | `t-12,t-8,t-4,t` | 每相机 `[B,To,4,3,H,W]` |
+| 七轴 joint、velocity、阈值后 tau_ext | 默认 `t-24…t` | 合并为 `[B,To,tau_ext_history_steps,21]` |
 
-源列为 `observation.joint`、`observation.velocity`、`observation.tau_ext_unthresholded`。episode 开头不足的历史重复首帧。RGB 缓存可以是 uint8，前向时转换为 `[0,1]` 并缩放到 112×112；状态均值/标准差只使用训练 episode，作为 checkpoint buffer 保存。
+状态源为 `observation.joint`、`observation.velocity`、`observation.tau_ext`。图像在 episode 开头延用首帧，缺失的完整 joint/velocity/tau_ext 状态历史填零。状态标准化仅用训练 episode 拟合，并存入 checkpoint。
 
-两个相机共享三层 CNN；保留相机次序，拼接每个图像时刻的 64 维特征，经过 GRU 得到 64 维图像摘要。21 维状态经投影与另一个 GRU 得到 64 维状态摘要。两者拼接后由 MLP 输出一个 logit。默认总参数量为 112,737。
+两个相机共享 CNN，图像特征经 GRU 汇总；21 维历史状态经过投影与另一个 GRU，两者拼接后预测三个 logits。类别为 free=0、precontact=1、contact=2。`argmax != 0` 得到渲染开关；`p_open=1-p_free` 供日志使用。开关 detach，RGB/token 损失不更新 phase 头。precontact 的力矩即使经阈值后为零，仍按预测 phase 开启渲染；precontact→contact 按三分类 argmax 直接切换，不增加渐变或防抖。离线接触标签和默认 0.5 秒 precontact 标签仅用于监督，推理不需要标签或未来观测。
 
-```text
-两相机历史 RGB → 共享 CNN → 特征拼接 → 图像 GRU ─┐
-16 帧 joint / velocity / tau → 归一化 → 状态 GRU ─┤→ MLP → p_open
-                                                └→ p_open >= 0.5 → 渲染开关
-```
+## 顺序训练与冻结
 
-## 训练与梯度
-
-标签由现有教师的逐帧 `contact_phase` 规则产生：free=0，precontact/contact=1。标签只用于教师目标与 BCE 监督；学生渲染和推理开关始终使用预测结果。
-
-| 阶段 | 训练模块 | 损失 |
+| 阶段 | 可训练模块 | 验证选模和收敛指标 |
 | --- | --- | --- |
-| 前 5 个 epoch | 独立空间 gate + 阶段子网络 | 原 gate patch/平滑损失 + BCE |
-| 其后 RGB 蒸馏 | RGB 主干 + 阶段子网络；空间 gate 冻结 | 普通 context token MSE + BCE |
+| phase | 仅 phase 头 | 三分类交叉熵 |
+| intensity | 独立空间 gate 与其编码路径 | 教师 context 响应强度的 patch 损失与平滑损失 |
+| rgb | RGB RenderNet；两个预测头保持冻结 | 最终 context token MSE |
 
-BCE 权重为 1。二值开关对概率执行 detach，token MSE 不向阶段子网络传梯度。RGB 开关关闭时保持输入图像；打开时应用原空间 gate 和 RGB 残差。阶段模块作为 RenderNet 的子模块，共享优化器、EMA 和 checkpoint 生命周期。
+每个阶段使用验证损失监测收敛，连续 5 次验证无至少 0.0001 改善即恢复该阶段最优权重并冻结。phase 和空间强度阶段不执行 RGB/DINO 蒸馏前向。阶段切换重置优化器状态、学习率和早停计数，EMA 与冻结权重同步，恢复训练时保留当前阶段与计数。RGB 阶段结束时早停，不重新解冻预测头。`training.num_epochs=3000` 是总预算上限，不替代收敛条件。
 
-验证选模和早停只按原 token MSE；BCE 不计入选模指标。gate 阶段不累计早停，切换 RGB 时重置计数，patience 5、min_delta 0.0001。
+context 空间强度监督来自冻结教师在真实力矩与零力矩下 context 的差异，默认每图归一化为强度场。学生在推理时仅执行自身预测头，空间 gate 与 FiLM 调制 RGB 残差；free 保留输入图像，precontact/contact 应用渲染。学生图像路径经过冻结教师视觉编码器，不重放教师的力觉融合 FFN。
+
+## 教师课程
+
+冻结 DINOv3 后使用单层 image-query cross-attention/FFN 和 DiT。contact/precontact 开启完整融合，free 整体旁路；训练视觉 token 的 mask 概率按 0%–25%=1、25%–75% 从 1 线性降到 0、75%–100%=0。mask 仅作用于 contact/precontact，验证、推理与蒸馏目标不加 mask。当前统一配置无 blur、未来力矩输入或固定 epoch 的强度预热。
 
 ## 推理接口
 
-`obs['phase_inputs']` 包含：
+`obs['phase_inputs']` 包含原始物理状态和历史图像：
 
 ```python
 {
-    'state': tensor,  # [B,To,16,21]，原始物理量
-    'images': {'side': tensor, 'wrist': tensor},  # 各 [B,To,4,3,H,W]
+    'state': tensor,  # [B,To,tau_ext_history_steps,21]，joint、velocity、阈值后tau_ext
+    'images': {'side': tensor, 'wrist': tensor},  # 各[B,To,4,3,H,W]
 }
 ```
 
-`RenderNet.forward(..., phase_inputs=...)` 内部预测开关，返回 condition 中的 `phase_logits`、`p_open`、`contact_alpha`。checkpoint 恢复状态标准化；部署端须按相同次序和偏移维护历史，不传未来帧。渲染入口已递归处理此输入，不依赖推理时的 `contact_phase`。
-
-日志新增阶段 BCE、准确率、预测打开比例，以及 free 误开率、precontact 召回率、contact 召回率。分阶段指标累积真实样本数，并记录各自分母，避免缺失类别被误读为零召回。
-
-与旧实验相比，gate / FiLM RGB / token MSE 主链保留，但额外加入了阶段预测能力；本次学生不能再称为与 11 月 7 日结构完全相同。预测时机是否足够准确，需要训练后的分阶段指标与任务评估验证。
+RenderNet 内部返回 `phase_logits`、`phase_prediction`、`p_open` 与 `contact_alpha`。部署端使用与训练相同的时间偏移、阈值和补零规则，不传离线 `contact_phase` 作为推理开关。旧二分类 checkpoint 仍按保存的配置和输出维数加载，与新的三分类模型权重不互换。

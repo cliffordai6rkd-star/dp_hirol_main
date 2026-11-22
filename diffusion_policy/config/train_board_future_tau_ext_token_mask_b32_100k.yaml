@@ -1,0 +1,7 @@
+# Compatibility name: causal history50 CIVI, not future torque. Budget only: 100k.
+defaults:
+  - train_civi_teacher
+  - _self_
+name: train_board_future_tau_ext_token_mask_b32_100k
+training:
+  num_optimizer_steps: 100000

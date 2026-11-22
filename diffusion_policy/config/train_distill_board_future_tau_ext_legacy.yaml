@@ -1,0 +1,5 @@
+# Compatibility name: the unified causal three-stage student; no future input.
+defaults:
+  - train_distill_render_net_student
+  - _self_
+name: train_distill_board_future_tau_ext_legacy

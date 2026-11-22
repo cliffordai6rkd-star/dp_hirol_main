@@ -154,21 +154,21 @@ def test_phase_binary_fusion_preserves_selective_pixel_blur_and_clear_targets():
     assert "contact_alpha" not in seen[0]
 
 
-def test_reproduction_configs_match_confirmed_teacher_and_old_student():
+def test_compatibility_names_resolve_to_unified_mask_teacher_and_staged_student():
     root = Path(__file__).resolve().parents[1] / "diffusion_policy/config"
     teacher = load_config_reference(str(root / "train_civi_teacher_board_blur_legacy_fusion.yaml"))
     student = load_config_reference(str(root / "train_distill_render_net_board_legacy.yaml"))
     assert teacher.policy.fusion_gate_mode == "phase_binary"
-    assert teacher.policy.cross_attn_layers == 2
+    assert teacher.policy.cross_attn_layers == 1
     assert teacher.policy.precontact_seconds == .5
     assert teacher.policy.future_phase_wrench_key is None
-    assert teacher.task.dataset.windowed_lowdim_feature_groups.tau_ext.start_offset == -7
-    assert teacher.shape_meta.obs.tau_ext.shape == [8, 7]
+    assert teacher.task.dataset.windowed_lowdim_feature_groups.tau_ext.start_offset == -24
+    assert teacher.shape_meta.obs.tau_ext.shape == [25, 7]
     assert teacher.training.num_optimizer_steps == 150000
     assert teacher.dataloader.batch_size == 32
-    schedule = FactrBlurScheduler(**OmegaConf.to_container(teacher.policy.image_blur_schedule))
-    schedule.set_total_steps(teacher.training.num_optimizer_steps)
-    assert [schedule.sigma(step) for step in (0, 50000, 100000, 150000)] == pytest.approx([5, 5, 2.5, 0])
+    assert teacher.policy.image_blur_schedule is None
+    assert teacher.policy.image_mask_scope == "precontact_contact"
+    assert teacher.policy.mask_schedule.piecewise_probabilities == [1., 1., 0., 0.]
     assert student.render_net.backbone.image_self_attn_layers == 4
     assert student.render_net.backbone.cross_attn_layers == 2
     assert student.render_net.backbone.decoder_layers == 4
@@ -177,10 +177,10 @@ def test_reproduction_configs_match_confirmed_teacher_and_old_student():
     assert student.render_net.residual_scale == 1.
     assert student.render_net.separate_gate_path
     assert student.render_net.spatial_modulation.enabled
-    assert student.training.render_stages.intensity_epochs == 5
+    assert student.render_net.phase_predictor.num_classes == 3
+    assert student.training.render_stages.transition == "validation_plateau"
     assert student.dataloader.batch_size == 16
     assert student.training.early_stopping.enabled
     assert student.training.early_stopping.patience == 5
-    assert student.training.early_stopping.start_at_rgb
     assert student.distillation.objective == "token_mse"
     assert not student.distillation.use_teacher_ffn

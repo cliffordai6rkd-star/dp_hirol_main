@@ -1,4 +1,4 @@
-"""Predict the teacher's binary phase switch from measured causal history."""
+"""Predict contact phases from measured causal histories."""
 
 import torch
 from torch import nn
@@ -9,7 +9,8 @@ class CausalPhaseGate(nn.Module):
     def __init__(self, image_keys, history_steps=16, image_offsets=(-12, -8, -4, 0),
                  hidden_dim=64, image_size=112, threshold=0.5, loss_weight=1.0,
                  state_source_keys=("observation.joint", "observation.velocity",
-                                    "observation.tau_ext_unthresholded")):
+                                    "observation.tau_ext_unthresholded"), num_classes=2,
+                 pad_mode="edge"):
         super().__init__()
         self.image_keys = tuple(image_keys)
         self.history_steps = int(history_steps)
@@ -17,11 +18,19 @@ class CausalPhaseGate(nn.Module):
         self.image_size = int(image_size)
         self.threshold = float(threshold)
         self.loss_weight = float(loss_weight)
+        self.pad_mode = str(pad_mode)
+        if self.pad_mode not in {"edge", "zero"}:
+            raise ValueError("Phase history pad_mode must be edge or zero")
+        # Two classes retain the original single-logit checkpoint layout.
+        self.num_classes = int(num_classes)
+        if self.num_classes not in {2, 3}:
+            raise ValueError("Phase prediction supports two or three classes")
         if (self.history_steps < 1 or not self.image_offsets
                 or tuple(sorted(set(self.image_offsets))) != self.image_offsets
                 or self.image_offsets[-1] != 0 or self.image_offsets[0] < 1 - self.history_steps):
             raise ValueError("Phase image offsets must be distinct causal offsets ending at zero, within history")
-        if len(self.image_keys) != 2 or len(state_source_keys) != 3:
+        self.state_source_keys = tuple(str(key) for key in state_source_keys)
+        if len(self.image_keys) != 2 or len(self.state_source_keys) != 3:
             raise ValueError("Phase prediction requires two cameras and joint/velocity/torque histories")
         if not 0 < self.threshold < 1 or not self.loss_weight > 0:
             raise ValueError("Phase threshold must be in (0,1) and loss weight positive")
@@ -40,7 +49,7 @@ class CausalPhaseGate(nn.Module):
         self.state_projection = nn.Sequential(nn.Linear(21, hidden_dim), nn.SiLU())
         self.state_temporal = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.head = nn.Sequential(nn.Linear(2 * hidden_dim, hidden_dim), nn.SiLU(),
-                                  nn.Linear(hidden_dim, 1))
+                                  nn.Linear(hidden_dim, 3 if self.num_classes == 3 else 1))
 
     @torch.no_grad()
     def fit_normalizer(self, training_states):
@@ -73,9 +82,28 @@ class CausalPhaseGate(nn.Module):
             summaries.append(features.reshape(batch * steps, len(self.image_offsets), -1))
         _, image_hidden = self.image_temporal(torch.cat(summaries, dim=-1))
         normalized = (state.float() - self.state_mean) / self.state_std
+        thresholded_torque = self.state_source_keys[-1] == "observation.tau_ext"
+        if self.num_classes == 3 or thresholded_torque:
+            # Thresholded physical zeros retain their meaning even when joint
+            # position/velocity are nonzero and the training torque mean is not.
+            torque = normalized[..., 14:]
+            torque = torch.where(state[..., 14:].eq(0).all(dim=-1, keepdim=True),
+                                 torch.zeros_like(torque), torque)
+            normalized = torch.cat((normalized[..., :14], torque), dim=-1)
+        if self.pad_mode == "zero":
+            normalized = torch.where(state.eq(0).all(dim=-1, keepdim=True),
+                                     torch.zeros_like(normalized), normalized)
         projected = self.state_projection(normalized.reshape(batch * steps, self.history_steps, 21))
         _, state_hidden = self.state_temporal(projected)
-        logits = self.head(torch.cat((image_hidden[-1], state_hidden[-1]), dim=-1)).reshape(batch, steps).float()
+        logits = self.head(torch.cat((image_hidden[-1], state_hidden[-1]), dim=-1)).float()
+        if self.num_classes == 3:
+            logits = logits.reshape(batch, steps, 3)
+            probabilities = logits.softmax(dim=-1)
+            prediction = logits.detach().argmax(dim=-1)
+            return {"phase_logits": logits, "phase_probabilities": probabilities,
+                    "phase_prediction": prediction, "p_open": 1 - probabilities[..., 0],
+                    "contact_alpha": (prediction != 0).to(logits.dtype)}
+        logits = logits.reshape(batch, steps)
         probability = logits.sigmoid()
         # Token gradients cannot change the timing classifier through this switch.
         gate = (probability.detach() >= self.threshold).to(logits.dtype)

@@ -1,3 +1,4 @@
+import bisect
 import math
 from typing import Optional, Sequence
 
@@ -335,6 +336,196 @@ class VectorThresholdGate(nn.Module):
             raise ValueError("gated values must have at least one dimension")
         keep = self.keep_mask(values)
         return torch.where(keep.unsqueeze(-1), values, torch.zeros_like(values))
+
+
+class MaskProbabilityScheduler(nn.Module):
+    """Map optimizer update steps to contact-image masking probability."""
+
+    def __init__(
+        self,
+        schedule_type: str = "cosine",
+        start_step: int = 0,
+        end_step: int = 50_000,
+        start_probability: float = 1.0,
+        end_probability: float = 0.0,
+        exponential_rate: float = 5.0,
+        piecewise_steps: Optional[Sequence[int]] = None,
+        piecewise_probabilities: Optional[Sequence[float]] = None,
+        piecewise_interpolation: str = "linear",
+        total_steps: Optional[int] = None,
+        piecewise_fractions: Optional[Sequence[float]] = None,
+    ) -> None:
+        super().__init__()
+        supported = {"constant", "linear", "cosine", "exponential", "piecewise"}
+        if schedule_type not in supported:
+            raise ValueError(
+                f"Unsupported schedule_type={schedule_type!r}; expected one of {sorted(supported)}"
+            )
+        if end_step < start_step:
+            raise ValueError("end_step must be greater than or equal to start_step")
+        for value in (start_probability, end_probability):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError("mask probabilities must be in [0, 1]")
+        if exponential_rate <= 0:
+            raise ValueError("exponential_rate must be positive")
+        if piecewise_interpolation not in {"linear", "hold"}:
+            raise ValueError("piecewise_interpolation must be 'linear' or 'hold'")
+
+        self.schedule_type = schedule_type
+        self.start_step = int(start_step)
+        self.end_step = int(end_step)
+        self.start_probability = float(start_probability)
+        self.end_probability = float(end_probability)
+        self.exponential_rate = float(exponential_rate)
+        self.piecewise_interpolation = piecewise_interpolation
+        self.piecewise_fractions = None
+        self.auto_total_steps = piecewise_fractions is not None and total_steps is None
+        self.total_steps = None
+
+        if piecewise_fractions is not None:
+            if piecewise_steps:
+                raise ValueError(
+                    "provide either piecewise_steps or piecewise_fractions, not both"
+                )
+            fractions = tuple(float(value) for value in piecewise_fractions)
+            if (
+                len(fractions) < 1
+                or any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in fractions)
+                or tuple(sorted(set(fractions))) != fractions
+            ):
+                raise ValueError(
+                    "piecewise_fractions must be sorted finite values in [0, 1]"
+                )
+            self.piecewise_fractions = fractions
+        self.piecewise_steps = tuple(int(step) for step in (piecewise_steps or ()))
+        if self.piecewise_fractions is not None and total_steps is not None:
+            self.set_total_steps(total_steps)
+        self.piecewise_probabilities = tuple(
+            float(value) for value in (piecewise_probabilities or ())
+        )
+        if self.schedule_type == "piecewise":
+            boundaries = self.piecewise_fractions or self.piecewise_steps
+            if len(boundaries) < 1:
+                raise ValueError("piecewise schedule requires at least one step")
+            if len(boundaries) != len(self.piecewise_probabilities):
+                raise ValueError("piecewise steps and probabilities must have equal length")
+            if tuple(sorted(self.piecewise_steps)) != self.piecewise_steps:
+                raise ValueError("piecewise steps must be sorted")
+            if any(not 0.0 <= value <= 1.0 for value in self.piecewise_probabilities):
+                raise ValueError("piecewise probabilities must be in [0, 1]")
+
+    def set_total_steps(self, total_steps: int) -> None:
+        total_steps = int(total_steps)
+        if total_steps < 1:
+            raise ValueError("piecewise_fractions requires a positive total_steps")
+        if self.piecewise_fractions is not None:
+            steps = tuple(int(round(value * total_steps)) for value in self.piecewise_fractions)
+            if tuple(sorted(set(steps))) != steps:
+                raise ValueError("piecewise_fractions must map to distinct optimizer steps")
+            self.piecewise_steps = steps
+        self.total_steps = total_steps
+
+    def probability(self, optimizer_step: int) -> float:
+        step = int(optimizer_step)
+        if self.schedule_type == "constant":
+            return self.start_probability
+        if self.schedule_type == "piecewise":
+            if self.piecewise_fractions is not None and self.total_steps is None:
+                raise RuntimeError("Set the optimizer-step budget before using the mask curriculum")
+            return self._piecewise_probability(step)
+        if step <= self.start_step:
+            return self.start_probability
+        if step >= self.end_step:
+            return self.end_probability
+
+        duration = max(1, self.end_step - self.start_step)
+        progress = (step - self.start_step) / duration
+        if self.schedule_type == "linear":
+            weight = 1.0 - progress
+        elif self.schedule_type == "cosine":
+            weight = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            end_value = math.exp(-self.exponential_rate)
+            weight = (math.exp(-self.exponential_rate * progress) - end_value) / (
+                1.0 - end_value
+            )
+        return self.end_probability + (
+            self.start_probability - self.end_probability
+        ) * weight
+
+    def _piecewise_probability(self, step: int) -> float:
+        insertion = bisect.bisect_right(self.piecewise_steps, step)
+        if insertion == 0:
+            return self.piecewise_probabilities[0]
+        if insertion >= len(self.piecewise_steps):
+            return self.piecewise_probabilities[-1]
+        left = insertion - 1
+        if self.piecewise_interpolation == "hold":
+            return self.piecewise_probabilities[left]
+        left_step = self.piecewise_steps[left]
+        right_step = self.piecewise_steps[insertion]
+        progress = (step - left_step) / max(1, right_step - left_step)
+        left_value = self.piecewise_probabilities[left]
+        right_value = self.piecewise_probabilities[insertion]
+        return left_value + (right_value - left_value) * progress
+
+    def forward(self, optimizer_step: int) -> float:
+        return self.probability(optimizer_step)
+
+class ContactAwareImageMasker(nn.Module):
+    """Sample whole-image token masks for selected contact-target windows.
+
+    The caller supplies the phase condition that should trigger masking.  For
+    future-phase training this is the future-window contact flag, rather than
+    the current observation's contact state.
+    """
+
+    def __init__(self, scope: str = "full_context") -> None:
+        super().__init__()
+        if scope not in {"current_observation", "full_context", "precontact_contact", "current_contact"}:
+            raise ValueError(
+                f"Unsupported mask scope={scope!r}; "
+                "expected 'current_observation', 'full_context', 'precontact_contact', or 'current_contact'."
+            )
+        self.scope = scope
+
+    def forward(
+        self,
+        contact_mask: torch.Tensor,
+        probability: float,
+        enabled: bool = True,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        if contact_mask.ndim != 2:
+            raise ValueError(
+                f"contact_mask must have shape [B, To], got {tuple(contact_mask.shape)}"
+            )
+        result = torch.zeros_like(contact_mask, dtype=torch.bool)
+        probability = float(probability)
+        if not enabled or probability <= 0.0:
+            return result
+
+        if self.scope in {"precontact_contact", "current_contact"}:
+            if probability >= 1.0:
+                return contact_mask.clone()
+            return contact_mask & (torch.rand(contact_mask.shape, device=contact_mask.device,
+                                              generator=generator) < probability)
+
+        latest_contact = contact_mask[:, -1]
+        if probability >= 1.0:
+            selected = latest_contact
+        else:
+            random_values = torch.rand(
+                latest_contact.shape,
+                device=contact_mask.device,
+                generator=generator,
+            )
+            selected = latest_contact & (random_values < probability)
+
+        if self.scope == "full_context":
+            return selected[:, None].expand_as(contact_mask).clone()
+        result[:, -1] = selected
+        return result
 
 
 class FactrBlurScheduler(nn.Module):

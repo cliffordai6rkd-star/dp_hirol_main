@@ -116,6 +116,8 @@ def _config(root):
     # This fixture replaces both networks; its teacher has no LSTM to copy.
     cfg.render_net.initialize_wrench_from_teacher = False
     cfg.render_net.high_attention_render.enabled = False
+    cfg.render_net.phase_predictor.enabled = False
+    cfg.training.render_stages = {"enabled": False, "transition": "epoch"}
     cfg.logging.progress_bar = False
     cfg.logging.plot_every_steps = 0
     for loader in (cfg.dataloader, cfg.val_dataloader):

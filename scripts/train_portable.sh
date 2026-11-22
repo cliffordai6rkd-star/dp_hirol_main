@@ -19,8 +19,8 @@ if [[ "$mode" == check ]]; then
     scripts/check_ddp_runtime.py "$@"
 fi
 args=("$mode"
-  --dp-config diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml
-  --distill-config diffusion_policy/config/train_distill_render_net_board_legacy.yaml
+  --dp-config diffusion_policy/config/train_civi_teacher.yaml
+  --distill-config diffusion_policy/config/train_distill_render_net_student.yaml
   --nproc-per-node "$nproc")
 case "$mode" in
   all|dp)

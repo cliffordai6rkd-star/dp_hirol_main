@@ -1,0 +1,1075 @@
+{
+  "architecture": "shared per-camera 4/8/12-channel CNN at 64x64 + tau_ext GRU + MLP -> 3-class CE",
+  "inputs": {
+    "images": [
+      "side",
+      "wrist"
+    ],
+    "tau_ext_history_steps": 50,
+    "tau_ext_dim": 7,
+    "tau_ext_source": "teacher-preprocessed normalized tau_ext with physical zeros preserved"
+  },
+  "labels": "0=free, 1=precontact, 2=contact; open iff prediction != 0",
+  "objective": "unweighted cross_entropy(logits, contact_phase)",
+  "best_epoch": 12,
+  "best_validation_ce": 0.11849559468402415,
+  "stopped_epoch": 15,
+  "early_stopped": true,
+  "parameters": 4551,
+  "final_train": {
+    "accuracy": 0.9595268368721008,
+    "phase_recall": [
+      0.9947834610939026,
+      0.3876337707042694,
+      1.0
+    ],
+    "free_false_open_rate": 0.005216535433070866,
+    "precontact_open_rate": 0.3876337707042694,
+    "contact_open_rate": 1.0,
+    "open_recall": 0.8670624677336086,
+    "observations": 28068,
+    "confusion": [
+      [
+        20214,
+        106,
+        0
+      ],
+      [
+        1030,
+        652,
+        0
+      ],
+      [
+        0,
+        0,
+        6066
+      ]
+    ],
+    "ce_loss": 0.12280950563879744
+  },
+  "final_validation": {
+    "accuracy": 0.9617180228233337,
+    "phase_recall": [
+      0.9900709390640259,
+      0.460317462682724,
+      1.0
+    ],
+    "free_false_open_rate": 0.009929078014184398,
+    "precontact_open_rate": 0.4761904776096344,
+    "contact_open_rate": 1.0,
+    "open_recall": 0.9098360655737705,
+    "observations": 2142,
+    "confusion": [
+      [
+        1396,
+        8,
+        6
+      ],
+      [
+        66,
+        58,
+        2
+      ],
+      [
+        0,
+        0,
+        606
+      ]
+    ],
+    "ce_loss": 0.11849559468402415
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "accuracy": 0.8784024715423584,
+        "phase_recall": [
+          0.9981299042701721,
+          0.0,
+          0.7209033966064453
+        ],
+        "free_false_open_rate": 0.0018700787401574803,
+        "precontact_open_rate": 0.06361474096775055,
+        "contact_open_rate": 0.7209033966064453,
+        "open_recall": 0.5782137325761487,
+        "observations": 28068,
+        "confusion": [
+          [
+            20282,
+            0,
+            38
+          ],
+          [
+            1575,
+            0,
+            107
+          ],
+          [
+            1693,
+            0,
+            4373
+          ]
+        ],
+        "ce_loss": 0.4104472966730654
+      },
+      "validation": {
+        "accuracy": 0.9318394064903259,
+        "phase_recall": [
+          0.9900709390640259,
+          0.0,
+          0.9900990128517151
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.1587301641702652,
+        "contact_open_rate": 0.9900990128517151,
+        "open_recall": 0.8469945355191257,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            0,
+            14
+          ],
+          [
+            106,
+            0,
+            20
+          ],
+          [
+            6,
+            0,
+            600
+          ]
+        ],
+        "ce_loss": 0.2128418710162771
+      },
+      "elapsed_seconds": 45.250476359855384
+    },
+    {
+      "epoch": 2,
+      "train": {
+        "accuracy": 0.9427105784416199,
+        "phase_recall": [
+          0.9971948862075806,
+          0.1218787133693695,
+          0.9878008365631104
+        ],
+        "free_false_open_rate": 0.0028051181102362204,
+        "precontact_open_rate": 0.20749108493328094,
+        "contact_open_rate": 0.9899439215660095,
+        "open_recall": 0.8200826019617966,
+        "observations": 28068,
+        "confusion": [
+          [
+            20263,
+            40,
+            17
+          ],
+          [
+            1333,
+            205,
+            144
+          ],
+          [
+            61,
+            13,
+            5992
+          ]
+        ],
+        "ce_loss": 0.2016746115506978
+      },
+      "validation": {
+        "accuracy": 0.9458450078964233,
+        "phase_recall": [
+          0.9872340559959412,
+          0.2539682686328888,
+          0.9933993220329285
+        ],
+        "free_false_open_rate": 0.01276595744680851,
+        "precontact_open_rate": 0.3333333432674408,
+        "contact_open_rate": 0.9966996908187866,
+        "open_recall": 0.8825136612021858,
+        "observations": 2142,
+        "confusion": [
+          [
+            1392,
+            18,
+            0
+          ],
+          [
+            84,
+            32,
+            10
+          ],
+          [
+            2,
+            2,
+            602
+          ]
+        ],
+        "ce_loss": 0.18004625255153292
+      },
+      "elapsed_seconds": 89.98616181127727
+    },
+    {
+      "epoch": 3,
+      "train": {
+        "accuracy": 0.9525082111358643,
+        "phase_recall": [
+          0.997244119644165,
+          0.27764564752578735,
+          0.9897791147232056
+        ],
+        "free_false_open_rate": 0.0027559055118110236,
+        "precontact_open_rate": 0.3156956136226654,
+        "contact_open_rate": 0.9930761456489563,
+        "open_recall": 0.846024780588539,
+        "observations": 28068,
+        "confusion": [
+          [
+            20264,
+            43,
+            13
+          ],
+          [
+            1151,
+            467,
+            64
+          ],
+          [
+            42,
+            20,
+            6004
+          ]
+        ],
+        "ce_loss": 0.18120641282468808
+      },
+      "validation": {
+        "accuracy": 0.9542483687400818,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3333333432674408,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.3968254029750824,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8961748633879781,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            76,
+            42,
+            8
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.17316153778387608
+      },
+      "elapsed_seconds": 135.61748528899625
+    },
+    {
+      "epoch": 4,
+      "train": {
+        "accuracy": 0.956035315990448,
+        "phase_recall": [
+          0.9968996047973633,
+          0.328180730342865,
+          0.993241012096405
+        ],
+        "free_false_open_rate": 0.0031003937007874015,
+        "precontact_open_rate": 0.34363853931427,
+        "contact_open_rate": 0.9960435032844543,
+        "open_recall": 0.8544140423335054,
+        "observations": 28068,
+        "confusion": [
+          [
+            20257,
+            55,
+            8
+          ],
+          [
+            1104,
+            552,
+            26
+          ],
+          [
+            24,
+            17,
+            6025
+          ]
+        ],
+        "ce_loss": 0.16942724597000475
+      },
+      "validation": {
+        "accuracy": 0.9542483687400818,
+        "phase_recall": [
+          0.9886524677276611,
+          0.3492063581943512,
+          1.0
+        ],
+        "free_false_open_rate": 0.011347517730496455,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1394,
+            8,
+            8
+          ],
+          [
+            78,
+            44,
+            4
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.17091293267063956
+      },
+      "elapsed_seconds": 180.42053420189768
+    },
+    {
+      "epoch": 5,
+      "train": {
+        "accuracy": 0.9574604630470276,
+        "phase_recall": [
+          0.9974901676177979,
+          0.3370986878871918,
+          0.9953840970993042
+        ],
+        "free_false_open_rate": 0.0025098425196850393,
+        "precontact_open_rate": 0.34601664543151855,
+        "contact_open_rate": 0.9978569149971008,
+        "open_recall": 0.856350025813113,
+        "observations": 28068,
+        "confusion": [
+          [
+            20269,
+            46,
+            5
+          ],
+          [
+            1100,
+            567,
+            15
+          ],
+          [
+            13,
+            15,
+            6038
+          ]
+        ],
+        "ce_loss": 0.162652105403045
+      },
+      "validation": {
+        "accuracy": 0.9523809552192688,
+        "phase_recall": [
+          0.9843971729278564,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.015602836879432624,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1388,
+            12,
+            10
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.17066850746267873
+      },
+      "elapsed_seconds": 225.27777369413525
+    },
+    {
+      "epoch": 6,
+      "train": {
+        "accuracy": 0.9580305218696594,
+        "phase_recall": [
+          0.9974409341812134,
+          0.3394768238067627,
+          0.9975271821022034
+        ],
+        "free_false_open_rate": 0.002559055118110236,
+        "precontact_open_rate": 0.3472056984901428,
+        "contact_open_rate": 0.9990108609199524,
+        "open_recall": 0.8575116159008777,
+        "observations": 28068,
+        "confusion": [
+          [
+            20268,
+            47,
+            5
+          ],
+          [
+            1098,
+            571,
+            13
+          ],
+          [
+            6,
+            9,
+            6051
+          ]
+        ],
+        "ce_loss": 0.15039777065149074
+      },
+      "validation": {
+        "accuracy": 0.9551820755004883,
+        "phase_recall": [
+          0.9886524677276611,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.011347517730496455,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1394,
+            10,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.14478621185591128
+      },
+      "elapsed_seconds": 269.6757993060164
+    },
+    {
+      "epoch": 7,
+      "train": {
+        "accuracy": 0.9583154916763306,
+        "phase_recall": [
+          0.997588574886322,
+          0.3394768238067627,
+          0.9983514547348022
+        ],
+        "free_false_open_rate": 0.0024114173228346456,
+        "precontact_open_rate": 0.34601664543151855,
+        "contact_open_rate": 0.9995054602622986,
+        "open_recall": 0.8576406814661848,
+        "observations": 28068,
+        "confusion": [
+          [
+            20271,
+            47,
+            2
+          ],
+          [
+            1100,
+            571,
+            11
+          ],
+          [
+            3,
+            7,
+            6056
+          ]
+        ],
+        "ce_loss": 0.1453756070555794
+      },
+      "validation": {
+        "accuracy": 0.9561157822608948,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.14472340703720138
+      },
+      "elapsed_seconds": 313.6890060710721
+    },
+    {
+      "epoch": 8,
+      "train": {
+        "accuracy": 0.9588499069213867,
+        "phase_recall": [
+          0.9981299042701721,
+          0.3394768238067627,
+          0.9990108609199524
+        ],
+        "free_false_open_rate": 0.0018700787401574803,
+        "precontact_open_rate": 0.34601664543151855,
+        "contact_open_rate": 0.9996702671051025,
+        "open_recall": 0.857769747031492,
+        "observations": 28068,
+        "confusion": [
+          [
+            20282,
+            36,
+            2
+          ],
+          [
+            1100,
+            571,
+            11
+          ],
+          [
+            2,
+            4,
+            6060
+          ]
+        ],
+        "ce_loss": 0.14036877538137657
+      },
+      "validation": {
+        "accuracy": 0.9561157822608948,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.13694601799739675
+      },
+      "elapsed_seconds": 357.76628782693297
+    },
+    {
+      "epoch": 9,
+      "train": {
+        "accuracy": 0.9589568376541138,
+        "phase_recall": [
+          0.9980807304382324,
+          0.34066587686538696,
+          0.9993405938148499
+        ],
+        "free_false_open_rate": 0.0019192913385826771,
+        "precontact_open_rate": 0.34601664543151855,
+        "contact_open_rate": 0.9998351335525513,
+        "open_recall": 0.8578988125967991,
+        "observations": 28068,
+        "confusion": [
+          [
+            20281,
+            39,
+            0
+          ],
+          [
+            1100,
+            573,
+            9
+          ],
+          [
+            1,
+            3,
+            6062
+          ]
+        ],
+        "ce_loss": 0.13771419718307326
+      },
+      "validation": {
+        "accuracy": 0.9561157822608948,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.12611624045274894
+      },
+      "elapsed_seconds": 401.6526935379952
+    },
+    {
+      "epoch": 10,
+      "train": {
+        "accuracy": 0.9589924216270447,
+        "phase_recall": [
+          0.9975393414497375,
+          0.3472056984901428,
+          0.9995054602622986
+        ],
+        "free_false_open_rate": 0.0024606299212598425,
+        "precontact_open_rate": 0.34958383440971375,
+        "contact_open_rate": 0.9998351335525513,
+        "open_recall": 0.8586732059886423,
+        "observations": 28068,
+        "confusion": [
+          [
+            20270,
+            50,
+            0
+          ],
+          [
+            1094,
+            584,
+            4
+          ],
+          [
+            1,
+            2,
+            6063
+          ]
+        ],
+        "ce_loss": 0.13367009401168514
+      },
+      "validation": {
+        "accuracy": 0.9561157822608948,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.13519360040541456
+      },
+      "elapsed_seconds": 445.7678601630032
+    },
+    {
+      "epoch": 11,
+      "train": {
+        "accuracy": 0.9588855504989624,
+        "phase_recall": [
+          0.996259868144989,
+          0.36028537154197693,
+          0.9996702671051025
+        ],
+        "free_false_open_rate": 0.0037401574803149606,
+        "precontact_open_rate": 0.3614744246006012,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.861383582860093,
+        "observations": 28068,
+        "confusion": [
+          [
+            20244,
+            75,
+            1
+          ],
+          [
+            1074,
+            606,
+            2
+          ],
+          [
+            0,
+            2,
+            6064
+          ]
+        ],
+        "ce_loss": 0.13264747565057147
+      },
+      "validation": {
+        "accuracy": 0.9561157822608948,
+        "phase_recall": [
+          0.9900709390640259,
+          0.3650793731212616,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.380952388048172,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8934426229508197,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            78,
+            46,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.13081631221113696
+      },
+      "elapsed_seconds": 489.766940491274
+    },
+    {
+      "epoch": 12,
+      "train": {
+        "accuracy": 0.958244264125824,
+        "phase_recall": [
+          0.9953740239143372,
+          0.3596908450126648,
+          0.9998351335525513
+        ],
+        "free_false_open_rate": 0.004625984251968504,
+        "precontact_open_rate": 0.36028537154197693,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8611254517294786,
+        "observations": 28068,
+        "confusion": [
+          [
+            20226,
+            94,
+            0
+          ],
+          [
+            1076,
+            605,
+            1
+          ],
+          [
+            0,
+            1,
+            6065
+          ]
+        ],
+        "ce_loss": 0.12820067750315253
+      },
+      "validation": {
+        "accuracy": 0.9617180228233337,
+        "phase_recall": [
+          0.9900709390640259,
+          0.460317462682724,
+          1.0
+        ],
+        "free_false_open_rate": 0.009929078014184398,
+        "precontact_open_rate": 0.4761904776096344,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.9098360655737705,
+        "observations": 2142,
+        "confusion": [
+          [
+            1396,
+            8,
+            6
+          ],
+          [
+            66,
+            58,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.11849559468402415
+      },
+      "elapsed_seconds": 533.6911390163004
+    },
+    {
+      "epoch": 13,
+      "train": {
+        "accuracy": 0.9583154916763306,
+        "phase_recall": [
+          0.9940944910049438,
+          0.37752676010131836,
+          0.9995054602622986
+        ],
+        "free_false_open_rate": 0.005905511811023622,
+        "precontact_open_rate": 0.3781212866306305,
+        "contact_open_rate": 0.9998351335525513,
+        "open_recall": 0.8648683531233867,
+        "observations": 28068,
+        "confusion": [
+          [
+            20200,
+            120,
+            0
+          ],
+          [
+            1046,
+            635,
+            1
+          ],
+          [
+            1,
+            2,
+            6063
+          ]
+        ],
+        "ce_loss": 0.12596915429331934
+      },
+      "validation": {
+        "accuracy": 0.9598506093025208,
+        "phase_recall": [
+          0.9886524677276611,
+          0.4444444477558136,
+          1.0
+        ],
+        "free_false_open_rate": 0.011347517730496455,
+        "precontact_open_rate": 0.460317462682724,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.907103825136612,
+        "observations": 2142,
+        "confusion": [
+          [
+            1394,
+            8,
+            8
+          ],
+          [
+            68,
+            56,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.12381748237710595
+      },
+      "elapsed_seconds": 578.0986473271623
+    },
+    {
+      "epoch": 14,
+      "train": {
+        "accuracy": 0.9598118662834167,
+        "phase_recall": [
+          0.9949803352355957,
+          0.39239001274108887,
+          0.9993405938148499
+        ],
+        "free_false_open_rate": 0.005019685039370079,
+        "precontact_open_rate": 0.39417359232902527,
+        "contact_open_rate": 0.9998351335525513,
+        "open_recall": 0.8683531233866805,
+        "observations": 28068,
+        "confusion": [
+          [
+            20218,
+            100,
+            2
+          ],
+          [
+            1019,
+            660,
+            3
+          ],
+          [
+            1,
+            3,
+            6062
+          ]
+        ],
+        "ce_loss": 0.12066047678790372
+      },
+      "validation": {
+        "accuracy": 0.9598506093025208,
+        "phase_recall": [
+          0.9886524677276611,
+          0.4444444477558136,
+          1.0
+        ],
+        "free_false_open_rate": 0.011347517730496455,
+        "precontact_open_rate": 0.460317462682724,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.907103825136612,
+        "observations": 2142,
+        "confusion": [
+          [
+            1394,
+            6,
+            10
+          ],
+          [
+            68,
+            56,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.13666449195203606
+      },
+      "elapsed_seconds": 622.5019257380627
+    },
+    {
+      "epoch": 15,
+      "train": {
+        "accuracy": 0.9603819251060486,
+        "phase_recall": [
+          0.9945374131202698,
+          0.405469685792923,
+          0.9998351335525513
+        ],
+        "free_false_open_rate": 0.005462598425196851,
+        "precontact_open_rate": 0.405469685792923,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.8709344346928239,
+        "observations": 28068,
+        "confusion": [
+          [
+            20209,
+            110,
+            1
+          ],
+          [
+            1000,
+            682,
+            0
+          ],
+          [
+            0,
+            1,
+            6065
+          ]
+        ],
+        "ce_loss": 0.11608565667901892
+      },
+      "validation": {
+        "accuracy": 0.9598506093025208,
+        "phase_recall": [
+          0.9886524677276611,
+          0.4444444477558136,
+          1.0
+        ],
+        "free_false_open_rate": 0.011347517730496455,
+        "precontact_open_rate": 0.460317462682724,
+        "contact_open_rate": 1.0,
+        "open_recall": 0.907103825136612,
+        "observations": 2142,
+        "confusion": [
+          [
+            1394,
+            8,
+            8
+          ],
+          [
+            68,
+            56,
+            2
+          ],
+          [
+            0,
+            0,
+            606
+          ]
+        ],
+        "ce_loss": 0.13359154699618966
+      },
+      "elapsed_seconds": 666.6252832952887
+    }
+  ],
+  "elapsed_seconds": 181.983198617585,
+  "training_seconds": 666.6252832952887
+}

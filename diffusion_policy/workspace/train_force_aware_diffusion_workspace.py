@@ -648,9 +648,10 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         for policy in (self.model, self.ema_model):
             if policy is None:
                 continue
-            blur_scheduler = getattr(policy, "blur_scheduler", None)
-            if blur_scheduler is not None and getattr(blur_scheduler, "auto_total_steps", False):
-                blur_scheduler.set_total_steps(total_optimizer_steps)
+            for name in ("blur_scheduler", "mask_scheduler"):
+                scheduler = getattr(policy, name, None)
+                if scheduler is not None and getattr(scheduler, "auto_total_steps", False):
+                    scheduler.set_total_steps(total_optimizer_steps)
             # Optimizer progress is checkpointed on the workspace, whereas
             # the policy's scalar step is not part of its state_dict.
             policy.set_optimizer_step(self.optimizer_step)

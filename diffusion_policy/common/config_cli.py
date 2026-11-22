@@ -53,7 +53,7 @@ def parse_overwrite_argv(argv: Sequence[str]) -> tuple[list[str], bool]:
     if len(args) == 1:
         raise SystemExit(
             "--overwrite requires a training config, for example: "
-            "python train.py --config-name=train_civi_teacher_board_blur_legacy_fusion --overwrite"
+            "python train.py --config-name=train_civi_teacher --overwrite"
         )
     # Override resume regardless of argument order, before Hydra saves its
     # config snapshot. Never persist a destructive 'overwrite=true' setting:

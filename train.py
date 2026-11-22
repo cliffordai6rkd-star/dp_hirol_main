@@ -1,7 +1,7 @@
 """Train the CIVI teacher/student pipeline, or one explicit Hydra workspace.
 
 python train.py
-python train.py --config diffusion_policy/config/train_civi_teacher_board_blur_legacy_fusion.yaml
+python train.py --config diffusion_policy/config/train_civi_teacher.yaml
 """
 
 import sys

@@ -1,0 +1,162 @@
+% Internal execution checklist, not a completed results supplement.
+% Official CVPR author-kit style is bundled unchanged as cvpr.sty.
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[review]{cvpr}
+\usepackage{tabularx}
+\usepackage{array}
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+\usepackage[breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+\def\confName{CVPR}
+\def\confYear{2027}
+\def\cvprPaperID{TBD}
+\title{Contact-Informed Visuomotor Interface:\\
+Minimal Five-Day Supplementary Evidence Checklist}
+\author{Anonymous submission}
+\newcommand{\checkitem}[1]{\par\noindent\(\square\)\ #1\par}
+\newcommand{\pending}{\textit{Pending}}
+\renewcommand{\thesection}{S\arabic{section}}
+\renewcommand{\thetable}{S\arabic{table}}
+\renewcommand{\thefigure}{S\arabic{figure}}
+\begin{document}
+\maketitlesupplementary
+
+\section{Scope and fixed workload}
+\label{sec:scope}
+\textbf{Status: prospective execution plan; no new experimental results are claimed.}
+The main manuscript is frozen. This checklist prioritizes the smallest set of supplementary evidence that can address deployment validity and the independent value of learned image-space encoding. It is an internal planning document, to be converted into an evidence-based supplement after measurement. The target is credible acceptance-level evidence; completion does not guarantee a review score.
+
+\paragraph{Workload cap.}
+Use one existing contact-rich task, Wipe Board by default, one DP backbone, one verified CIVI renderer, and the existing demonstrations. Train only \textbf{two} additional downstream policies: a direct torque-fusion baseline and a fixed RGB torque-encoding baseline. Evaluate the three methods on \textbf{20 trials each: 60 trials in total}. Online phase verification reuses these same rollouts. Torque interventions use held-out replay and require no additional robot trials. Do not add tasks, encoders, new teachers, renderer retraining, curriculum ablations, or a full seed grid to this five-day plan.
+
+\paragraph{Resource assumptions.}
+A valid causal CIVI checkpoint, its data/configuration provenance, the existing dataset, and robot access must already be available. The local GPU has approximately 24\,GB memory. The paper's 6\,GPUh per DP training run is an estimate, not a measured promise for the current hardware. Allow \textbf{12\,GPUh for training plus up to 4\,GPUh for diagnostics}, with the remaining days reserved for implementation, robot operation, failures, and writing. GPU-dependent robot sessions and training are scheduled separately.
+
+\paragraph{First half-day gate.}
+Verify the exact checkpoint and resolved configuration before reusing an existing result. Historical future-wrench runs, different visual readouts, and newly added causal modules must not be silently treated as the same experiment. If the required causal checkpoint is missing or incompatible, prioritize repair and causal validation; the stated workload no longer includes rebuilding the full pipeline from scratch.
+
+\section{The three retained experiments}
+
+\subsection{E1: Equal-information comparison}
+\label{sec:e1}
+\textbf{Question.} Does the learned RGB interface offer value beyond receiving torque information?
+
+\checkitem{Freeze one task, demonstration split, camera preprocessing, action representation, sampler, action horizon, low-level controller, and evaluation timeout before training.}
+
+\checkitem{Reuse one verified CIVI--DP checkpoint. Train B1 and B2 below with the same demonstrations and full downstream training budget. Retain the same available robot-state inputs.}
+
+\begin{table}[t]
+\centering
+\caption{E1: the entire new robot experiment. A dash means no new training; it does not imply zero original training cost.}
+\label{tab:e1}
+\begin{tabular}{@{}p{0.43\columnwidth}rr@{}}
+\toprule
+Method & New GPUh & Trials\\
+\midrule
+CIVI--DP, verified checkpoint & -- & 20\\
+B1: direct torque fusion & 6 & 20\\
+B2: fixed RGB torque encoding & 6 & 20\\
+\midrule
+Total & 12 & 60\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{B1: direct fusion.}
+Encode the same signed torque history using a small temporal encoder and inject its embedding into the DP conditioning pathway. Provide the same causal phase probability or active flag available to CIVI. Document the injection point and parameter count. This comparison may modify the baseline architecture: its purpose is to test whether the RGB interface is necessary, not to handicap direct fusion.
+
+\paragraph{B2: fixed RGB encoding.}
+Render normalized joint-torque histories in a fixed image strip or inset, with a consistent channel/joint order and scale. Include the same causal phase cue. Preserve the scene resolution as closely as possible and document any reserved border or occlusion. Normalization must be fitted using training data only. No additional tactile hardware or known contact-point projection is required.
+
+\paragraph{Fairness and selection.}
+Use the same causal information and comparable tuning effort for all three methods. Select checkpoints using the predeclared held-out validation rule, never robot test success. Do not select the more favorable of several test runs for reporting. Record actual updates, training time, parameter counts, and any configuration difference rather than equating nominal epochs with equal compute.
+
+\paragraph{Evaluation and deliverable.}
+Use 20 initial-condition blocks and evaluate all three methods once in each block; randomize method order within each block. Give every trial a fixed success rule and timeout. Report success counts, intervals, paired win/loss outcomes, failure categories, and the per-trial ledger. Report raw contact-loss counts or completion time only if the existing logging supports them without new instrumentation.
+
+\paragraph{Interpretation.}
+A repeatable, practically meaningful advantage over both matched baselines would strengthen the case for learned encoding. Similar performance requires a narrower value proposition; superiority over RGB-only cannot establish this claim. This minimal plan uses one checkpoint per method and does not establish training-seed robustness.
+
+\subsection{E2: Causal phase verification}
+\label{sec:e2}
+\textbf{Question.} Are the new closed-loop results produced without future observations or offline phase labels controlling deployment?
+
+\checkitem{Document the predictor input modalities, history offsets, sampling rate, normalization split, threshold, and exact checkpoint. Confirm that all deployment histories end at the current observation time.}
+
+\checkitem{Check the actual robot inference call, not only the predictor definition. Offline phase labels may supervise training or stratify evaluation; they must not control the deployed rendering switch.}
+
+\checkitem{Log image/state timestamps, torque-history endpoints, predicted phase probability, active switch, and action timestamps during the same 60 E1 trials. Do not collect another rollout batch for this item.}
+
+\checkitem{On held-out episodes, report active precision/recall, free-state false activation, contact recall, pre-contact recall, and activation timing relative to the declared offline reference. Give counts and denominators.}
+
+The existing CNN--GRU phase implementation can be reused only after checkpoint verification. Its documented history layout uses four non-future RGB samples and sixteen state samples; exact frame offsets and physical time spans must be copied from the selected configuration. A torque-derived offline label is a proxy, not independent physical contact ground truth. Any pre-contact oracle that uses a future onset is restricted to offline diagnosis.
+
+\paragraph{Deliverable and interpretation.}
+Provide one phase table and one synchronized representative trace, together with the actual deployment input description. This resolves causal validity; it does \emph{not} establish that phase gating is better than always-on rendering. The latter claim is deliberately outside this reduced plan.
+
+\subsection{E3: Torque-content intervention}
+\label{sec:e3}
+\textbf{Question.} Does the frozen system respond to continuous torque content when phase is held fixed?
+
+\checkitem{Use held-out trajectories unseen by the evaluated teacher where feasible; otherwise state the weaker split explicitly. Never use an unverified historical diagnostic as new evidence.}
+
+\checkitem{For identical image/history windows, compare real torque, zeroed normalized torque features, and shuffled torque history. Hold the phase switch fixed to its original value across conditions. Keep diffusion sampling noise paired.}
+
+\checkitem{For teacher diagnostics, additionally report fusion bypass if the existing tool supports the selected checkpoint. Preserve negative results. Distinguish zero normalized features from physically zero raw torque.}
+
+\checkitem{Where practical, shuffle within matched task/phase groups. If only ordinary batch shuffling is supported, call it an input-sensitivity diagnostic and describe its distribution shift.}
+
+\checkitem{Separate teacher-action and renderer/downstream readouts. An intervention on the teacher alone is not evidence that a different downstream visual encoder reads the rendered cue.}
+
+\paragraph{Metrics and deliverable.}
+Report normalized action error and end-effector error, with units, normalization, sample counts, and trajectory-level summaries. Use a compact three-condition plot or table; feature MSE is secondary. Prefer an existing compatible evaluation path. The current teacher intervention tool defaults to the training split, so validation must be explicitly requested and checked.
+
+\paragraph{Interpretation limit.}
+A degradation under shuffled or zero inputs establishes dependence under intervention, not a complete causal benefit or architectural necessity: the intervention may be out of distribution. A phase-only retrained system would be a stronger control, but is \textbf{not scheduled} here. If torque dependence is weak or bypass improves performance, report that result and limit the mechanism claim.
+
+\section{Five-day execution}
+\label{sec:days}
+\begin{table*}[t]
+\centering
+\caption{Fixed five-day plan. Reserved time is intentional; do not fill it with extra experiments. Training and robot inference are not assumed to share one GPU concurrently.}
+\label{tab:days}
+\begin{tabularx}{\textwidth}{@{}lXl@{}}
+\toprule
+Day & Required work and completion gate & Resource cap\\
+\midrule
+D1 & Verify the causal checkpoint, data split, and method version. Freeze E1 protocol. Implement only B1/B2 and perform small compatibility checks. Start B1 after the protocol is fixed. & First half-day: provenance; B1 about 6\,GPUh overnight\\
+D2 & Finish B2, verify equal information and training budget, select both checkpoints on validation. Run E3 held-out replay and E2 phase analysis. & B2 about 6\,GPUh; diagnostics up to 4\,GPUh\\
+D3 & Run the first ten randomized initial-condition blocks: three methods per block. Capture phase and timing traces as part of E1. & 30 robot trials\\
+D4 & Run the remaining ten blocks. Resolve invalid trials using the predeclared rule and retain their records. Reconcile all 60 outcomes and video IDs. & 30 robot trials\\
+D5 & Produce one main comparison table, one phase table/trace, and one torque-intervention figure. Write the supplement, verify anonymity and references, compile the final PDF, and check all numeric claims against raw records. & Writing, figure generation, and contingency\\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\paragraph{Robot time.}
+At four minutes per complete trial including reset and adjudication, 60 trials take four hours. Reserve another two hours for setup/calibration and two hours for video/ledger reconciliation: approximately eight laboratory hours in total. Measure the actual trial-cycle time on D1. Do not shorten failure timeouts, discard unfavorable trials, or claim statistical confidence merely to fit the schedule.
+
+\paragraph{If work overruns.}
+Preserve equal-information E1 and a truthful causal deployment description. Reduce video editing and decorative visualizations first. E3 can report a smaller predeclared held-out sample with its limitation. Do not quietly reduce baseline training while preserving the full model's original budget. No new seed grid or optional fourth experiment is admitted by this plan.
+
+\section{Writing the eventual CVPR supplement}
+\label{sec:writing}
+The present source uses the official CVPR author-kit style, 10-point two-column US-letter layout, anonymous review mode, and the provided supplementary-title command. It is a \textbf{planning source}, not an already completed results supplement. Keep planning language, score targets, local paths, and the five-day schedule out of the submitted scientific document.
+
+\paragraph{Recommended evidence order.}
+Open the eventual supplement with a short navigation paragraph and the E1 comparison table. Follow with E2 deployment details and E3 intervention results, then essential implementation details and video indexing. A compact four-to-six-page supplement is an organizational target, not a statement of the official page allowance; check the actual conference instructions before submission.
+
+\paragraph{No changes to the main manuscript.}
+Use explicit supplementary scope clarifications when needed. For example, the reported 5--8\% latency range applies to the slow-sampler main configurations; the paper's DDIM numbers imply approximately 47.7\% relative overhead. Describe the image mask as teacher-induced representation-change guidance unless independent contact localization has been measured. Correct the positioning of related methods and disclose any material checkpoint/protocol mismatch rather than silently replacing an earlier result.
+
+\paragraph{Towards stronger acceptance evidence without new runs.}
+If verified existing DP and \(\pi_0\) records use the identical frozen renderer, document its checkpoint identity, the different downstream visual pathways, and each policy's training protocol. This adds provenance to the existing reuse claim; it is not a newly measured third-encoder or zero-shot result. The strongest positive conclusion available from this reduced plan is a useful, causally deployable task-specific interface that beats reasonable same-information alternatives. Universal transfer, seed robustness, spatial-component necessity, and cross-task generalization remain outside the new evidence.
+
+\paragraph{Completion checklist.}
+\checkitem{Two baseline trainings and exactly 60 primary trials are complete or explicitly marked incomplete.}
+\checkitem{All E1 test runs use the declared causal inputs; split and checkpoint identities are recorded.}
+\checkitem{E3 retains all measured conditions, including null or unfavorable outcomes.}
+\checkitem{Every number in the supplement maps to a result file and trial/trajectory IDs.}
+\checkitem{The eventual submission contains measured results, not this execution schedule or empty placeholders.}
+\checkitem{Submission ID, anonymity, formatting, compilation, and conference-specific supplementary rules are checked before upload.}
+
+\end{document}

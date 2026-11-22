@@ -183,6 +183,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         observation_validity_key: Optional[str] = None,
         episode_warmup_steps: int = 0,
         wrench_filter: Optional[Mapping] = None,
+        wrench_threshold: Optional[Mapping] = None,
         contact_label_config: Optional[Mapping] = None,
         phase_label_mode: str = "current_wrench",
         phase_predictor: Optional[Mapping] = None,
@@ -356,6 +357,9 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         self._filtered_columns = {}
         if self.wrench_filter.get("enabled", False):
             self._filter_wrench_column()
+        self.wrench_threshold = dict(wrench_threshold or {})
+        if self.wrench_threshold.get("enabled", False):
+            self._threshold_wrench_column()
         self._phase_source_data = (
             self._load_column(self.phase_source_key, dtype=np.float32)
             if self.phase_resampling_enabled
@@ -404,9 +408,9 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                     raise ValueError(
                         f"windowed lowdim feature {key!r} requires positive steps/stride"
                     )
-                if start_offset + (steps - 1) * stride < 0 and config.get("pad_mode", "edge") not in {"edge", "clip"}:
+                if config.get("pad_mode", "edge") not in {"edge", "clip", "zero"}:
                     raise ValueError(
-                        f"windowed lowdim feature {key!r} uses negative offsets and must use pad_mode='edge'"
+                        f"windowed lowdim feature {key!r} requires pad_mode='edge', 'clip', or 'zero'"
                     )
                 self.windowed_lowdim_feature_groups[key] = {
                     **config,
@@ -703,6 +707,13 @@ class LeRobotV3ImageDataset(BaseImageDataset):
 
     def _phase_inputs(self, obs_indices, frame_cache):
         state_rows, image_rows = self._phase_history_indices(obs_indices)
+        state = self.phase_state_data[state_rows].copy()
+        if self.phase_predictor_config.get("pad_mode", "edge") == "zero":
+            history = state.shape[1]
+            episodes = np.searchsorted(self.episode_ends, obs_indices, side="right")
+            starts = np.asarray([self.episode_ranges[i].start for i in episodes])[:, None]
+            requested = obs_indices[:, None] + np.arange(1 - history, 1)
+            state[requested < starts] = 0
         images = {}
         for key in self.rgb_keys:
             if key in self.image_data:
@@ -713,7 +724,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                     expected_shape=tuple(self.shape_meta["obs"][key]["shape"]), frame_cache=frame_cache,
                 ) for row in image_rows.reshape(-1)])
             images[key] = np.asarray(pixels).reshape(*image_rows.shape, *pixels.shape[1:])
-        return {"state": self.phase_state_data[state_rows].copy(), "images": images}
+        return {"state": state, "images": images}
 
     def set_contact_label_config(self, config):
         """Use the teacher's exact contact configuration for CPU alpha labels."""
@@ -802,6 +813,24 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         log.info("Wrench: causal first-order low-pass %.3g Hz, per episode before windowing (%s)",
                  cutoff, source_key)
 
+    def _threshold_wrench_column(self):
+        """Apply the physical vector threshold before histories and phase inputs."""
+        config = self.wrench_threshold
+        source_key = str(config.get("source_key", "observation.tau_ext"))
+        threshold = float(config.get("threshold", 12.5))
+        norm = str(config.get("norm", "l1"))
+        if not np.isfinite(threshold) or threshold < 0 or norm not in {"l1", "l2"}:
+            raise ValueError("wrench_threshold requires a finite nonnegative threshold and l1/l2 norm")
+        source = self._load_column(source_key, dtype=np.float32)
+        if source.ndim != 2 or not np.isfinite(source).all():
+            raise ValueError("wrench_threshold source must contain finite vectors [N,D]")
+        magnitude = (np.abs(source).sum(axis=-1) if norm == "l1"
+                     else np.linalg.norm(source, axis=-1))
+        self._filtered_columns[source_key] = np.where(
+            (magnitude >= threshold)[:, None], source, np.zeros_like(source),
+        )
+        log.info("Wrench: %s vector threshold %.3g before histories (%s)", norm, threshold, source_key)
+
     def _load_episode_index(self) -> np.ndarray:
         episode_data_index = getattr(self.lerobot_dataset, "episode_data_index", None)
         if episode_data_index is not None and "from" in episode_data_index and "to" in episode_data_index:
@@ -828,13 +857,14 @@ class LeRobotV3ImageDataset(BaseImageDataset):
     ) -> np.ndarray:
         """Materialize a fixed-rate low-dimensional window for every row.
 
-        ``start_offset`` and ``stride`` are expressed in source rows.  Edge
-        clipping is used at episode boundaries so history windows can be
-        left-padded; future windows are filtered out of the sampler below.
+        ``start_offset`` and ``stride`` are expressed in source rows. History
+        uses the configured edge or zero padding; missing future observations
+        are always filtered out of the sampler below.
         """
         steps = int(config["steps"])
         stride = int(config["stride"])
         start_offset = int(config["start_offset"])
+        zero_pad = config.get("pad_mode", "edge") == "zero"
         result = np.empty((self.dataset_length, steps, source.shape[-1]), dtype=np.float32)
         offsets = start_offset + stride * np.arange(steps, dtype=np.int64)
         offsets_sec = config.get("offsets_sec")
@@ -889,6 +919,7 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                 targets = local_anchor_times[:, None] + offsets_sec[None, :]
                 local_indices = _nearest_indices(local_source_times, targets)
                 indices = local_indices + start
+                padding = targets < local_source_times[0] - boundary_epsilon
                 # History can be edge-padded; future targets must exist in
                 # the source episode rather than reuse the final force row.
                 valid = (targets <= local_source_times[-1] + boundary_epsilon).all(axis=1)
@@ -898,12 +929,16 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                 anchors = np.arange(start, end + 1, dtype=np.int64)[:, None]
                 requested_indices = anchors + offsets[None, :]
                 indices = np.clip(requested_indices, start, end)
+                padding = requested_indices < start
                 valid = (requested_indices <= end).all(axis=1)
             warmup = getattr(self, "episode_warmup_steps", 0)
             valid &= (indices >= start + warmup).all(axis=1)
             if valid_rows is not None:
                 valid_rows[start : end + 1] = valid
-            result[start : end + 1] = source[indices]
+            values = source[indices]
+            if zero_pad:
+                values = np.where(padding[..., None], np.zeros_like(values), values)
+            result[start : end + 1] = values
         return result
 
     @staticmethod

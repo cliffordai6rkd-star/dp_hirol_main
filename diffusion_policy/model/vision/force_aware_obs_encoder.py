@@ -63,6 +63,7 @@ class ForceAwareObsEncoder(nn.Module):
         cross_attn_query: str = "wrench",
         image_shapes: Optional[Mapping[str, Sequence[int]]] = None,
         cross_attn_query_residual: bool = True,
+        image_token_masking: bool = False,
     ) -> None:
         super().__init__()
         if n_emb % n_head != 0:
@@ -145,6 +146,9 @@ class ForceAwareObsEncoder(nn.Module):
                 self.patch_counts[key] = (shape[1] // patch_h) * (shape[2] // patch_w)
 
         self.image_projection = nn.Linear(int(hidden_size), self.n_emb)
+        self.image_mask_token = (
+            nn.Parameter(torch.zeros(1, 1, self.n_emb)) if image_token_masking else None
+        )
         self.wrench_projection = nn.Linear(int(wrench_dim), self.n_emb)
         self.wrench_position = nn.Parameter(
             torch.zeros(1, 1, self.wrench_history_steps, self.n_emb)
@@ -258,6 +262,8 @@ class ForceAwareObsEncoder(nn.Module):
         nn.init.normal_(self.obs_position, std=0.02)
         nn.init.normal_(self.image_modality, std=0.02)
         nn.init.normal_(self.force_modality, std=0.02)
+        if self.image_mask_token is not None:
+            nn.init.normal_(self.image_mask_token, std=0.02)
         if self.camera_embedding is not None:
             nn.init.normal_(self.camera_embedding, std=0.02)
         self._set_backbone_frozen()
@@ -366,7 +372,7 @@ class ForceAwareObsEncoder(nn.Module):
         return tokens[:, 0], tokens[:, patch_start:]
 
     def _encode_image_streams(self, images, image_keys, batch_size, obs_steps,
-                              *, input_grad=False):
+                              *, input_grad=False, image_token_mask=None):
         """Shared visual path, before wrench encoding or attention fusion."""
         camera_groups = {}
         for key in image_keys:
@@ -395,6 +401,13 @@ class ForceAwareObsEncoder(nn.Module):
                            + self.image_modality)
             if self.camera_embedding is not None:
                 patch_image = patch_image + self.camera_embedding[:, :, camera_index]
+            if image_token_mask is not None:
+                if self.image_mask_token is None:
+                    raise ValueError("image_token_mask requires image_token_masking=true")
+                patch_image = torch.where(
+                    image_token_mask[:, :, None, None],
+                    self.image_mask_token.reshape(1, 1, 1, self.n_emb), patch_image,
+                )
             camera_patch_tokens.append(patch_image)
         return encoded_camera_patches, camera_patch_tokens
 
@@ -451,6 +464,7 @@ class ForceAwareObsEncoder(nn.Module):
         future_contact: Optional[torch.Tensor] = None,
         contact_alpha: Optional[torch.Tensor] = None,
         fusion_gate: Optional[torch.Tensor] = None,
+        image_token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if images is not None and image is not None:
             raise ValueError("provide either images or the legacy image argument, not both")
@@ -559,10 +573,17 @@ class ForceAwareObsEncoder(nn.Module):
                 device=wrench_history.device, dtype=wrench_history.dtype,
             ).reshape(batch_size * obs_steps, 1, 1)
 
+        if image_token_mask is not None:
+            if image_token_mask.dtype != torch.bool or image_token_mask.shape != (batch_size, obs_steps):
+                raise ValueError("image_token_mask must be a bool tensor [B, To]")
+            if fusion_gate is not None:
+                image_token_mask = image_token_mask & fusion_gate
+
         obs_position = self.obs_position[:, :obs_steps]
 
         encoded_camera_patches, camera_patch_tokens = self._encode_image_streams(
             images, image_keys, batch_size, obs_steps,
+            image_token_mask=image_token_mask,
         )
 
         force = self.wrench_projection(wrench_history)

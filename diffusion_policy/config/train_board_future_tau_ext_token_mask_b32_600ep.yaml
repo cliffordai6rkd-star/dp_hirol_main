@@ -1,0 +1,8 @@
+# Compatibility name: same causal CIVI; budget only: 600 epochs.
+defaults:
+  - train_civi_teacher
+  - _self_
+name: train_board_future_tau_ext_token_mask_b32_600ep
+training:
+  num_epochs: 600
+  num_optimizer_steps: null

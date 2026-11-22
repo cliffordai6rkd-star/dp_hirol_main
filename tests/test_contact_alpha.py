@@ -246,12 +246,12 @@ def test_full_future_contact_auxiliary_path_preserves_legacy_preprocessing_retur
     assert preprocessor.forward_with_future_contact(obs)[2].shape == (2, 2, 8)
 
 
-def test_teacher_forward_smoke_uses_alpha_without_a_gate_argument():
+def test_teacher_forward_smoke_uses_alpha_by_default():
     teacher = make_teacher()
     obs = observations()
     loss = teacher.compute_loss({"obs": obs, "action": torch.randn(2, 9, 7)}, optimizer_step=0)
     assert loss.ndim == 0 and torch.isfinite(loss)
-    assert not hasattr(teacher, "contact_fusion_gate")
+    assert teacher.contact_fusion_gate is False
     assert "contact_gate" not in teacher.obs_encoder.forward.__code__.co_varnames
 
 

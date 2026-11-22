@@ -1,5 +1,6 @@
 """Render RGB using full LSTM wrench sequences and spatial cross-attention."""
 
+import contextlib
 import copy
 import math
 
@@ -521,8 +522,10 @@ class RenderNet(nn.Module):
                  spatial_modulation=None, backbone=None, architecture_version=None,
                  separate_gate_path=False, transformer=None,
                  condition_prediction=None, condition_backbone=None, context_adapter=None,
-                 dual_path=None, rgb_epsilon=None, phase_predictor=None):
+                 dual_path=None, rgb_epsilon=None, phase_predictor=None,
+                 contact_fusion_gate=False):
         super().__init__()
+        self.contact_fusion_gate = bool(contact_fusion_gate)
         # ``backbone``/``transformer`` were the public configuration shape in
         # older RenderNet checkpoints.  The active implementation is the CNN
         # attention backbone, but accepting those fields keeps old configs and
@@ -693,8 +696,9 @@ class RenderNet(nn.Module):
             )
         phase_config = dict(phase_predictor or {})
         self.phase_prediction_enabled = bool(phase_config.pop("enabled", False))
+        self.freeze_phase_after_convergence = bool(phase_config.pop("freeze_after_convergence", False))
         if self.phase_prediction_enabled and self.condition_prediction_enabled:
-            raise ValueError("Use the causal binary phase predictor or the historical region/alpha network")
+            raise ValueError("Use the causal phase predictor or the historical region/alpha network")
         self.phase_predictor = (CausalPhaseGate(self.image_keys, **phase_config)
                                 if self.phase_prediction_enabled else None)
         self.spatial_modulations = nn.ModuleList()
@@ -782,15 +786,17 @@ class RenderNet(nn.Module):
         """Select which independent path receives gradients.
 
         ``adapter`` calibrates visual tokens while both image networks freeze.
-        ``intensity`` trains only the gate branch.  ``rgb`` freezes that
-        branch and trains the complete RGB wrench encoder, image encoder,
+        ``phase`` trains the causal classifier. ``intensity`` trains only the
+        gate branch. ``rgb`` freezes that branch and trains the RGB wrench encoder, image encoder,
         attention stack, decoder and RGB head.  ``joint`` trains both paths.
         """
         stage = str(stage)
-        if stage not in {"adapter", "intensity", "rgb", "joint"}:
-            raise ValueError("RenderNet stage must be adapter, intensity, rgb or joint")
+        if stage not in {"adapter", "phase", "intensity", "rgb", "joint"}:
+            raise ValueError("RenderNet stage must be adapter, phase, intensity, rgb or joint")
         if stage == "adapter" and self.context_adapter is None:
             raise ValueError("Adapter pretraining requires context_adapter.enabled=true")
+        if stage == "phase" and self.phase_predictor is None:
+            raise ValueError("Phase pretraining requires phase_predictor.enabled=true")
         self.training_stage = stage
         self.requires_grad_(False)
         if stage == "adapter":
@@ -802,7 +808,33 @@ class RenderNet(nn.Module):
             for module in self._rgb_modules():
                 self._set_requires_grad(module, True)
         if self.phase_predictor is not None:
-            self.phase_predictor.requires_grad_(True)
+            self.phase_predictor.requires_grad_(
+                stage in {"phase", "joint"}
+                or (self.phase_predictor.num_classes == 2 and not self.freeze_phase_after_convergence)
+            )
+        self.train(self.training)
+
+    def train(self, mode=True):
+        """Keep completed heads deterministic when the renderer enters train mode."""
+        super().train(mode)
+        stage = getattr(self, "training_stage", "joint")
+        phase = getattr(self, "phase_predictor", None)
+        if (mode and phase is not None
+                and (phase.num_classes == 3 or self.freeze_phase_after_convergence)
+                and stage != "joint"):
+            if stage != "phase":
+                phase.eval()
+            if stage in {"adapter", "phase", "rgb"}:
+                if self.gate_backbone is not None:
+                    self.gate_backbone.eval()
+                for module in self._gate_modules():
+                    if isinstance(module, nn.Module):
+                        module.eval()
+            if stage in {"adapter", "phase", "intensity"}:
+                for module in self._rgb_modules():
+                    if isinstance(module, nn.Module):
+                        module.eval()
+        return self
 
     def set_stage_mode(self, training=True):
         """Set mode while keeping the frozen branch deterministic."""
@@ -811,7 +843,7 @@ class RenderNet(nn.Module):
             return
         if self.training_stage == "joint":
             return
-        frozen = (self._gate_modules() + self._rgb_modules() if self.training_stage == "adapter"
+        frozen = (self._gate_modules() + self._rgb_modules() if self.training_stage in {"adapter", "phase"}
                   else self._gate_modules() if self.training_stage == "rgb" else self._rgb_modules())
         for module in frozen:
             self._set_requires_grad(module, False)
@@ -941,8 +973,12 @@ class RenderNet(nn.Module):
     def forward(self, images=None, wrench_history=None, *, return_aux=False, use_attention_mask=None,
                 future_contact=None, contact_alpha=None, condition_only=False,
                 return_condition=False, image_context=None, cached_condition=None,
-                return_rgb_stats=False, phase_inputs=None):
+                return_rgb_stats=False, phase_inputs=None, phase_only=False, intensity_only=False):
         """Render RGB, or train the student-owned visual adapter through DDP."""
+        if phase_only:
+            if self.phase_predictor is None or phase_inputs is None:
+                raise ValueError("phase_only requires a phase predictor and causal phase_inputs")
+            return self.phase_predictor(phase_inputs)
         if image_context is not None:
             if self.context_adapter is None:
                 raise ValueError("No student context adapter was configured")
@@ -965,24 +1001,28 @@ class RenderNet(nn.Module):
                     predicted_masks, condition = self.condition_network(images, wrench_history)
             # Offline labels supervise this network; they never drive rendering.
             contact_alpha = condition["contact_alpha"]
-            if condition_only:
+            if condition_only or intensity_only:
                 return None, predicted_masks, condition
         elif condition_only:
             raise ValueError("condition_only requires condition_prediction.enabled=true")
         if self.phase_predictor is not None:
             if phase_inputs is None:
                 raise ValueError("Causal phase prediction requires phase_inputs with RGB and measured state histories")
-            condition = self.phase_predictor(phase_inputs)
+            frozen_phase = (self.phase_predictor.num_classes == 3
+                            and self.training_stage not in {"phase", "joint"})
+            with torch.no_grad() if frozen_phase else contextlib.nullcontext():
+                condition = self.phase_predictor(phase_inputs)
             contact_alpha = condition["contact_alpha"]
-        wrench_tokens = self.encode_wrench_history(wrench_history)
+        wrench_tokens = None if intensity_only else self.encode_wrench_history(wrench_history)
         gate_wrench_tokens = (self.encode_gate_wrench_history(wrench_history)
                               if use_mask and not self.condition_prediction_enabled else None)
         batch, steps = wrench_history.shape[:2]
         alpha = contact_alpha
-        if alpha is None and future_contact is not None:
+        if future_contact is not None and (alpha is None or self.contact_fusion_gate and self.phase_predictor is None):
             if future_contact.ndim == 2:
                 future_contact = future_contact.unsqueeze(-1)
-            alpha = compute_contact_alpha(future_contact)
+            alpha = (future_contact.any(dim=-1).float() if self.contact_fusion_gate
+                     else compute_contact_alpha(future_contact))
         if alpha is not None and alpha.shape != (batch, steps):
             raise ValueError("contact_alpha must have shape [B, To]")
         rendered, masks, rgb_stats = {}, {}, {}
@@ -1021,6 +1061,9 @@ class RenderNet(nn.Module):
                 mask = F.interpolate(flat_mask, size=padded_size, mode="bilinear", align_corners=False)
                 mask = mask[:, :, :height, :width]
             flat_gate = self._mask_gate(mask, image) if use_mask else mask
+            if intensity_only:
+                masks[key] = mask.reshape(batch, steps, 1, *image.shape[-2:])
+                continue
             rgb_camera = self.camera_embedding.weight[self.image_keys.index(key)].reshape(1, 1, -1)
             backbone_forward = (self._compiled_backbone_forward
                                 if self._compiled_backbone_forward is not None
@@ -1088,6 +1131,8 @@ class RenderNet(nn.Module):
                 rendered[key] = (image + self.residual_scale * image_alpha * residual).clamp(0, 1)
             if alpha is not None:
                 rendered[key] = torch.where(image_alpha > 0, rendered[key], image)
+        if intensity_only:
+            return None, masks, condition
         if return_rgb_stats:
             return rendered, rgb_stats
         if return_condition:

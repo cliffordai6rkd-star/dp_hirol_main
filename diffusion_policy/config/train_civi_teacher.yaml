@@ -1,10 +1,10 @@
-# Complete contact-informed teacher for the clean 25 Hz xArm demonstrations.
-# export CIVI_DATASET_PATH=/path/to/*_clean_ma5_l1_12p5, then python train.py.
+# Unified CIVI teacher: causal thresholded torque, phase-selective token masking.
+# Board is the default task; override dataset_path for another LeRobot v3 task.
 name: train_civi_teacher
 exp_name: ${name}
 _target_: diffusion_policy.workspace.train_force_aware_diffusion_workspace.TrainForceAwareDiffusionWorkspace
-output_dir: data/outputs/civi/current_tau_ext/teacher
-dataset_path: ${oc.env:CIVI_DATASET_PATH,null}
+output_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_civi/teacher
+dataset_path: ${oc.env:CIVI_DATASET_PATH,data/board_25hz_3cam_lerobotv3_clean_ma5_l1_12p5}
 dino_model_path: model/model/dinov3-vitb16-pretrain-lvd1689m
 task_name: xarm_clean_25hz_tau_ext
 
@@ -13,11 +13,12 @@ shape_meta:
   obs:
     side: {shape: [3, 224, 224], type: rgb}
     wrist: {shape: [3, 224, 224], type: rgb}
-    tau_ext: {shape: [8, 7], type: low_dim}
+    tau_ext: {shape: ["${tau_ext_history_steps}", 7], type: low_dim}
   action:
     shape: [7]
 
 horizon: 9
+tau_ext_history_steps: 25 # 25 Hz 下约 1 秒；教师和学生共用，缺失历史补零。
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
@@ -58,7 +59,7 @@ policy:
   phase_wrench_key: tau_ext
   future_phase_wrench_key: null
   precontact_seconds: ${phase_resampling.precontact_seconds}
-  wrench_history_steps: 8
+  wrench_history_steps: ${tau_ext_history_steps}
   relative_pose_actions: false
   action_reference_key: action_reference
   action_representation: joint_position
@@ -69,10 +70,10 @@ policy:
   freeze_modules: []
   force_temporal_encoder: lstm
   force_encoder_layers: 2
-  # 2026-11-12 13:51 (ada3341): dense image-query fusion followed by the DiT.
+  # Keep the single image-query CA used by the mask-token teacher.
   pre_cross_self_attn_layers: 0
   cross_attn_query: image
-  cross_attn_layers: 2
+  cross_attn_layers: 1
   cross_attn_query_residual: true
   camera_attention_mode: joint
   n_emb: 256
@@ -89,18 +90,20 @@ policy:
   contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
   contact_history_reducer: max
   contact_norm: ${contact_norm}
-  input_gate_enabled: false
-  # Select each observation frame by its offline phase: leave free RGB clear.
-  image_blur_scope: precontact_contact
-  image_blur_schedule:
-    schedule_type: linear
-    # Bind to the actual optimizer budget, including epoch-based runs.
-    total_steps: null
-    start_sigma: 5.0
-    end_sigma: 0.0
-    # Hold sigma=5 for the first third, then linearly decay over the last 2/3.
-    start_fraction: 0.3333333333333333
-    end_fraction: 1.0
+  input_gate_enabled: true
+  input_gate_threshold: 12.5
+  input_gate_norm: l1
+  preserve_zero_wrench: true
+  fusion_gate_mode: phase_binary
+  # Free observations bypass the complete fusion branch and keep visual tokens.
+  image_blur_schedule: null
+  image_mask_scope: precontact_contact
+  mask_schedule:
+    schedule_type: piecewise
+    total_steps: ${training.num_optimizer_steps}
+    piecewise_fractions: [0.0, 0.25, 0.75, 1.0]
+    piecewise_probabilities: [1.0, 1.0, 0.0, 0.0]
+    piecewise_interpolation: linear
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -138,7 +141,7 @@ training:
   resume: false
   amp: {enabled: true, dtype: bfloat16, allow_tf32: true}
   distributed:
-    enabled: true
+    enabled: false
     backend: nccl
     batch_size_is_global: true
     find_unused_parameters: false
@@ -147,14 +150,15 @@ training:
   lr_scheduler: cosine
   lr_warmup_steps: 500
   num_epochs: null
-  num_optimizer_steps: 200000
+  num_optimizer_steps: 150000
   gradient_accumulate_every: 1
   max_grad_norm: 1.0
   use_ema: true
   rollout_every: 100
   checkpoint_every: 2000
-  checkpoint_every_optimizer_steps: 20000
-  validation_start_optimizer_step: 150000
+  checkpoint_every_optimizer_steps: 10000
+  validation_start_optimizer_step: 0
+  val_epoch_every: 10
   val_every: 10
   sample_every: 10
   max_train_steps: null
@@ -166,20 +170,20 @@ logging:
   resume: false
   mode: disabled
   name: ${name}
-  tags: [xarm, 25hz, clean, tau-ext, precontact-ramp, joint-position, dual-camera, image-query, lstm2]
+  tags: [civi, xarm, 25hz, "tau-ext-history${tau_ext_history_steps}", threshold12p5, phase-binary, token-mask, single-ca]
   id: null
   group: xarm_clean_25hz_tau_ext
 
 checkpoint:
   topk:
-    monitor_key: checkpoint_action_mse
+    monitor_key: val_action_mse_raw
     mode: min
     k: 3
-    format_str: optimizer_step={optimizer_step:08d}-action_mse={checkpoint_action_mse:.8f}.ckpt
+    format_str: optimizer_step={optimizer_step:08d}-val_action_mse={val_action_mse_raw:.8f}.ckpt
   save_last_ckpt: true
   save_last_snapshot: false
   action_mse:
-    enabled: true
+    enabled: false
     every_optimizer_steps: 10000
     episode_selection: all
     seed: 42
@@ -190,8 +194,8 @@ task:
   wrench_key: tau_ext
   phase_wrench_key: tau_ext
   future_phase_wrench_key: null
-  wrench_history_steps: 8
-  phase_wrench_steps: 8
+  wrench_history_steps: ${tau_ext_history_steps}
+  phase_wrench_steps: ${tau_ext_history_steps}
   phase_wrench_stride: 1
   free_threshold: ${free_threshold}
   contact_threshold: ${contact_threshold}
@@ -200,8 +204,8 @@ task:
   contact_force_dims: [0, 1, 2, 3, 4, 5, 6]
   contact_history_reducer: max
   contact_norm: ${contact_norm}
-  phase_source_key: observation.tau_ext_unthresholded
-  input_gate_enabled: false
+  phase_source_key: observation.tau_ext
+  input_gate_enabled: true
   relative_pose_actions: false
   action_reference_key: action_reference
   image_shape: [3, 224, 224]
@@ -218,28 +222,34 @@ task:
     n_obs_steps: ${n_obs_steps}
     n_latency_steps: ${n_latency_steps}
     seed: 42
-    val_ratio: 0.0
+    val_ratio: 0.08064516129032258
     window_sampling_strategy: timestamp
     image_feature_map:
       side: observation.images.front
       wrist: observation.images.right_wrist
     windowed_lowdim_feature_groups:
       tau_ext:
-        source_key: observation.tau_ext_unthresholded
-        steps: 8
-        start_offset: -7
+        source_key: observation.tau_ext
+        steps: ${tau_ext_history_steps}
+        start_offset: ${eval:'1 - ${tau_ext_history_steps}'}
         stride: 1
+        pad_mode: zero
     action_feature_fields: [action.joint]
     action_feature_columns: null
     action_feature_offsets: null
     action_layout: per_step
     relative_pose_actions: false
     timestamp_key: timestamp
-    # The saved torque bundle is already causally filtered; keep its continuous pre-threshold signal.
+    # The saved bundle is causally filtered; enforce the same physical threshold at load time.
     wrench_filter:
       enabled: false
-      source_key: observation.tau_ext_unthresholded
+      source_key: observation.tau_ext
       timestamp_key: timestamp
+    wrench_threshold:
+      enabled: true
+      source_key: observation.tau_ext
+      threshold: 12.5
+      norm: l1
     timestamp_step_sec: 0.04
     timestamp_tolerance_sec: null
     observation_validity_key: null
@@ -252,7 +262,7 @@ task:
     image_cache_chunk_frames: 64
     phase_resampling_enabled: true
     phase_label_mode: current_wrench
-    phase_source_key: observation.tau_ext_unthresholded
+    phase_source_key: observation.tau_ext
     contact_threshold: ${contact_threshold}
     contact_enter_frames: 5
     contact_exit_frames: 5
