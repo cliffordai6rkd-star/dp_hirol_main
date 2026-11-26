@@ -20,6 +20,9 @@ logs/
 checkpoints/
 models/
 pretrain_models/
+libero_ft_model/
+third_party/
+
 
 # Local package/model caches and Docker wheel download artifacts.
 .cache/

@@ -1,27 +1,22 @@
-# Minimal five-day supplementary evidence plan
+# CVPR supplementary material
 
-The active plan contains three experiment groups, two additional DP trainings, and 60 primary robot trials. The earlier 460-trial proposal is superseded.
+The current supplementary source and compiled PDF are kept in `english/` and
+are synchronized with the self-contained submission folder at the repository
+root, `cvpr2027_supplement/`.
 
-Files:
+The 14-page appendix contains the CVPR-formatted method details, paper results,
+experiment visualizations, quantitative ablations and interventions, negative
+controls, and limitations. Its assets include real robot frames and outputs
+from phase-gate, student renderer, paired-response, and torque-estimator
+experiments found in this repository. Sections S10 and S11 include recorded
+attention and context response maps, matched CA and FiLM teacher comparisons,
+simulation and robot training results, and the LIBERO K4 rollout result.
+The experiment paths for these sections are listed in `english/SOURCES.md`.
 
-- English CVPR-format execution checklist: english/main.tex
-- Official CVPR author-kit style: english/cvpr.sty
-- Chinese execution plan: 五天最小补证计划_中文.md
+`cvprPaperID` remains `TBD` because the assigned submission identifier was not
+provided. Replace it before submission. The six-page execution-plan material
+in `五天最小补证计划_中文.md` is retained as an internal historical plan and is
+not part of the submitted appendix.
 
-The project is located under /home/lcy/code/dp_hirol_main, which resolves to /home/lcy/code/civi. The requested spelling dp_firol_mian was not an existing directory; the existing CIVI project was used.
-
-These documents are prospective plans. No training, robot experiment, or new result was produced by writing them. The English source is not yet a measured-results supplement to upload. After execution, replace planning content with verified results, remove internal scheduling/checklist language, and enter the real submission ID.
-
-Template provenance:
-
-- Source: https://github.com/cvpr-org/author-kit
-- Style fetched: 2026-11-18
-- Style URL: https://raw.githubusercontent.com/cvpr-org/author-kit/main/cvpr.sty
-- SHA256: ae8e51adc7270b118833b2092310ca1151a19fab0c09b1ab35a485ac4004ac0f
-- Layout: 10pt, two columns, US letter; anonymous review mode; official supplementary-title command.
-
-Compilation:
-
-Open english/main.tex with the adjacent cvpr.sty, or upload both to an existing LaTeX environment. The normal build target is main.tex. The Codex built-in compiler was attempted, but its Tectonic dependency bundle was unavailable to that process; no compiled PDF has been verified or delivered. This is an environment failure, not a reported successful source compilation.
-
-Before actual submission, check the conference's current supplementary instructions and page/file restrictions. A planning estimate of four to six pages does not assert an official page allowance.
+The PDF was compiled with Tectonic in CVPR review mode. Check the current
+conference instructions and file limits before upload.

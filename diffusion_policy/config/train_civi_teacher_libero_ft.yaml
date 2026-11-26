@@ -1,0 +1,37 @@
+defaults:
+  - train_civi_teacher_libero_k4_wrench_b32_200k_all50
+  - _self_
+
+name: ${task_name}_civi_teacher
+task_name: k4_close_bottom_open_top
+dataset_path: data/libero_k4_close_bottom_open_top_repaired_20hz_lerobot_v3
+dino_model_path: model/model/dinov3-vitb16-pretrain-lvd1689m
+output_dir: model_output/2026.11.26/libero_ft_b32_200k/${task_name}/civi_teacher
+
+training:
+  dino_patch_cache: ${output_dir}/../dino_patches.pt
+  normalize_wrench_in_dataset: true
+
+input_preprocessing:
+  rgb:
+    keys: [side, wrist]
+    shape: ${shape_meta.obs.side.shape}
+    resize: pillow_bilinear
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+    training_augmentation: ${task.dataset.image_randomer_config}
+    dino_autocast_dtype: bfloat16
+  wrench_filter: ${task.dataset.wrench_filter}
+  wrench_normalization: ${task.normalizer.mode}
+
+policy:
+  dino_image_mean: ${input_preprocessing.rgb.mean}
+  dino_image_std: ${input_preprocessing.rgb.std}
+
+task:
+  dataset:
+    wrench_filter: {enabled: true, cutoff_hz: 8.0, sample_hz: 20.0, source_key: observation.wrench, timestamp_key: timestamp}
+
+logging:
+  tags: [civi, libero_ft, all50, wrench_8hz, dino_patch_cache]
+  group: libero_ft_${task_name}

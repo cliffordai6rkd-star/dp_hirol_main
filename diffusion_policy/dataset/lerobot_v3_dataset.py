@@ -106,8 +106,15 @@ def _coerce_image(image_value, expected_shape: Sequence[int]) -> np.ndarray:
         # Pillow avoids importing OpenCV here.  OpenCV's libtiff/libjpeg
         # dependencies can conflict with the libraries bundled by PyTorch
         # when the dataset is imported after torch.
+        resize_input = np.asarray(image_hwc)
+        if np.issubdtype(resize_input.dtype, np.floating):
+            if not np.isfinite(resize_input).all():
+                raise ValueError("Image contains non-finite values")
+            if resize_input.size and float(resize_input.max()) <= 1.0:
+                resize_input = resize_input * 255.0
+            resize_input = np.clip(np.rint(resize_input), 0, 255).astype(np.uint8)
         image_hwc = np.asarray(
-            Image.fromarray(np.asarray(image_hwc)).resize(
+            Image.fromarray(resize_input).resize(
                 (target_w, target_h), Image.Resampling.BILINEAR
             )
         )
@@ -270,6 +277,8 @@ class LeRobotV3ImageDataset(BaseImageDataset):
             self.sampler_pad_after = self.pad_after
         self.anchor_position = max(0, min(self.sequence_length - 1, (n_obs_steps or 1) - 1))
         self.image_data: Dict[str, object] = {}
+        self.dino_patches = None
+        self.normalized_wrench = None
         self.load_result_cache_path = None
         load_result_on_disk = use_disk_result_cache(load_result_add)
         distributed_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -805,9 +814,13 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         source = self._load_column(source_key, dtype=np.float32)
         filtered = np.empty_like(source)
         cutoff = float(config.get("cutoff_hz", 2.0))
+        sample_hz = config.get("sample_hz")
+        if sample_hz is not None and (not np.isfinite(sample_hz) or sample_hz <= 0):
+            raise ValueError("wrench_filter.sample_hz must be positive and finite")
         for rows in self.episode_ranges:
             start, stop = rows.start, rows.stop
-            times = relative_time_seconds(clocks[start:stop], unit)
+            times = (relative_time_seconds(clocks[start:stop], unit) if sample_hz is None
+                     else np.arange(len(rows), dtype=np.float64) / sample_hz)
             filtered[start:stop] = first_order_lowpass(times, source[start:stop], cutoff)
         self._filtered_columns[source_key] = filtered
         log.info("Wrench: causal first-order low-pass %.3g Hz, per episode before windowing (%s)",
@@ -1403,6 +1416,8 @@ class LeRobotV3ImageDataset(BaseImageDataset):
 
     def get_validation_dataset(self) -> "LeRobotV3ImageDataset":
         val_set = copy.copy(self)
+        val_set.dino_patches = None
+        val_set.normalized_wrench = None
         # The Numba sampler cannot materialize an empty list of index rows.
         # Full-data training intentionally has no validation episodes.
         if self.val_mask.any():
@@ -1425,6 +1440,8 @@ class LeRobotV3ImageDataset(BaseImageDataset):
     def get_all_episodes_dataset(self) -> "LeRobotV3ImageDataset":
         """An unaugmented view of every valid episode window for checkpoint inference."""
         evaluation = copy.copy(self)
+        evaluation.dino_patches = None
+        evaluation.normalized_wrench = None
         evaluation.indices = create_indices(
             self.episode_ends,
             sequence_length=self.sequence_length,
@@ -1474,15 +1491,14 @@ class LeRobotV3ImageDataset(BaseImageDataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def _window_indices(self, idx):
         sequence_indices = self._sample_indices_to_sequence(idx)
         if self.window_sampling_strategy == "timestamp":
             sequence_indices = self._retime_sequence_indices(sequence_indices)
-          
-        obs_indices = sequence_indices[: self.n_obs_steps]
-        frame_cache: Dict[int, Dict] = {}
-        obs_dict = {}
+        return sequence_indices
 
+    def _read_images(self, obs_indices, frame_cache):
+        images_by_camera = {}
         for key in self.rgb_keys:
             if key in self.image_data:
                 images = read_image_result(self.image_data, key, obs_indices)
@@ -1504,8 +1520,47 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                     axis=0,
                 )
 
-            obs_dict[key] = self._augment_image_sequence(images)
+            images_by_camera[key] = self._augment_image_sequence(images)
+        return images_by_camera
 
+    def get_rgb_window(self, idx):
+        """Return the augmented RGB window before DINO or any learned fusion."""
+        obs_indices = self._window_indices(idx)[:self.n_obs_steps]
+        return dict_apply(self._read_images(obs_indices, {}), _safe_torch_from_numpy)
+
+    def get_window_indices(self):
+        """Resolve the frame rows used by every training sample."""
+        return self._sequence_indices_from_sampler_rows(self.indices)
+
+    @torch.no_grad()
+    def prepare_normalized_wrench(self, normalizer):
+        """Apply the teacher's contact and normalization rules to filtered windows."""
+        preprocessor = self.contact_label_preprocessor
+        if (preprocessor is None or preprocessor.future_phase_wrench_key is not None
+                or preprocessor.precontact_seconds is not None):
+            raise ValueError("Cached wrench requires current-contact preprocessing")
+        key = preprocessor.wrench_key
+        preprocessor.normalizer.load_state_dict(normalizer.state_dict())
+        rows = self.get_window_indices()[:, :self.n_obs_steps]
+        histories = self.windowed_lowdim_data[key]
+        self.normalized_wrench = torch.empty((*rows.shape, *histories.shape[1:]), dtype=torch.float32)
+        self.wrench_contact = torch.empty(rows.shape, dtype=torch.bool)
+        for start in range(0, len(rows), 1024):
+            batch = slice(start, start + 1024)
+            inputs = {name: torch.from_numpy(self.windowed_lowdim_data[name][rows[batch]])
+                      for name in preprocessor.required_keys}
+            normalized, contact, _ = preprocessor(inputs)
+            self.normalized_wrench[batch] = normalized
+            self.wrench_contact[batch] = contact
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        sequence_indices = self._window_indices(idx)
+        obs_indices = sequence_indices[:self.n_obs_steps]
+        frame_cache: Dict[int, Dict] = {}
+        obs_dict = {}
+        patches = getattr(self, "dino_patches", None)
+        if patches is None:
+            obs_dict.update(self._read_images(obs_indices, frame_cache))
 
         for key in self.lowdim_keys:
             values = self.windowed_lowdim_data.get(key, self.lowdim_data.get(key))
@@ -1514,10 +1569,11 @@ class LeRobotV3ImageDataset(BaseImageDataset):
         if getattr(self, "phase_state_data", None) is not None:
             obs_dict["phase_inputs"] = self._phase_inputs(obs_indices, frame_cache)
 
-        if getattr(self, "contact_label_preprocessor", None) is not None:
+        normalized = getattr(self, "normalized_wrench", None)
+        if normalized is None and getattr(self, "contact_label_preprocessor", None) is not None:
             obs_dict["contact_alpha"] = self._sample_contact_alpha(obs_indices, obs_dict)
-            if self._frame_contact_phase is not None:
-                obs_dict["contact_phase"] = self._frame_contact_phase[obs_indices]
+        if getattr(self, "_frame_contact_phase", None) is not None:
+            obs_dict["contact_phase"] = self._frame_contact_phase[obs_indices]
 
         action = self._sample_action(sequence_indices)
         if self.relative_pose_actions:
@@ -1526,10 +1582,13 @@ class LeRobotV3ImageDataset(BaseImageDataset):
                 anchor_idx
             ].astype(np.float32, copy=False)
 
-        return {
-            "obs": dict_apply(obs_dict, _safe_torch_from_numpy),
-            "action": _safe_torch_from_numpy(action),
-        }
+        obs = dict_apply(obs_dict, _safe_torch_from_numpy)
+        if patches is not None:
+            obs.update({key: patches[idx, :, camera] for camera, key in enumerate(sorted(self.rgb_keys))})
+        if normalized is not None:
+            obs["wrench_normalized"] = normalized[idx]
+            obs["wrench_contact"] = self.wrench_contact[idx]
+        return {"obs": obs, "action": _safe_torch_from_numpy(action)}
 # 一个torch
 # batch = 
 #     "obs": 

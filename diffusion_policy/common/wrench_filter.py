@@ -5,6 +5,24 @@ import math
 import numpy as np
 
 
+class CausalWrenchFilter:
+    """Episode-local one-pole smoothing with immediate output for each sample."""
+
+    def __init__(self, cutoff_hz, sample_hz):
+        if not math.isfinite(cutoff_hz) or not math.isfinite(sample_hz) or min(cutoff_hz, sample_hz) <= 0:
+            raise ValueError("Wrench cutoff and sample frequencies must be positive and finite")
+        self.alpha = -math.expm1(-2.0 * math.pi * cutoff_hz / sample_hz)
+        self.reset()
+
+    def reset(self):
+        self.value = None
+
+    def __call__(self, sample):
+        sample = np.asarray(sample, dtype=np.float64)
+        self.value = sample.copy() if self.value is None else self.value + self.alpha * (sample - self.value)
+        return self.value.astype(np.float32)
+
+
 def relative_time_seconds(timestamps, unit="s"):
     """Subtract the episode origin before converting integer clocks to seconds."""
     values = np.asarray(timestamps).reshape(-1)

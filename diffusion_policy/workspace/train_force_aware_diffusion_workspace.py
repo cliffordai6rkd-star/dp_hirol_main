@@ -26,6 +26,7 @@ import hydra
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import tqdm
 import wandb
 from hydra.core.hydra_config import HydraConfig
@@ -43,6 +44,7 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.common.phase_sampler import PhaseWeightedDistributedSampler
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
+from diffusion_policy.dataset.dino_patch_cache import precompute_dino_patches
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
@@ -247,6 +249,83 @@ def resolve_training_limits(training_cfg) -> tuple[Optional[int], Optional[int]]
     return num_epochs, num_optimizer_steps
 
 
+def initialize_policy_from_checkpoint(policy, checkpoint_path: str) -> dict:
+    """Warm-start compatible policy weights without restoring training state.
+
+    A source checkpoint may come from another task or sensor layout.  This
+    initializer copies shape-compatible learned weights, resizes the force
+    history position embedding when history lengths differ, and deliberately
+    leaves task/sensor-specific input and output projections initialized for
+    the target task.
+    """
+    checkpoint_path = os.path.expanduser(str(checkpoint_path))
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"training.init_checkpoint not found: {checkpoint_path}")
+    payload = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        pickle_module=dill,
+        weights_only=False,
+    )
+    state_dicts = payload.get("state_dicts", {})
+    source = state_dicts.get("ema_model") or state_dicts.get("model")
+    if not isinstance(source, dict):
+        raise ValueError(
+            f"training.init_checkpoint has no policy model state: {checkpoint_path}"
+        )
+
+    target = policy.state_dict()
+    skip_prefixes = (
+        "obs_encoder.backbone.",  # loaded from the configured DINO directory
+        "obs_encoder.wrench_projection.",  # sensor input changed to 6D wrench
+        "model.input_embedding.",  # action coordinates have different semantics
+        "model.output_head.",
+        "normalizer.",  # recomputed from the target training split
+        "contact_detector.",  # target contact threshold and debounce are authoritative
+        "input_gate.",
+        "blur_scheduler.",
+        "mask_scheduler.",
+    )
+    loaded = []
+    skipped = []
+    resized = []
+    for key, target_value in target.items():
+        if key.startswith(skip_prefixes):
+            skipped.append(key)
+            continue
+        source_value = source.get(key)
+        if source_value is None:
+            skipped.append(key)
+            continue
+        if key == "obs_encoder.wrench_position" and source_value.ndim == 4 and target_value.ndim == 4:
+            if source_value.shape[:2] == target_value.shape[:2] and source_value.shape[3] == target_value.shape[3]:
+                source_value = F.interpolate(
+                    source_value.squeeze(1).transpose(1, 2).float(),
+                    size=target_value.shape[2],
+                    mode="linear",
+                    align_corners=True,
+                ).transpose(1, 2).unsqueeze(1)
+                target[key] = source_value.to(dtype=target_value.dtype)
+                loaded.append(key)
+                resized.append(key)
+                continue
+        if tuple(source_value.shape) != tuple(target_value.shape):
+            skipped.append(key)
+            continue
+        target[key] = source_value.to(dtype=target_value.dtype)
+        loaded.append(key)
+
+    if not loaded:
+        raise ValueError(f"No compatible policy weights found in {checkpoint_path}")
+    policy.load_state_dict(target, strict=True)
+    return {
+        "checkpoint": checkpoint_path,
+        "loaded_tensors": len(loaded),
+        "skipped_tensors": len(skipped),
+        "resized_tensors": resized,
+    }
+
+
 class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
     include_keys = (
         "global_step", "optimizer_step", "epoch", "freeze_config", "topk_state",
@@ -271,6 +350,23 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         )
         if not isinstance(self.model, ForceAwareDiffusionTransformerPolicy):
             raise TypeError("cfg.policy must instantiate ForceAwareDiffusionTransformerPolicy")
+        init_checkpoint = cfg.training.get("init_checkpoint")
+        self.initialization_info = None
+        if init_checkpoint:
+            if bool(cfg.training.get("resume", False)):
+                raise ValueError(
+                    "training.init_checkpoint initializes a fresh run; it cannot be combined with training.resume"
+                )
+            self.initialization_info = initialize_policy_from_checkpoint(
+                self.model, str(init_checkpoint),
+            )
+            log.info(
+                "Initialized policy from %s: loaded=%d tensors, resized=%s, skipped=%d",
+                self.initialization_info["checkpoint"],
+                self.initialization_info["loaded_tensors"],
+                self.initialization_info["resized_tensors"],
+                self.initialization_info["skipped_tensors"],
+            )
         # This is saved separately from model weights because requires_grad is
         # not part of a PyTorch state_dict.  It makes a checkpoint self-
         # describing when DINOv3 or the fusion block is frozen.
@@ -464,7 +560,7 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
 
         latest_checkpoint = self.get_checkpoint_path()
         if cfg.training.resume and latest_checkpoint.is_file():
-            self.load_checkpoint(path=latest_checkpoint)
+            self.load_checkpoint(path=latest_checkpoint, include_keys=self.include_keys, map_location="cpu")
             if self.is_main_process:
                 log.info(
                     "Resumed %s at optimizer_step=%d, epoch=%d",
@@ -630,6 +726,23 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.set_normalizer(normalizer)
 
+        patch_cache = cfg.training.get("dino_patch_cache")
+        normalize_wrench = bool(cfg.training.get("normalize_wrench_in_dataset", False))
+        if patch_cache or normalize_wrench:
+            log.info(
+                "Prepared dataset %s: %d train / %d validation demos, %d frames, %d train windows",
+                dataset.dataset_path, dataset.train_mask.sum(), dataset.val_mask.sum(),
+                dataset.dataset_length, len(dataset),
+            )
+            views = {"train": dataset, "val": validation_dataset}
+            if getattr(self, "_checkpoint_eval_dataset", None) is not None:
+                views["all"] = self._checkpoint_eval_dataset
+            if normalize_wrench:
+                for view in views.values():
+                    if len(view):
+                        view.prepare_normalized_wrench(normalizer)
+                log.info("Wrench normalization and contact masks prepared in the dataset")
+
         accumulation_steps = int(cfg.training.gradient_accumulate_every)
         max_train_batches = len(train_dataloader)
         if cfg.training.max_train_steps is not None:
@@ -732,6 +845,34 @@ class TrainForceAwareDiffusionWorkspace(BaseWorkspace):
         allow_tf32 = bool(amp_cfg.get("allow_tf32", True))
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.backends.cudnn.allow_tf32 = allow_tf32
+        if patch_cache:
+            if self.model.blur_scheduler is not None:
+                raise ValueError("DINO patch caching requires RGB blur to be disabled")
+            cache_path = pathlib.Path(patch_cache)
+            for name, view in views.items():
+                if not len(view):
+                    continue
+                path = cache_path if name == "train" else cache_path.with_name(f"{cache_path.stem}-{name}.pt")
+                rgb = OmegaConf.to_container(cfg.input_preprocessing.rgb, resolve=True)
+                rgb["training_augmentation"] = (
+                    OmegaConf.to_container(cfg.task.dataset.image_randomer_config, resolve=True)
+                    if name == "train" and cfg.task.dataset.image_randomer_config is not None else None
+                )
+                view.dino_patches = precompute_dino_patches(
+                    view, self.model.obs_encoder, path, device=device,
+                    batch_size=int(cfg.dataloader.batch_size),
+                    num_workers=int(cfg.dataloader.num_workers),
+                    seed=int(cfg.training.seed),
+                    amp_dtype=(resolve_amp_dtype(amp_cfg.get("dtype", "bfloat16"))
+                               if amp_cfg.get("enabled", False) else None),
+                    preprocessing=rgb, dino_path=cfg.policy.dino_model_name_or_path,
+                )
+                if getattr(view, "phase_state_data", None) is None:
+                    view.image_data = {}
+                    view._ram_cache_entry = None
+            for group, params in zip(("DiT", "observation encoder"), self.optimizer.param_groups):
+                log.info("Optimizer group %s: %d trainable parameters",
+                         group, sum(value.numel() for value in params["params"]))
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)

@@ -60,6 +60,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         num_inference_steps: Optional[int] = None,
         dino_model_name_or_path: str = "facebook/dinov3-vits16-pretrain-lvd1689m",
         dino_local_files_only: bool = True,
+        dino_image_mean: Sequence[float] = (0.485, 0.456, 0.406),
+        dino_image_std: Sequence[float] = (0.229, 0.224, 0.225),
         freeze_dino_backbone: bool = True,
         freeze_modules: Optional[Sequence[str]] = None,
         wrench_history_steps: int = 8,
@@ -206,8 +208,10 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
             )
 
         action_dim = action_shape[0]
-        if action_representation not in {"ee_pose", "joint_position"}:
-            raise ValueError("action_representation must be 'ee_pose' or 'joint_position'")
+        if action_representation not in {"ee_pose", "ee_pose_delta", "joint_position"}:
+            raise ValueError(
+                "action_representation must be 'ee_pose', 'ee_pose_delta', or 'joint_position'"
+            )
         if relative_pose_actions and action_representation != "ee_pose":
             raise ValueError("relative_pose_actions requires action_representation='ee_pose'")
         if relative_pose_actions and action_dim != 7:
@@ -229,6 +233,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
                 dropout=p_drop_attn,
                 freeze_backbone=freeze_dino_backbone,
                 local_files_only=dino_local_files_only,
+                image_mean=dino_image_mean,
+                image_std=dino_image_std,
                 image_keys=configured_image_keys,
                 camera_attention_mode=camera_attention_mode,
                 pre_cross_self_attn_layers=pre_cross_self_attn_layers,
@@ -480,6 +486,14 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
     def _prepare_context_inputs(self, obs_dict, *, return_future_contact=False):
         """Prepare RGB and wrench exactly as the teacher does, before learned encoders."""
         images, phase_wrench, wrench, future_phase_wrench = self._validate_obs(obs_dict)
+        if "wrench_normalized" in obs_dict:
+            normalized = obs_dict["wrench_normalized"][:, :self.n_obs_steps]
+            contact = obs_dict["wrench_contact"][:, :self.n_obs_steps]
+            if normalized.shape != wrench.shape or contact.shape != wrench.shape[:2]:
+                raise ValueError("Prepared wrench and contact must match the observation window")
+            self._latest_processed_wrench = None
+            self._latest_normalized_wrench = normalized.detach()
+            return images, normalized, contact, contact.unsqueeze(-1) if return_future_contact else None
         normalized_wrench, contact, future_contact_or_has, processed_wrench = preprocess_wrench(
             wrench, phase_wrench, future_phase_wrench,
             shared_phase_signal=self.phase_wrench_key == self.wrench_key,
@@ -516,6 +530,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         images, normalized_wrench, contact, future_contact = (
             self.prepare_context_inputs_with_future_contact(obs_dict)
         )
+        precomputed_patches = images[self.image_keys[0]].ndim == 4
         if self.fusion_gate_mode == "current_contact" and "contact_phase" in obs_dict:
             # Training labels scan measured frames once per episode. Use that
             # exact causal debounce state rather than rescanning overlapping
@@ -535,6 +550,8 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         sigma = 0.0
         blurred_images = torch.zeros_like(blur_contact, dtype=torch.bool)
         if self.blur_scheduler is not None and apply_curriculum_mask:
+            if precomputed_patches:
+                raise ValueError("RGB blur requires images before DINO patch encoding")
             sigma = self.blur_scheduler.sigma(self.optimizer_step)
             if sigma > 0:
                 if self.image_blur_scope == "precontact_contact":
@@ -608,6 +625,7 @@ class ForceAwareDiffusionTransformerPolicy(BaseImagePolicy):
         return self.obs_encoder(
             images=images,
             wrench_history=normalized_wrench,
+            precomputed_patches=precomputed_patches,
             **fusion_kwargs,
         )
 

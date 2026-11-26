@@ -1,0 +1,24 @@
+defaults:
+  - train_civi_teacher_libero_k4_wrench_b32_200k
+  - _self_
+
+name: train_civi_teacher_libero_k4_wrench_b32_200k_all50
+output_dir: /home/lcy/code/civi/model_output/2026.11.25/libero_k4_close_bottom_open_top_wrench_b32_200k_all50/teacher
+
+training:
+  resume: false
+  init_checkpoint: null
+  # The workspace skips validation until this step, beyond the training budget.
+  validation_start_optimizer_step: ${eval:'${training.num_optimizer_steps} + 1'}
+
+logging:
+  tags: [civi, libero, k4_close_bottom_open_top, measured_wrench, history20, phase_1_5, all50]
+
+checkpoint:
+  topk:
+    monitor_key: null
+    format_str: optimizer_step={optimizer_step:08d}.ckpt
+
+task:
+  dataset:
+    val_ratio: 0.0

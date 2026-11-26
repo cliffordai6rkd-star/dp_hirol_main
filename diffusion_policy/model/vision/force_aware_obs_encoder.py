@@ -386,7 +386,10 @@ class ForceAwareObsEncoder(nn.Module):
             flat_images = torch.cat([
                 images[key].reshape(-1, *images[key].shape[2:]) for key in grouped_keys
             ], dim=0)
-            _, grouped_patches = self._encode_dino(flat_images, input_grad=input_grad)
+            if flat_images.ndim == 3:
+                grouped_patches = flat_images
+            else:
+                _, grouped_patches = self._encode_dino(flat_images, input_grad=input_grad)
             grouped_patches = self.image_projection(grouped_patches)
             for key, patch_image in zip(grouped_keys, grouped_patches.split(flat_camera_batch)):
                 if key in self.patch_counts and patch_image.shape[1] != self.patch_counts[key]:
@@ -465,6 +468,7 @@ class ForceAwareObsEncoder(nn.Module):
         contact_alpha: Optional[torch.Tensor] = None,
         fusion_gate: Optional[torch.Tensor] = None,
         image_token_mask: Optional[torch.Tensor] = None,
+        precomputed_patches: bool = False,
     ) -> torch.Tensor:
         if images is not None and image is not None:
             raise ValueError("provide either images or the legacy image argument, not both")
@@ -494,17 +498,19 @@ class ForceAwareObsEncoder(nn.Module):
             image_keys = runtime_image_keys
 
         first_image = images[image_keys[0]]
-        if first_image.ndim != 5:
+        expected_dims = 4 if precomputed_patches else 5
+        expected_axes = "[B, To, P, D]" if precomputed_patches else "[B, To, C, H, W]"
+        if first_image.ndim != expected_dims:
             raise ValueError(
-                f"image {image_keys[0]!r} must be [B, To, C, H, W], "
+                f"image {image_keys[0]!r} must be {expected_axes}, "
                 f"got {tuple(first_image.shape)}"
             )
         batch_size, obs_steps = first_image.shape[:2]
         for key in image_keys:
             camera_image = images[key]
-            if camera_image.ndim != 5:
+            if camera_image.ndim != expected_dims:
                 raise ValueError(
-                    f"image {key!r} must be [B, To, C, H, W], "
+                    f"image {key!r} must be {expected_axes}, "
                     f"got {tuple(camera_image.shape)}"
                 )
             if camera_image.shape[:2] != (batch_size, obs_steps):
@@ -513,6 +519,10 @@ class ForceAwareObsEncoder(nn.Module):
                     f"{tuple(camera_image.shape[:2])} do not match "
                     f"{(batch_size, obs_steps)}"
                 )
+            if precomputed_patches:
+                if tuple(camera_image.shape[2:]) != (self.patch_counts[key], self.image_projection.in_features):
+                    raise ValueError(f"Cached patch shape does not match configured camera {key!r}")
+                continue
             if camera_image.shape[2] != 3:
                 raise ValueError(
                     f"image {key!r} must have 3 channels, got {camera_image.shape[2]}"
